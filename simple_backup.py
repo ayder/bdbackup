@@ -1,3 +1,4 @@
+#!/usr/bin/python
 from bdbackup import filebackup
 
 b = backup('shopbg88', ".", "template.txt")
