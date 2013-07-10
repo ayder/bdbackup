@@ -7,19 +7,22 @@ import tarfile
     basicly it works for directories under /home dir
 """
 
-class dbbackup():
+class bdbackup():
     """ Constructor requires those parameters
         backup_dst : path where the archive will be created
         template_filename : Template file to choose backup folders
-        chdir_path   : somewhere different form home
+        chdir   : somewhere different form home
     """
-    def __init__(self, backup_dst, template_filename=None, chdir_path=None,compression=None):
-        self.chdir_path = chdir_path
+    def __init__(self, backup_dst, template_filename=None, chdir=None,compression=None):
+        self.chdir = chdir
         self.template_filename = template_filename
         self.tar= None
         self.backup_paths = None
         self.backup_dst= backup_dst
+        self.compression = compression
+        self.tar_filename="backup-mdy"
         self.tar_file = os.path.join(self.backup_dst,self.tar_filename)
+        print self.tar_file
 
         if self.compression:
             self.tar_opt ="w:gz"
@@ -29,7 +32,8 @@ class dbbackup():
             self.tar_filename= backup_dst + ".tar"
 
         if template_filename:
-            load_template()
+            self.load_template(self.template_filename)
+            self.open_archive()
 
 
     def __del__(self):
@@ -54,9 +58,9 @@ class dbbackup():
         """ Try to open the tar archive to a destination
         """
         try:
-            self.tar = tarfile.open(self.tar_file,self.tar_opt)
+            self.tar = tarfile.open(self.tar_filename,self.tar_opt)
         except Exception,e:
-            print "Unable to open %s error: %s" % (backup_dst, e)
+            print "Unable to open %s error: %s" % (self.tar_file, e)
         return self.tar
 
     def close_archive(self):
@@ -64,7 +68,7 @@ class dbbackup():
             self.tar.close()
             self.tar = None
         except Exception,e:
-            print "Unable to close %s error: %s" % (backup_dst, e)
+            print "Unable to close %s error: %s" % (self.tarfile, e)
         return
 
 
@@ -79,10 +83,10 @@ class dbbackup():
             return 0
 
         if self.chdir:
-            if os.path.isdir(self.chdir_path):
-                os.chdir(self.chdir_path)
+            if os.path.isdir(self.chdir):
+                os.chdir(self.chdir)
             else:
-                print "Unable to chdir to %s. No source directory found" %s (self.chdir_path)
+                print "Unable to chdir to %s. No source directory found" %s (self.chdir)
 
         for path in self.backup_paths:
             path = path.rstrip()

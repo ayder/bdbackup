@@ -1,8 +1,6 @@
 #!/usr/bin/python
-from bdbackup import filebackup
+from bdbackup import bdbackup
 
-b = backup('shopbg88', ".", "template.txt")
-b.read_template()
-b.open_archive()
-b.do_backup(debug=True)
+b = bdbackup(backup_dst='/home/sinan/bdbackup', template_filename="template.txt",chdir="/home/sinan")
+b.backup(debug=True)
 b.close_archive()
