@@ -1,4 +1,4 @@
 bdbackup
 ========
 
-Brain Dead Backup For FS Mysql
+Brain dead backup script for some devops purposes.
