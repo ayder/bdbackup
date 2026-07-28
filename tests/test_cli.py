@@ -1,6 +1,7 @@
 """CLI smoke tests."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
@@ -41,6 +42,23 @@ def test_xtrabackup_help():
     runner = CliRunner()
     result = runner.invoke(main, ["xtrabackup", "--help"])
     assert result.exit_code == 0
-    assert "--database" in result.output
     assert "full" in result.output
     assert "incremental" in result.output
+    assert "prune" in result.output
+
+
+def test_mysqldump_full_without_database():
+    runner = CliRunner()
+    with patch("bdbackup.cli.MySQLBackup") as mock_cls:
+        instance = mock_cls.return_value
+        instance.backup.return_value = Path("/tmp/all-databases.sql.gz")
+        result = runner.invoke(main, ["mysqldump", "--full"])
+        assert result.exit_code == 0, result.output
+        instance.backup.assert_called_once_with(None)
+
+
+def test_mysqldump_database_required_without_full():
+    runner = CliRunner()
+    result = runner.invoke(main, ["mysqldump"])
+    assert result.exit_code != 0
+    assert "--database is required" in result.output

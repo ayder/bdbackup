@@ -2,24 +2,34 @@
 
 from __future__ import annotations
 
-import logging
-import sys
+import fcntl
+import os
+import stat
+import tempfile
+from collections.abc import Iterable
+from contextlib import contextmanager
+from datetime import UTC
 from pathlib import Path
 
 
-def setup_logging(name: str = "bdbackup", level: int = logging.INFO) -> logging.Logger:
-    """Configure a simple stderr logger."""
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setLevel(level)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-    return logger
+@contextmanager
+def process_lock(lock_path: str | Path):
+    """Advisory process lock using fcntl (POSIX only).
+
+    Raises BlockingIOError if another process already holds the lock.
+    """
+    lock_file = Path(lock_path)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def read_template(path: Path | str) -> list[str]:
@@ -35,7 +45,47 @@ def read_template(path: Path | str) -> list[str]:
 
 
 def today_stamp() -> str:
-    """Return a YYYY-MM-DD-HHMMSS style timestamp."""
+    """Return a UTC YYYY-MM-DD-HHMMSS style timestamp."""
     from datetime import datetime
 
-    return datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return datetime.now(UTC).strftime("%Y-%m-%d-%H%M%S")
+
+
+def redact_cmd(cmd: Iterable[str | Path], secrets: Iterable[str]) -> list[str]:
+    """Return a copy of *cmd* with any secret value replaced by '***'."""
+    secret_set = {str(s) for s in secrets if s}
+    return ["***" if str(part) in secret_set else str(part) for part in cmd]
+
+
+@contextmanager
+def mysql_cnf_file(
+    *,
+    user: str,
+    password: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+):
+    """Create a temporary mysql client options file with safe permissions.
+
+    Yields the Path to the file. The file is deleted when the context exits.
+    Using a defaults-extra-file keeps credentials out of argv and process lists.
+    """
+    fd, raw_path = tempfile.mkstemp(prefix="bdbackup-cnf-", suffix=".cnf")
+    path = Path(raw_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("[client]\n")
+            f.write(f"user={user}\n")
+            if password:
+                f.write(f"password={password}\n")
+            if host:
+                f.write(f"host={host}\n")
+            if port is not None:
+                f.write(f"port={port}\n")
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        yield path
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass

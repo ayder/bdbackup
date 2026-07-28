@@ -1,9 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+# DEPRECATED: This script is kept for environments that cannot run the Python
+# CLI directly. The Python implementation in bdbackup.xtrabackup is the canonical
+# source of truth. Consider migrating to:
+#   bdbackup xtrabackup full --database ... --root ...
+
 # Companion script for full MySQL physical backups via xtrabackup/mariabackup.
-# This is intentionally kept as a Bash script because xtrabackup is a system tool
-# and the surrounding orchestration (symlinks, retention, flags) is filesystem-heavy.
 
 BACKUP_ROOT="${BACKUP_ROOT:-/backup/mysql}"
 DATE=$(date +%F)

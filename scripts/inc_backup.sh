@@ -1,6 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+# DEPRECATED: This script is kept for environments that cannot run the Python
+# CLI directly. The Python implementation in bdbackup.xtrabackup is the canonical
+# source of truth. Consider migrating to:
+#   bdbackup xtrabackup incremental --database ... --root ...
+
 # Companion script for incremental MySQL physical backups via xtrabackup/mariabackup.
 # Requires a successful full backup flag and a valid base directory.
 
