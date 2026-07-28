@@ -28,6 +28,8 @@ pip install -e ".[dev]"
 
 ## Usage
 
+All commands support `--logging DEBUG|INFO|WARNING|ERROR`.
+
 ### File backup
 
 Create a template file listing paths (one per line, `#` for comments):
@@ -42,43 +44,67 @@ data/projects
 Run the backup:
 
 ```bash
-bdbackup file backup-template.txt -d /backup/files/daily -z --debug
+bdbackup file --template backup-template.txt -d /backup/files/daily -z
 ```
 
 Options:
 
 | Flag | Description |
 |------|-------------|
+| `--template` | Template file listing paths to archive |
 | `-d, --dst` | Destination archive path (without extension) |
 | `-c, --chdir` | Change to this directory before archiving |
 | `-z, --compress` | Gzip-compress the archive |
 | `-x, --exclude` | Exclude path (repeatable) |
-| `--debug` | Print every backed-up path |
+| `--logging` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
-### Database backups
+### mysqldump
 
-#### mysqldump
+Dump a single database:
 
 ```bash
-bdbackup db mysqldump mydatabase -o /backup/mysql/dumps -u root -p secret
+bdbackup mysqldump --database mydatabase -o /backup/mysql/dumps -u root -p secret
 ```
 
-#### xtrabackup
+Dump all databases:
+
+```bash
+bdbackup mysqldump --full -o /backup/mysql/dumps -u root -p secret
+```
+
+Options:
+
+| Flag | Description |
+|------|-------------|
+| `--database` | Database name to dump (ignored when `--full`) |
+| `-o, --out-dir` | Directory for the dump file |
+| `-u, --user` | MySQL user |
+| `-p, --password` | MySQL password |
+| `-h, --host` | MySQL host |
+| `-P, --port` | MySQL port |
+| `--options` | Comma-separated mysqldump options |
+| `--full` | Add `--all-databases` and dump everything |
+
+### xtrabackup
 
 Full backup:
 
 ```bash
-bdbackup db xtrabackup full -r /backup/mysql -u xtrabackup -p secret
+bdbackup xtrabackup full --database production -r /backup/mysql -u xtrabackup -p secret
 ```
 
 Incremental backup (requires a full backup from today):
 
 ```bash
-bdbackup db xtrabackup incremental -r /backup/mysql -u xtrabackup -p secret
+bdbackup xtrabackup incremental --database production -r /backup/mysql -u xtrabackup -p secret
 ```
+
+Options:
 
 | Flag | Description |
 |------|-------------|
+| `mode` | `full` or `incremental` |
+| `--database` | Database name (used for directory naming) |
 | `-r, --root` | Backup root directory |
 | `-u, --user` | MySQL user |
 | `-p, --password` | MySQL password |

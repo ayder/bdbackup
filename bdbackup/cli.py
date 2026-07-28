@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import click
@@ -14,12 +15,31 @@ from bdbackup.xtrabackup import XtraBackup
 
 @click.group(name="bdbackup")
 @click.version_option(version=__version__, prog_name="bdbackup")
-def main() -> None:
+@click.option(
+    "--logging",
+    "log_level",
+    default="INFO",
+    help="Log level: DEBUG, INFO, WARNING, ERROR.",
+)
+@click.pass_context
+def main(ctx: click.Context, log_level: str) -> None:
     """Brain-dead backup: file archives, mysqldump and xtrabackup helpers."""
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    ctx.ensure_object(dict)
+    ctx.obj["log_level"] = level
 
 
 @main.command()
-@click.argument("template", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--template",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Template file listing paths to archive.",
+)
 @click.option(
     "-d",
     "--dst",
@@ -35,16 +55,14 @@ def main() -> None:
 )
 @click.option("-z", "--compress/--no-compress", default=False, help="Gzip-compress the archive.")
 @click.option("-x", "--exclude", multiple=True, help="Path/pattern to exclude; can be repeated.")
-@click.option("--debug/--no-debug", default=False, help="Print every backed-up path.")
 def file(
     template: Path,
     dst: Path,
     chdir: Path | None,
     compress: bool,
     exclude: tuple[str, ...],
-    debug: bool,
 ) -> None:
-    """Create a tar archive from a TEMPLATE file listing paths."""
+    """Create a tar archive from a template file listing paths."""
     fb = FileBackup(
         backup_dst=dst,
         template_filename=template,
@@ -53,19 +71,14 @@ def file(
         exclude=exclude,
     )
     try:
-        fb.backup(debug=debug)
+        fb.backup(debug=False)
     finally:
         fb.close_archive()
     click.echo(f"Archive created: {fb.tar_filename}")
 
 
-@main.group()
-def db() -> None:
-    """Database backup commands."""
-
-
-@db.command(name="mysqldump")
-@click.argument("database")
+@main.command()
+@click.option("--database", required=True, help="Database name to dump.")
 @click.option(
     "-o",
     "--out-dir",
@@ -84,6 +97,7 @@ def db() -> None:
     show_default=True,
     help="Comma-separated mysqldump options.",
 )
+@click.option("--full/--no-full", default=False, help="Add --all-databases and dump everything.")
 def mysqldump(
     database: str,
     out_dir: Path,
@@ -92,22 +106,27 @@ def mysqldump(
     host: str,
     port: int,
     options: str,
+    full: bool,
 ) -> None:
     """Dump a MySQL database with mysqldump."""
+    opts = options.split(",")
+    if full:
+        opts = ["--all-databases"]
     mb = MySQLBackup(
         out_dir=out_dir,
         user=user,
         password=password,
         host=host,
         port=port,
-        options=options.split(","),
+        options=opts,
     )
-    out = mb.backup(database)
+    out = mb.backup(database if not full else "all-databases")
     click.echo(f"Dump written to: {out}")
 
 
-@db.command(name="xtrabackup")
+@main.command()
 @click.argument("mode", type=click.Choice(["full", "incremental"], case_sensitive=False))
+@click.option("--database", required=True, help="Database name (used for directory naming).")
 @click.option(
     "-r",
     "--root",
@@ -134,8 +153,9 @@ def mysqldump(
     help="Number of compression threads.",
 )
 @click.option("--retention", default=5, show_default=True, type=int, help="Retention in days.")
-def xtrabackup_cmd(
+def xtrabackup(
     mode: str,
+    database: str,
     backup_root: Path,
     user: str,
     password: str | None,
@@ -146,7 +166,7 @@ def xtrabackup_cmd(
 ) -> None:
     """Run a full or incremental xtrabackup physical backup."""
     xb = XtraBackup(
-        backup_root=backup_root,
+        backup_root=backup_root / database,
         user=user,
         password=password,
         binary=binary,

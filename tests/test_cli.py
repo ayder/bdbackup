@@ -22,13 +22,25 @@ def test_file_backup(tmp_path: Path):
 
     dst = tmp_path / "backup"
     runner = CliRunner()
-    result = runner.invoke(main, ["file", str(template), "--dst", str(dst)])
+    result = runner.invoke(
+        main,
+        ["file", "--template", str(template), "-d", str(dst)],
+    )
     assert result.exit_code == 0, result.output
     assert dst.with_suffix(".tar").exists()
 
 
-def test_db_help():
+def test_mysqldump_help():
     runner = CliRunner()
-    for args in [["db", "--help"], ["db", "mysqldump", "--help"], ["db", "xtrabackup", "--help"]]:
-        result = runner.invoke(main, args)
-        assert result.exit_code == 0, args
+    result = runner.invoke(main, ["mysqldump", "--help"])
+    assert result.exit_code == 0
+    assert "--database" in result.output
+
+
+def test_xtrabackup_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["xtrabackup", "--help"])
+    assert result.exit_code == 0
+    assert "--database" in result.output
+    assert "full" in result.output
+    assert "incremental" in result.output
