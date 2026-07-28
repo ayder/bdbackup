@@ -1,56 +1,72 @@
+"""Logical MySQL backup helpers using mysqldump."""
+
+from __future__ import annotations
+
 import gzip
 import subprocess
-import ConfigParser
-import logging
-import logging.config
-from dboperations import mysqlops
+from collections.abc import Iterable
+from pathlib import Path
 
-class mysqlbackup():
-
-    def __init__(self,configfile):
-        self.configfile= configfile
-        self.config = None
-        init_logging()
-        getconfig()
+from bdbackup.utils import setup_logging, today_stamp
 
 
-    def backup(self):
-        mydb = mysqlops.pass
-        pass
+class MySQLBackup:
+    """Create compressed logical MySQL backups with mysqldump."""
 
-    def init_logging(self):
-        logger = logging.getlogger('Backup_logger')
-        logger.setLevel(logging.DEBUG)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        ch.setFormatter(formatter)
-        logger.addHandler(ch)
-        self.logger = logger
+    def __init__(
+        self,
+        out_dir: str | Path = ".",
+        user: str = "root",
+        password: str | None = None,
+        host: str = "localhost",
+        port: int = 3306,
+        options: Iterable[str] | None = None,
+    ):
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.user = user
+        self.password = password
+        self.host = host
+        self.port = port
+        self.options = list(options or ["--single-transaction", "--databases"])
+        self.logger = setup_logging("bdbackup.mysql")
 
-    def init_logging_from_config(self, configfile):
-        logging.config.fileConfig('logging.conf')
-        logger = logging.getLogger('backup_logger')
+    def _build_cmd(self, database: str) -> list[str]:
+        cmd = [
+            "mysqldump",
+            f"--host={self.host}",
+            f"--port={self.port}",
+            f"--user={self.user}",
+        ]
+        if self.password:
+            cmd.append(f"--password={self.password}")
+        cmd.extend(self.options)
+        cmd.append(database)
+        return cmd
 
+    def backup(self, database: str) -> Path:
+        """Dump a single database to a gzip-compressed SQL file."""
+        out_filename = self.out_dir / f"{database}-{today_stamp()}.sql.gz"
+        cmd = self._build_cmd(database)
+        self.logger.info("Running: %s", " ".join(cmd))
 
-    def getconfig(self):
-        config = ConfigParser.RawConfigParser()
-        try:
-            self.config = config.read(self.configfile)
-        except Exception,e:
-            logging.error ("Unable to read %s" % self.configfile)
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            text=False,
+        )
+        if proc.returncode != 0:
+            error = proc.stdout.decode("utf-8", errors="replace")
+            self.logger.error("mysqldump failed for %s: %s", database, error)
+            raise subprocess.CalledProcessError(proc.returncode, cmd, output=error)
 
+        with gzip.open(out_filename, "wb") as f:
+            f.write(proc.stdout)
+        self.logger.info("Wrote compressed dump to %s", out_filename)
+        return out_filename
 
-    def mysqlbackup(self,domaindb):
-        out_filename = "deneme.sql.gz"
-        db_user= "root"
-        db_pass= ""
-        options = "--singe-transaction --databases"
-
-        cmdL1 = ["mysqldump", "--user=" + db_user, "--password=" + db_pass, options, domaindb]
-        p1 = subprocess.Popen(cmdL1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        dump_output = p1.communicate()[0]
-
-        f = gzip.open(out_filename, "wb")
-        f.write(dump_output)
-        f.close()
+    def backup_all(self, databases: Iterable[str]) -> list[Path]:
+        """Dump multiple databases."""
+        return [self.backup(db) for db in databases]

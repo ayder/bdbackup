@@ -1,112 +1,131 @@
-#!/usr/bin/python
+"""Template-driven tar archive backup."""
+
+from __future__ import annotations
+
 import os
-import sys
 import tarfile
+from collections.abc import Iterable
+from pathlib import Path
 
-""" Class to backup a directory on a given template
-    basicly it works for directories under /home dir
-"""
+from bdbackup.utils import setup_logging
 
-class bdbackup():
-    """ Constructor requires those parameters
-        backup_dst : path where the archive will be created
-        template_filename : Template file to choose backup folders
-        chdir   : somewhere different form home
-    """
-    def __init__(self, backup_dst, template_filename=None, chdir=None,compression=None):
-        self.chdir = chdir
-        self.template_filename = template_filename
-        self.tar= None
-        self.backup_paths = None
-        self.backup_dst= backup_dst
+
+class FileBackup:
+    """Create a tar archive from a list of paths supplied by a template file."""
+
+    def __init__(
+        self,
+        backup_dst: str | Path,
+        template_filename: str | Path | None = None,
+        chdir: str | Path | None = None,
+        compression: bool = False,
+        exclude: Iterable[str] | None = None,
+    ):
+        self.chdir = Path(chdir) if chdir else None
+        self.template_filename = Path(template_filename) if template_filename else None
+        self.backup_paths: list[Path] = []
+        self.backup_dst = Path(backup_dst)
         self.compression = compression
-        self.tar_filename="backup-mdy"
-        self.tar_file = os.path.join(self.backup_dst,self.tar_filename)
-        print self.tar_file
+        self.exclude = {Path(e).resolve() for e in (exclude or [])}
+        self.tar: tarfile.TarFile | None = None
+        self.logger = setup_logging("bdbackup.file")
 
-        if self.compression:
-            self.tar_opt ="w:gz"
-            self.tar_filename= backup_dst + ".tar.gz"
-        else:
-            self.tar_opt = "w"
-            self.tar_filename= backup_dst + ".tar"
+        self.tar_opt = "w:gz" if compression else "w"
+        ext = ".tar.gz" if compression else ".tar"
+        self.tar_filename = Path(str(self.backup_dst) + ext)
 
-        if template_filename:
+        if self.backup_dst.is_dir():
+            raise IsADirectoryError(
+                f"backup_dst must be a file path, got directory: {self.backup_dst}"
+            )
+
+        self.backup_dst.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.template_filename:
             self.load_template(self.template_filename)
             self.open_archive()
 
-
-    def __del__(self):
-        """ Desctructor in case we forgot to close file
-        """
-        if self.tar:
-            self.close_archive()
-
-    def load_template(self, temp=None):
-        """ Load the template file and populare backup_paths
-        """
-        if temp:
-            self.tempalte_filename= temp
-        try:
-            temp_file = open(self.template_filename,'r')
-            self.backup_paths = temp_file.readlines()
-        except Exception,e:
-            print "%s template dosyasi acilamadi hata: %s" % (self.template_filename,e)
+    def load_template(self, template: str | Path) -> list[Path]:
+        """Load paths from a template file."""
+        template = Path(template)
+        if not template.exists():
+            raise FileNotFoundError(f"Template file not found: {template}")
+        lines = [
+            line.strip()
+            for line in template.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.backup_paths = [Path(line) for line in lines]
+        self.logger.info("Loaded %d paths from %s", len(self.backup_paths), template)
         return self.backup_paths
 
-    def open_archive(self):
-        """ Try to open the tar archive to a destination
-        """
+    def open_archive(self) -> tarfile.TarFile:
+        """Open the destination tar archive."""
         try:
-            self.tar = tarfile.open(self.tar_filename,self.tar_opt)
-        except Exception,e:
-            print "Unable to open %s error: %s" % (self.tar_file, e)
+            self.tar = tarfile.open(self.tar_filename, self.tar_opt)
+        except Exception as exc:  # pragma: no cover
+            self.logger.error("Unable to open %s: %s", self.tar_filename, exc)
+            raise
         return self.tar
 
-    def close_archive(self):
-        try:
-            self.tar.close()
-            self.tar = None
-        except Exception,e:
-            print "Unable to close %s error: %s" % (self.tarfile, e)
-        return
+    def close_archive(self) -> None:
+        """Close the archive if it is open."""
+        if self.tar:
+            try:
+                self.tar.close()
+            except Exception as exc:  # pragma: no cover
+                self.logger.error("Unable to close %s: %s", self.tar_filename, exc)
+                raise
+            finally:
+                self.tar = None
 
+    def _is_excluded(self, path: Path) -> bool:
+        """Check whether a path (or any parent) is in the exclude set."""
+        resolved = path.resolve()
+        if resolved in self.exclude:
+            return True
+        return any(resolved.is_relative_to(excluded) for excluded in self.exclude)
 
-
-    def backup(self,debug=False):
-        """ This does the backup
-            enable debug to see some fancy action
-        """
+    def backup(self, debug: bool = False) -> list[Path]:
+        """Add every template path to the archive."""
+        if not self.tar:
+            self.open_archive()
 
         if not self.backup_paths:
-            print "No information to backup. Does the template loaded?"
-            return 0
+            self.logger.warning("No information to backup. Is the template loaded?")
+            return []
 
         if self.chdir:
-            if os.path.isdir(self.chdir):
-                os.chdir(self.chdir)
-            else:
-                print "Unable to chdir to %s. No source directory found" %s (self.chdir)
+            if not self.chdir.is_dir():
+                raise NotADirectoryError(f"Unable to chdir to {self.chdir}")
+            os.chdir(self.chdir)
+            self.logger.info("Changed working directory to %s", self.chdir)
 
-        for path in self.backup_paths:
-            path = path.rstrip()
-
-            if os.path.exists(path):
-                if debug: print "Backing up:",path
+        backed_up: list[Path] = []
+        for raw_path in self.backup_paths:
+            path = raw_path
+            if self._is_excluded(path):
+                if debug:
+                    self.logger.info("Skipping excluded path: %s", path)
+                continue
+            if path.exists():
+                if debug:
+                    self.logger.info("Backing up: %s", path)
                 try:
-                    st = self.tar.add(path)
-                except Exception,e:
-                    print "%s dosyasinda hata:%s" %(path,e)
-            else :
-                print "Warning: backup path %s not found" % (path)
+                    self.tar.add(path, arcname=path.name)
+                    backed_up.append(path)
+                except Exception as exc:  # pragma: no cover
+                    self.logger.error("Error adding %s: %s", path, exc)
+            else:
+                self.logger.warning("Backup path not found: %s", path)
 
-        return st
+        self.logger.info("Backed up %d items to %s", len(backed_up), self.tar_filename)
+        return backed_up
 
+    def __enter__(self) -> FileBackup:
+        if not self.tar:
+            self.open_archive()
+        return self
 
-def main():
-    pass
-
-# Standard boilerplate to call the main() function to begin
-# the program.
-if __name__ == '__main__':
-    main()
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close_archive()

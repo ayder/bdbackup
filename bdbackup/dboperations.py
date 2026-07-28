@@ -1,61 +1,92 @@
-#!/usr/bin/python
+"""Lightweight MySQL operations for tracking backup metadata."""
 
-import MySQLdb
+from __future__ import annotations
 
-# Open database connection
-class mysqlops():
+from typing import Any
 
-    def __init__(self):
+from bdbackup.utils import setup_logging
 
+
+class MySQLOps:
+    """Manage backup metadata in a MySQL database.
+
+    Requires PyMySQL to be installed (``pip install bdbackup[mysql]``).
+    """
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        user: str = "root",
+        password: str = "",
+        database: str = "backup_information",
+    ):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.database = database
+        self.db: Any | None = None
+        self.cursor: Any | None = None
+        self.dblist: list[str] = []
+        self.logger = setup_logging("bdbackup.db")
+        self._connect()
+
+    def _connect(self) -> None:
         try:
-            self.db = MySQLdb.connect("localhost","root","","backup_information" )
-            self.cursor = db.cursor()
-        except:
-            print "Unable to connect mysql"
-        self.dblist = []
+            import pymysql
 
-    def get_dblist():
-        # prepare a cursor object using cursor() method
-        #cursor = db.cursor()
+            self.db = pymysql.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database,
+            )
+            self.cursor = self.db.cursor()
+            self.logger.info("Connected to MySQL metadata database")
+        except ImportError:
+            self.logger.error(
+                "PyMySQL is required for metadata tracking. "
+                "Install it with: pip install bdbackup[mysql]"
+            )
+            raise
+        except Exception as exc:
+            self.logger.error("Unable to connect to MySQL: %s", exc)
+            raise
 
-        # Prepare SQL query to INSERT a record into the database.
-        sql = "select `ID` ,`DATABASE`, `LAST_BACKUP_TIMESTAMP` \
-                from tbl_backup WHERE `STATUS` = 1"
-        count = 0
-
+    def get_dblist(self) -> list[str]:
+        """Return the list of active databases from tbl_backup."""
+        sql = (
+            "SELECT `ID`, `DATABASE`, `LAST_BACKUP_TIMESTAMP` "
+            "FROM tbl_backup WHERE `STATUS` = 1"
+        )
         try:
-           # Execute the SQL command
-           self.cursor.execute(sql)
-           # Fetch all the rows in a list of lists.
-           results = self.cursor.fetchall()
-           for row in results:
-              print row
-              id = row[0]
-              dbname = row[1]
-              backupts = row[2]
-              self.dblist[count] = dbname
-              count += 1
-        except Exception, e:
-           print "Error: unable to fecth data %s" % e
-              # Now print fetched result
-
-        print "ID=%d,DB=%s,TIME=%s" % \
-                     (id, dbname, backupts )
+            self.cursor.execute(sql)
+            rows = self.cursor.fetchall()
+            self.dblist = [row[1] for row in rows]
+            for row in rows:
+                self.logger.info("ID=%s, DB=%s, TIME=%s", row[0], row[1], row[2])
+        except Exception as exc:
+            self.logger.error("Unable to fetch database list: %s", exc)
+            raise
         return self.dblist
 
-        # disconnect from server
-
-    def updatedb(dbname):
-        """ Prepare SQL query to update required records"""
-        sql = "UPDATE tbl_backup SET `LAST_BACKUP_TIMESTAMP`= now() WHERE `DATABASE` = '%d'" % (dbname)
+    def update_db(self, dbname: str) -> None:
+        """Update the last backup timestamp for a database."""
+        sql = "UPDATE tbl_backup SET `LAST_BACKUP_TIMESTAMP` = NOW() WHERE `DATABASE` = %s"
         try:
-            # Execute the SQL command
-            self.cursor.execute(sql)
-            # Commit your changes in the database
+            self.cursor.execute(sql, (dbname,))
             self.db.commit()
-        except:
-            # Rollback in case there is any error
+            self.logger.info("Updated backup timestamp for %s", dbname)
+        except Exception as exc:
             self.db.rollback()
+            self.logger.error("Unable to update %s: %s", dbname, exc)
+            raise
 
-    def __del__(self):
-        self.db.close()
+    def close(self) -> None:
+        """Close the database connection."""
+        if self.db:
+            self.db.close()
+            self.db = None
+            self.cursor = None
+
+    def __del__(self) -> None:
+        self.close()

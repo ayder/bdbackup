@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bdbackup"
+version = "0.2.0"
+description = "Brain-dead backup: template-driven file backups and MySQL/xtrabackup helpers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [
+    { name = "Sinan Alyuruk", email = "sinan@dbsmedya.com" },
+]
+keywords = ["backup", "tar", "mysql", "xtrabackup", "mariabackup"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Archiving :: Backup",
+]
+
+dependencies = [
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+mysql = ["PyMySQL>=1.0"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "twine", "build"]
+
+[project.scripts]
+bdbackup = "bdbackup.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ayder/bdbackup"
+Repository = "https://github.com/ayder/bdbackup"
+Issues = "https://github.com/ayder/bdbackup/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bdbackup"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/bdbackup",
+    "/scripts",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
