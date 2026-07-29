@@ -1,7 +1,13 @@
 # bdbackup job configuration.
 #
-# Usage:  bdbackup run --config config.toml <job-name>
-#         bdbackup run --config config.toml --all
+# Usage:  bdbackup run --config ~/.config/bdbackup/config.toml <job-name>
+#         bdbackup run --config ~/.config/bdbackup/config.toml --all
+#
+# All bdbackup settings live under ~/.config/bdbackup/ (honours
+# $XDG_CONFIG_HOME and $BDBACKUP_CONFIG_DIR):
+#   config.toml          this file — job definitions
+#   files.template       file-backup path lists (one path per line)
+#   templates/*.py       user-defined exclusion templates (see below)
 #
 # Each top-level table is one job; its name is the table name and it must
 # set `type` (file | mysqldump | xtrabackup).
@@ -21,16 +27,19 @@
 type = "file"
 
 # Template file listing the paths to archive, one per line; blank lines and
-# lines starting with '#' are ignored.
-template_filename = "/etc/bdbackup/files.template"
+# lines starting with '#' are ignored. Keep it with the other settings in
+# ~/.config/bdbackup/.
+template_filename = "~/.config/bdbackup/files.template"
 
 # Destination archive path WITHOUT extension; the format's extension
 # (.tar / .tar.gz / .tar.zst) is appended automatically.
 backup_dst = "/backup/files/daily"
 
-# Resolve relative template paths against this directory. Also serves as the
-# root that relative exclusion-template patterns (e.g. "tests/containers/*")
-# are matched against, and archive member names become relative to it.
+# REQUIRED for file jobs: the source path being backed up. Relative entries
+# in the template file, relative `exclude` entries, and relative
+# exclusion-template patterns (e.g. "tests/containers/*") are all resolved
+# against this directory — never against the process working directory.
+# Archive member names are stored relative to it.
 chdir = "/srv/www"
 
 # Archive format: "tar", "tar.gz" or "tar.zst".
@@ -44,10 +53,11 @@ follow_symlinks = false
 # them is skipped. They apply to every file found while walking the
 # template's directories.
 
-# 1. Exact paths. Entries are resolved absolutely (relative entries resolve
-#    against the process working directory, NOT chdir — prefer absolute
-#    paths). Excluding a directory also excludes everything beneath it.
-exclude = ["/srv/www/uploads/tmp", "/srv/www/cache"]
+# 1. Exact paths. Absolute entries are used as-is; relative entries resolve
+#    against `chdir` (the source path), so "uploads/tmp" below means
+#    /srv/www/uploads/tmp. Excluding a directory also excludes everything
+#    beneath it.
+exclude = ["uploads/tmp", "/srv/www/cache"]
 
 # 2. fnmatch glob patterns. Each pattern is matched against the full resolved
 #    path AND against the basename, so "*.log" excludes app.log anywhere.

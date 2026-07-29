@@ -164,6 +164,25 @@ def test_file_backup_unknown_template_raises(tmp_path: Path):
         FileBackup(backup_dst=tmp_path / "archive", exclude_templates=["nope"])
 
 
+def test_relative_exclude_resolves_against_chdir(tmp_path: Path):
+    src = tmp_path / "proj"
+    (src / "uploads" / "tmp").mkdir(parents=True)
+    (src / "uploads" / "tmp" / "scratch.bin").write_text("tmp")
+    (src / "uploads" / "keep.txt").write_text("keep")
+    template = tmp_path / "template.txt"
+    template.write_text("proj\n")
+
+    fb = FileBackup(
+        backup_dst=tmp_path / "archive",
+        template_filename=template,
+        chdir=tmp_path,
+        exclude=["proj/uploads/tmp"],  # relative to chdir, not the process CWD
+    )
+    result = fb.backup()
+    members = _archive_members(result.path)
+    assert members == {"proj/uploads/keep.txt"}
+
+
 # --- CLI --------------------------------------------------------------------
 
 

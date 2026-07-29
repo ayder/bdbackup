@@ -72,7 +72,7 @@ Options:
 |------|-------------|
 | `--template` | Template file listing paths to archive |
 | `-d, --dst` | Destination archive path (without extension) |
-| `-c, --chdir` | Resolve template paths against this directory |
+| `-c, --chdir` | Source path: resolve template paths and relative excludes against it |
 | `-f, --format` | Archive format: `tar`, `tar.gz`, `tar.zst` |
 | `-x, --exclude` | Exact resolved path to exclude (repeatable) |
 | `--exclude-pattern` | Glob pattern to exclude (repeatable) |
@@ -211,14 +211,18 @@ error, so a partial backup can never be mistaken for a complete one.
 
 ## Config-driven jobs
 
-For scheduled or multi-job usage, define a TOML config file:
+For scheduled or multi-job usage, define a TOML config file. Convention:
+keep all bdbackup settings under `~/.config/bdbackup/` (honours
+`$XDG_CONFIG_HOME` / `$BDBACKUP_CONFIG_DIR`) — `config.toml`, the
+`files.template` path lists, and `templates/*.py` exclusion presets.
 
 ```toml
-# jobs.toml
+# ~/.config/bdbackup/config.toml
 [files-daily]
 type = "file"
-template_filename = "/etc/bdbackup/files.template"
+template_filename = "~/.config/bdbackup/files.template"
 backup_dst = "/backup/files/daily"
+chdir = "/srv/www"   # source path: template/exclude entries resolve against it
 format = "tar.zst"
 exclude_pattern = ["*.log", "node_modules"]
 exclude_templates = ["python-dev"]
@@ -245,13 +249,13 @@ for a fully annotated config with every option explained.
 Run one job:
 
 ```bash
-bdbackup run --config jobs.toml mysql-prod
+bdbackup run --config ~/.config/bdbackup/config.toml mysql-prod
 ```
 
 Run every job:
 
 ```bash
-bdbackup run --config jobs.toml --all
+bdbackup run --config ~/.config/bdbackup/config.toml --all
 ```
 
 ## Bash companion scripts (deprecated)

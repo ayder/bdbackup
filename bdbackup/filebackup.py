@@ -41,7 +41,14 @@ class FileBackup:
         self.compression = compression
         self.format = "tar.gz" if compression else format
         self.follow_symlinks = follow_symlinks
-        self.exclude = {Path(e).resolve() for e in (exclude or [])}
+        # Relative exclude entries resolve against chdir (the source path),
+        # never against the process working directory.
+        self.exclude = {
+            (Path(e) if Path(e).is_absolute() else self.chdir / Path(e)).resolve()
+            if self.chdir
+            else Path(e).resolve()
+            for e in (exclude or [])
+        }
         self.exclude_patterns = list(exclude_pattern or [])
         self.exclude_templates = list(exclude_templates or [])
         self._template_matcher = (
