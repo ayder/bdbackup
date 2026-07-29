@@ -5,8 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from bdbackup.filebackup import FileBackup
-from bdbackup.mysqlbackup import MySQLBackup
-from bdbackup.xtrabackup import XtraBackup
+from bdbackup.mysql import MySQLBackup, XtraBackup
 
 
 def test_file_backup_format_option(tmp_path: Path):

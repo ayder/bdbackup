@@ -7,9 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
-from bdbackup.mysqlbackup import MySQLBackup
-from bdbackup.xtrabackup import XtraBackup
 
 
 @dataclass
@@ -25,10 +24,13 @@ class ConfigError(Exception):
     """Raised when a configuration file is invalid."""
 
 
+def supported_types() -> set[str]:
+    """Return all valid job types: 'file' plus every registered engine name."""
+    return {"file"} | set(list_engines())
+
+
 class Config:
     """Load and validate a TOML job configuration file."""
-
-    SUPPORTED_TYPES = {"file", "mysqldump", "xtrabackup"}
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -45,10 +47,10 @@ class Config:
             if not isinstance(section, dict):
                 raise ConfigError(f"Job {name!r} must be a table")
             job_type = section.get("type")
-            if job_type not in self.SUPPORTED_TYPES:
+            if job_type not in supported_types():
                 raise ConfigError(
                     f"Job {name!r} has unsupported type {job_type!r}; "
-                    f"expected one of {self.SUPPORTED_TYPES}"
+                    f"expected one of {sorted(supported_types())}"
                 )
             params = {k: v for k, v in section.items() if k != "type"}
             self.jobs[name] = Job(name=name, type=job_type, params=params)
@@ -60,11 +62,10 @@ class Config:
 
 
 def build_backend(job: Job):
-    """Instantiate the appropriate backend for a parsed job."""
+    """Instantiate the appropriate backend for a parsed job via the engine registry."""
     if job.type == "file":
         return FileBackup(**job.params)
-    if job.type == "mysqldump":
-        return MySQLBackup(**job.params)
-    if job.type == "xtrabackup":
-        return XtraBackup(**job.params)
-    raise ConfigError(f"Unsupported job type: {job.type}")
+    try:
+        return get_engine(job.type).backend(**job.params)
+    except EngineError as exc:
+        raise ConfigError(str(exc)) from exc

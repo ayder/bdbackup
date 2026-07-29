@@ -6,9 +6,9 @@ import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from bdbackup.mysqlbackup import MySQLBackup
-from bdbackup.utils import mysql_cnf_file, redact_cmd
-from bdbackup.xtrabackup import XtraBackup
+from bdbackup.mysql import MySQLBackup, XtraBackup
+from bdbackup.mysql.helpers import mysql_cnf_file
+from bdbackup.utils import redact_cmd
 
 
 def test_redact_cmd_masks_secrets():

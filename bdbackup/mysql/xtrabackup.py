@@ -1,4 +1,10 @@
-"""Physical MySQL/MariaDB backup helpers using xtrabackup / mariabackup."""
+"""Physical MySQL/MariaDB backup engine using xtrabackup / mariabackup.
+
+This engine targets the legacy Percona XtraBackup / MariaDB mariabackup
+interface. Versioned variants (e.g. xtrabackup_80.py / xtrabackup_84.py /
+xtrabackup_97.py) can be dropped in as new modules next to this file without
+editing any existing code — they self-register under their own names.
+"""
 
 from __future__ import annotations
 
@@ -11,11 +17,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from bdbackup.backends import BackupError, BackupResult
-from bdbackup.utils import mysql_cnf_file, process_lock, redact_cmd
+from bdbackup.engines import EngineInfo, register_engine
+from bdbackup.mysql.helpers import mysql_cnf_file
+from bdbackup.utils import process_lock, redact_cmd
 
 
 class XtraBackup:
-    """Run full or incremental physical backups with xtrabackup / mariabackup."""
+    """Run full or incremental physical backups with xtrabackup / mariabackup (legacy)."""
 
     def __init__(
         self,
@@ -38,7 +46,7 @@ class XtraBackup:
         self.parallel = max(1, parallel)
         self.throttle = throttle
         self.retention_days = retention_days
-        self.logger = logging.getLogger("bdbackup.xtrabackup")
+        self.logger = logging.getLogger("bdbackup.mysql.xtrabackup")
 
     @property
     def date_dir(self) -> Path:
@@ -249,3 +257,15 @@ class XtraBackup:
                 shutil.rmtree(item)
                 removed.append(item)
         return removed
+
+
+ENGINE = EngineInfo(
+    name="xtrabackup",
+    backend=XtraBackup,
+    description=(
+        "Physical backups via legacy Percona XtraBackup / MariaDB mariabackup. "
+        "Versioned variants (xtrabackup80/84/97) self-register as separate engines."
+    ),
+    family="mysql",
+)
+register_engine(ENGINE)

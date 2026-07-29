@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bdbackup.filebackup import FileBackup
-from bdbackup.xtrabackup import XtraBackup
+from bdbackup.mysql import XtraBackup
 
 
 def test_xtrabackup_atomic_target_cleanup_on_failure(tmp_path: Path):

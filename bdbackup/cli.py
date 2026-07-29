@@ -13,9 +13,8 @@ from bdbackup import __version__
 from bdbackup.backends import BackupError, setup_logging
 from bdbackup.config import Config, ConfigError, build_backend
 from bdbackup.filebackup import FileBackup
-from bdbackup.mysqlbackup import MySQLBackup
+from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.templates import TemplateError
-from bdbackup.xtrabackup import XtraBackup
 
 # Exit-code contract: 0 ok, 1 backup/verify failure, 2 usage, 3 locked.
 EXIT_OK = 0

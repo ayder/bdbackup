@@ -12,8 +12,7 @@ from click.testing import CliRunner
 from bdbackup.backends import setup_logging
 from bdbackup.config import Config, ConfigError
 from bdbackup.filebackup import FileBackup
-from bdbackup.mysqlbackup import MySQLBackup
-from bdbackup.xtrabackup import XtraBackup
+from bdbackup.mysql import MySQLBackup, XtraBackup
 
 
 def test_all_backends_implement_protocol(tmp_path: Path):

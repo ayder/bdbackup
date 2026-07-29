@@ -9,8 +9,8 @@ from unittest.mock import patch
 
 from bdbackup.backends import BackupError
 from bdbackup.filebackup import FileBackup
+from bdbackup.mysql import XtraBackup
 from bdbackup.utils import process_lock
-from bdbackup.xtrabackup import XtraBackup
 
 
 def test_process_lock_blocks_second_acquirer(tmp_path: Path):

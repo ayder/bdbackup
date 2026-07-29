@@ -3,8 +3,7 @@
 __version__ = "0.4.0"
 
 from bdbackup.filebackup import FileBackup
-from bdbackup.mysqlbackup import MySQLBackup
-from bdbackup.xtrabackup import XtraBackup
+from bdbackup.mysql import MySQLBackup, XtraBackup
 
 __all__ = [
     "FileBackup",

@@ -8,14 +8,16 @@
 #   config.toml          this file — job definitions
 #   files.template       file-backup path lists (one path per line)
 #   templates/*.py       user-defined exclusion templates (see below)
+#   engines/*.py         user-defined database engines (see README "Database engines")
 #
 # Each top-level table is one job; its name is the table name and it must
-# set `type` (file | mysqldump | xtrabackup).
+# set `type`: file | mysqldump | xtrabackup, or any engine registered by a
+# dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
 # Every other key is passed verbatim to the backend's constructor
-# (FileBackup / MySQLBackup / XtraBackup), so key names use Python-style
-# underscores (e.g. exclude_templates), NOT the CLI's dashes
-# (--exclude-template). A key that doesn't match a constructor parameter
-# fails the job with a TypeError.
+# (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup), so
+# key names use Python-style underscores (e.g. exclude_templates), NOT the
+# CLI's dashes (--exclude-template). A key that doesn't match a constructor
+# parameter fails the job with a TypeError.
 #
 # Types must match the constructor: strings for paths, integers for ports,
 # booleans for flags, and arrays of strings for the exclusion lists.

@@ -1,4 +1,4 @@
-"""Logical MySQL backup helpers using mysqldump."""
+"""Logical MySQL backup engine using mysqldump."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from bdbackup.backends import BackupError, BackupResult
-from bdbackup.utils import mysql_cnf_file, redact_cmd, today_stamp
+from bdbackup.engines import EngineInfo, register_engine
+from bdbackup.mysql.helpers import mysql_cnf_file
+from bdbackup.utils import redact_cmd, today_stamp
 
 
 class MySQLBackup:
@@ -41,7 +43,7 @@ class MySQLBackup:
             "--triggers",
         ]
         self.options = list(options) if options is not None else default_opts
-        self.logger = logging.getLogger("bdbackup.mysql")
+        self.logger = logging.getLogger("bdbackup.mysql.mysqldump")
 
     def _build_cmd(self, database: str | None, defaults_file: Path) -> list[str]:
         cmd = [
@@ -125,3 +127,12 @@ class MySQLBackup:
     def prune(self) -> list[Path]:
         """mysqldump has no built-in retention policy; return an empty list."""
         return []
+
+
+ENGINE = EngineInfo(
+    name="mysqldump",
+    backend=MySQLBackup,
+    description="Logical backups via mysqldump (gzip-compressed SQL).",
+    family="mysql",
+)
+register_engine(ENGINE)
