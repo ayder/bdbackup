@@ -9,7 +9,7 @@ from pathlib import Path
 
 import click
 
-from bdbackup import __version__
+from bdbackup import __version__, retention
 from bdbackup.backends import BackupError, setup_logging
 from bdbackup.config import Config, ConfigError, build_backend
 from bdbackup.filebackup import FileBackup
@@ -483,6 +483,111 @@ def xtrabackup_prepare(
     return _handle_errors(lambda: (xb.prepare(target), click.echo(f"Prepared: {target}")))
 
 
+
+
+@main.command()
+@click.option(
+    "--full-dir",
+    required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory containing full backups.",
+)
+@click.option(
+    "--incr-dir",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory containing incremental backups (optional).",
+)
+@click.option(
+    "--log-dir",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory containing backup logs to expire by age (optional).",
+)
+@click.option("--full-glob", default=retention.DEFAULTS["full_glob"], show_default=True,
+              help="Glob matching full backup files.")
+@click.option("--incr-glob", default=retention.DEFAULTS["incr_glob"], show_default=True,
+              help="Glob matching incremental backup files.")
+@click.option("--log-glob", default=retention.DEFAULTS["log_glob"], show_default=True,
+              help="Glob matching log files.")
+@click.option("--daily", default=retention.DEFAULTS["daily"], show_default=True, type=int,
+              help="Keep EVERY backup of the last N calendar days.")
+@click.option("--weekly", default=retention.DEFAULTS["weekly"], show_default=True, type=int,
+              help="Then one backup per ISO week, for N weeks.")
+@click.option("--monthly", default=retention.DEFAULTS["monthly"], show_default=True, type=int,
+              help="Then one backup per calendar month, for N months.")
+@click.option("--incr-days", default=retention.DEFAULTS["incr_days"], show_default=True,
+              type=int, help="Keep incrementals for N days, never past their full.")
+@click.option("--log-days", default=retention.DEFAULTS["log_days"], show_default=True,
+              type=int, help="Keep logs for N days.")
+@click.option("--pick", "pick_mode", default=retention.DEFAULTS["pick"], show_default=True,
+              type=click.Choice(["first", "last"]),
+              help="Which backup survives inside a week/month bucket.")
+@click.option("--min-keep-fulls", default=retention.DEFAULTS["min_keep_fulls"],
+              show_default=True, type=int,
+              help="Safety floor: never leave fewer than N fulls on disk.")
+@click.option("--now", default=None, metavar="YYYY-MM-DD",
+              help="Pretend it is this date (for testing).")
+@click.option("--apply", is_flag=True, help="Actually delete; default is a dry run.")
+@click.option("-q", "--quiet", is_flag=True, help="Only print the summary line.")
+def retention_cmd(
+    full_dir: Path,
+    incr_dir: Path | None,
+    log_dir: Path | None,
+    full_glob: str,
+    incr_glob: str,
+    log_glob: str,
+    daily: int,
+    weekly: int,
+    monthly: int,
+    incr_days: int,
+    log_days: int,
+    pick_mode: str,
+    min_keep_fulls: int,
+    now: str | None,
+    apply: bool,
+    quiet: bool,
+) -> int:
+    """Apply a GFS (daily/weekly/monthly) retention policy to a backup tree.
+
+    Default is a DRY RUN: nothing is deleted until --apply is passed.
+    Incremental backups are chain-safe: they never outlive their parent full,
+    and a full that still anchors a live incremental is kept.
+    """
+    import datetime as _dt
+
+    now_dt = None
+    if now:
+        try:
+            now_dt = _dt.datetime.strptime(now, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59
+            )
+        except ValueError:
+            raise click.UsageError("--now must be YYYY-MM-DD") from None
+
+    log_level = click.get_current_context().obj.get("log_level", "INFO")
+    rc = retention.run_job(
+        full_dir=full_dir,
+        incr_dir=incr_dir,
+        log_dir=log_dir,
+        full_glob=full_glob,
+        incr_glob=incr_glob,
+        log_glob=log_glob,
+        daily=daily,
+        weekly=weekly,
+        monthly=monthly,
+        incr_days=incr_days,
+        log_days=log_days,
+        pick_mode=pick_mode,
+        min_keep_fulls=min_keep_fulls,
+        now=now_dt,
+        apply_changes=apply,
+        verbose=(log_level == "DEBUG"),
+        quiet=quiet,
+    )
+    if rc:
+        click.get_current_context().exit(rc)
+    return rc
 @main.command()
 @click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
@@ -545,8 +650,22 @@ def run(
     failed = 0
     for name in names:
         job = config.get(name)
-        backend = build_backend(job)
         logger.info("Running job %r (%s)", name, job.type)
+
+        if job.type == "retention":
+            params = dict(job.params)
+            # Config uses CLI-style names; map to run_job's parameters.
+            if "apply" in params:
+                params["apply_changes"] = params.pop("apply")
+            if "pick" in params:
+                params["pick_mode"] = params.pop("pick")
+            rc = retention.run_job(**params)
+            if rc:
+                logger.error("Job %r failed (exit %s)", name, rc)
+                failed += 1
+            continue
+
+        backend = build_backend(job)
         try:
             result = backend.backup()
             if verify:
@@ -556,7 +675,10 @@ def run(
             logger.error("Job %r failed: %s", name, exc)
             failed += 1
 
-    return EXIT_BACKUP_FAILED if failed else EXIT_OK
+    rc = EXIT_BACKUP_FAILED if failed else EXIT_OK
+    if rc:
+        click.get_current_context().exit(rc)
+    return rc
 
 
 if __name__ == "__main__":

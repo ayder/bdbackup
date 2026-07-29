@@ -252,12 +252,55 @@ A process lock prevents two backup runs from corrupting the same backup root.
 Failed backups are written to a temporary directory first and cleaned up on
 error, so a partial backup can never be mistaken for a complete one.
 
+## Retention policy (GFS)
+
+The `bdbackup retention` command applies a grandfather-father-son policy to
+a backup tree: keep **every** backup for the last N days, then **one per ISO
+week** for N weeks, then **one per calendar month** for N months. Tiers are
+sequential and never overlap, so the retained set is deterministic and easy to
+reason about.
+
+```bash
+# Dry run (default) -- lists what would be deleted, changes nothing
+bdbackup retention --full-dir /backup/mysql/production \
+    --incr-dir /backup/mysql/production/incr \
+    --log-dir /backup/mysql/production/log \
+    --daily 7 --weekly 4 --monthly 6 \
+    --incr-days 7 --log-days 30 \
+    --min-keep-fulls 2 --pick first
+
+# Actually delete
+bdbackup retention ... --apply
+```
+
+| Tier | Flag | Meaning |
+|------|------|---------|
+| Daily | `--daily N` | Keep every backup of the last N calendar days |
+| Weekly | `--weekly N` | Then one backup per ISO week, for N weeks |
+| Monthly | `--monthly N` | Then one backup per calendar month, for N months |
+| Incrementals | `--incr-days N` | Keep incrementals for N days, never past their full |
+| Logs | `--log-days N` | Keep log files for N days |
+| Safety | `--min-keep-fulls N` | Never leave fewer than N newest fulls |
+| Pick | `--pick first/last` | Which backup survives in a weekly/monthly bucket |
+
+**Chain safety:** incrementals are attached to the newest full at or before
+their timestamp. An incremental whose parent full has expired is dropped as an
+orphan; a full that still anchors a live incremental is kept past the GFS tiers
+and marked as a **chain anchor**. This prevents the classic data-loss bug
+where a weekly bucket evicts the full that daily-window incrementals still
+depend on.
+
+Only `--full-dir` is required. `--incr-dir` and `--log-dir` are optional.
+`--full-glob`, `--incr-glob`, and `--log-glob` default to `full_*.mbi`,
+`incr_*.mbi`, and `*.log`.
+
 ## Config-driven jobs
 
 For scheduled or multi-job usage, define a TOML config file. Convention:
 keep all bdbackup settings under `~/.config/bdbackup/` (honours
 `$XDG_CONFIG_HOME` / `$BDBACKUP_CONFIG_DIR`) — `config.toml`, the
-`files.template` path lists, and `templates/*.py` exclusion presets.
+`files.template` path lists, `templates/*.py` exclusion presets, and
+`engines/*.py` database engines.
 
 ```toml
 # ~/.config/bdbackup/config.toml
@@ -282,6 +325,20 @@ type = "mysqldump"
 out_dir = "/backup/mysql/dumps"
 user = "backup"
 options = ["--single-transaction", "--all-databases"]
+
+[mysql-prod-retention]
+type = "retention"
+full_dir = "/backup/mysql/production"
+incr_dir = "/backup/mysql/production/incr"
+log_dir = "/backup/mysql/production/log"
+daily = 7
+weekly = 4
+monthly = 6
+incr_days = 7
+log_days = 30
+min_keep_fulls = 2
+pick = "first"
+apply = false           # set true once the dry-run output looks right
 ```
 
 Each top-level table is one job; its keys (except `type`) are passed verbatim

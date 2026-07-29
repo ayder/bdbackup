@@ -11,13 +11,13 @@
 #   engines/*.py         user-defined database engines (see README "Database engines")
 #
 # Each top-level table is one job; its name is the table name and it must
-# set `type`: file | mysqldump | xtrabackup, or any engine registered by a
-# dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
-# Every other key is passed verbatim to the backend's constructor
-# (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup), so
-# key names use Python-style underscores (e.g. exclude_templates), NOT the
-# CLI's dashes (--exclude-template). A key that doesn't match a constructor
-# parameter fails the job with a TypeError.
+# set `type`: file | mysqldump | xtrabackup | retention, or any engine
+# registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
+# Every other key is passed verbatim to the backend/policy constructor
+# (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup /
+# bdbackup.retention.run_job), so key names use Python-style underscores
+# (e.g. exclude_templates), NOT the CLI's dashes (--exclude-template).
+# A key that doesn't match a constructor/parameter fails the job with a TypeError.
 #
 # Types must match the constructor: strings for paths, integers for ports,
 # booleans for flags, and arrays of strings for the exclusion lists.
@@ -103,7 +103,7 @@ jobs = 1
 type = "xtrabackup"
 
 # Root directory for this job's backups; dated subdirectories are created
-# underneath and pruned after `retention_days`.
+# underneath.
 backup_root = "/backup/mysql/production"
 
 user = "xtrabackup"
@@ -113,4 +113,34 @@ compress = "zstd"                # compression algorithm for --compress
 compress_threads = 4
 parallel = 2                     # copy threads
 # throttle = 200                 # optional IOPS limit
-retention_days = 7               # prune backups older than this
+
+# ---------------------------------------------------------------------------
+# GFS retention policy for a backup tree (dry-run by default; set apply=true
+# to actually delete files). Incrementals are chain-safe: they never outlive
+# their parent full, and a full that still anchors a live incremental is kept.
+# ---------------------------------------------------------------------------
+[mysql-prod-retention]
+type = "retention"
+
+# Required. Directories containing full / incremental / log backups.
+full_dir = "/backup/mysql/production"
+incr_dir = "/backup/mysql/production/incr"   # optional; omit if none
+log_dir = "/backup/mysql/production/log"     # optional; omit if none
+
+# GFS tier counts.
+daily = 7                # keep EVERY backup of the last 7 calendar days
+weekly = 4               # then one backup per ISO week, for 4 weeks
+monthly = 6              # then one backup per calendar month, for 6 months
+
+# How many days of incrementals to keep, how many days of logs, and which
+# backup in a weekly/monthly bucket survives.
+incr_days = 7
+log_days = 30
+pick = "first"           # "first" (oldest/stable) or "last" (newest)
+
+# Safety floor: never leave fewer than this many newest fulls, whatever the
+# tiers say. Useful after a clock skew, restore from tape, etc.
+min_keep_fulls = 2
+
+# CRITICAL: default is false (dry run). Inspect the output, then set true.
+apply = false
