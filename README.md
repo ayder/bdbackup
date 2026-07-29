@@ -76,6 +76,7 @@ Options:
 | `-f, --format` | Archive format: `tar`, `tar.gz`, `tar.zst` |
 | `-x, --exclude` | Exact resolved path to exclude (repeatable) |
 | `--exclude-pattern` | Glob pattern to exclude (repeatable) |
+| `--exclude-template` | Named exclusion template, e.g. `python-dev` (repeatable, comma-separated allowed) |
 | `--follow-symlinks` | Follow symbolic links when archiving |
 | `--dry-run` | List what would be archived without writing anything |
 | `--verify / --no-verify` | Verify the archive after creation (default: on) |
@@ -85,6 +86,42 @@ Restore a file archive:
 
 ```bash
 bdbackup restore /backup/files/daily.tar -d /restore/here
+```
+
+### Exclusion templates
+
+`--exclude-template` applies a named bundle of gitignore-style exclusion
+patterns so you don't have to repeat common artifact rules:
+
+```bash
+bdbackup file --template backup-template.txt -d /backup/files/daily \
+    --exclude-template python-dev
+```
+
+The built-in `python-dev` template skips `__pycache__/`, `*.pyc`, `.venv/`,
+`venv/`, `uv.lock`, `Pipfile.lock`, `poetry.lock`, `*.egg-info/`, `build/`,
+`dist/`, and common tool caches (`.mypy_cache/`, `.pytest_cache/`,
+`.ruff_cache/`, `.tox/`, ...). Templates are repeatable and comma-separated
+values work too; they combine with `-x/--exclude` and `--exclude-pattern`.
+
+Patterns use gitignore-style syntax: `*.pyc` matches at any depth, a trailing
+`/` matches directories only, patterns containing a `/` (e.g.
+`tests/containers/*img`) match relative to the backup root, a leading `/`
+anchors to the root, and `!` negates a previous pattern.
+
+Custom templates are plain Python files in `~/.config/bdbackup/templates/`
+(honours `$XDG_CONFIG_HOME` and `$BDBACKUP_CONFIG_DIR`) that self-register —
+no existing code needs to change to add one:
+
+```python
+# ~/.config/bdbackup/templates/go_dev.py
+from bdbackup.templates import ExclusionTemplate
+
+TEMPLATE = ExclusionTemplate(
+    name="go-dev",
+    patterns=("vendor/", "vendor/**", "*.test", "go.work"),
+    description="Go development artifacts",
+)
 ```
 
 ## mysqldump
@@ -178,27 +215,32 @@ For scheduled or multi-job usage, define a TOML config file:
 
 ```toml
 # jobs.toml
-[job.files-daily]
+[files-daily]
 type = "file"
 template_filename = "/etc/bdbackup/files.template"
 backup_dst = "/backup/files/daily"
 format = "tar.zst"
 exclude_pattern = ["*.log", "node_modules"]
+exclude_templates = ["python-dev"]
 
-[job.mysql-prod]
+[mysql-prod]
 type = "xtrabackup"
 backup_root = "/backup/mysql/production"
-database = "production"
 user = "xtrabackup"
 retention_days = 7
 parallel = 2
 
-[job.mysqldump-all]
+[mysqldump-all]
 type = "mysqldump"
 out_dir = "/backup/mysql/dumps"
 user = "backup"
-full = true
+options = ["--single-transaction", "--all-databases"]
 ```
+
+Each top-level table is one job; its keys (except `type`) are passed verbatim
+to the backend constructor, so they use Python-style underscores
+(`exclude_templates`), not CLI dashes. See [config.toml.example](config.toml.example)
+for a fully annotated config with every option explained.
 
 Run one job:
 

@@ -14,6 +14,7 @@ from bdbackup.backends import BackupError, setup_logging
 from bdbackup.config import Config, ConfigError, build_backend
 from bdbackup.filebackup import FileBackup
 from bdbackup.mysqlbackup import MySQLBackup
+from bdbackup.templates import TemplateError
 from bdbackup.xtrabackup import XtraBackup
 
 # Exit-code contract: 0 ok, 1 backup/verify failure, 2 usage, 3 locked.
@@ -97,6 +98,16 @@ def _handle_errors(func, *args, **kwargs) -> int:
     help="Glob pattern to exclude; can be repeated.",
 )
 @click.option(
+    "--exclude-template",
+    "exclude_templates",
+    multiple=True,
+    metavar="NAME",
+    help=(
+        "Named exclusion template (e.g. python-dev); can be repeated or "
+        "comma-separated. User templates live in ~/.config/bdbackup/templates/."
+    ),
+)
+@click.option(
     "--follow-symlinks/--no-follow-symlinks",
     default=False,
     show_default=True,
@@ -121,6 +132,7 @@ def file(
     archive_format: str,
     exclude: tuple[str, ...],
     exclude_pattern: tuple[str, ...],
+    exclude_templates: tuple[str, ...],
     follow_symlinks: bool,
     dry_run: bool,
     verify: bool,
@@ -128,18 +140,25 @@ def file(
     """Create a tar archive from a template file listing paths."""
     log_level = click.get_current_context().obj.get("log_level", "INFO")
     debug = log_level == "DEBUG"
+    template_names = [
+        n.strip() for group in exclude_templates for n in group.split(",") if n.strip()
+    ]
 
     def _run() -> None:
-        fb = FileBackup(
-            backup_dst=dst,
-            template_filename=template,
-            chdir=chdir,
-            compression=compress,
-            format=archive_format,
-            exclude=exclude,
-            exclude_pattern=exclude_pattern,
-            follow_symlinks=follow_symlinks,
-        )
+        try:
+            fb = FileBackup(
+                backup_dst=dst,
+                template_filename=template,
+                chdir=chdir,
+                compression=compress,
+                format=archive_format,
+                exclude=exclude,
+                exclude_pattern=exclude_pattern,
+                exclude_templates=template_names,
+                follow_symlinks=follow_symlinks,
+            )
+        except TemplateError as exc:
+            raise click.UsageError(str(exc)) from exc
         try:
             result = fb.backup(debug=debug, dry_run=dry_run)
             if verify and not dry_run:

@@ -1,0 +1,104 @@
+# bdbackup job configuration.
+#
+# Usage:  bdbackup run --config config.toml <job-name>
+#         bdbackup run --config config.toml --all
+#
+# Each top-level table is one job; its name is the table name and it must
+# set `type` (file | mysqldump | xtrabackup).
+# Every other key is passed verbatim to the backend's constructor
+# (FileBackup / MySQLBackup / XtraBackup), so key names use Python-style
+# underscores (e.g. exclude_templates), NOT the CLI's dashes
+# (--exclude-template). A key that doesn't match a constructor parameter
+# fails the job with a TypeError.
+#
+# Types must match the constructor: strings for paths, integers for ports,
+# booleans for flags, and arrays of strings for the exclusion lists.
+
+# ---------------------------------------------------------------------------
+# File backup: tar archive built from a plain-text template of paths.
+# ---------------------------------------------------------------------------
+[files-daily]
+type = "file"
+
+# Template file listing the paths to archive, one per line; blank lines and
+# lines starting with '#' are ignored.
+template_filename = "/etc/bdbackup/files.template"
+
+# Destination archive path WITHOUT extension; the format's extension
+# (.tar / .tar.gz / .tar.zst) is appended automatically.
+backup_dst = "/backup/files/daily"
+
+# Resolve relative template paths against this directory. Also serves as the
+# root that relative exclusion-template patterns (e.g. "tests/containers/*")
+# are matched against, and archive member names become relative to it.
+chdir = "/srv/www"
+
+# Archive format: "tar", "tar.gz" or "tar.zst".
+format = "tar.zst"
+
+# Follow symbolic links while walking directories (default: false).
+follow_symlinks = false
+
+# --- Exclusions ------------------------------------------------------------
+# All three mechanisms are optional and MERGE: a path excluded by any of
+# them is skipped. They apply to every file found while walking the
+# template's directories.
+
+# 1. Exact paths. Entries are resolved absolutely (relative entries resolve
+#    against the process working directory, NOT chdir — prefer absolute
+#    paths). Excluding a directory also excludes everything beneath it.
+exclude = ["/srv/www/uploads/tmp", "/srv/www/cache"]
+
+# 2. fnmatch glob patterns. Each pattern is matched against the full resolved
+#    path AND against the basename, so "*.log" excludes app.log anywhere.
+exclude_pattern = ["*.log", "node_modules"]
+
+# 3. Named exclusion templates: reusable bundles of gitignore-style patterns.
+#    Built-in: "python-dev" (__pycache__/, *.pyc, .venv/, venv/, uv.lock,
+#    Pipfile.lock, poetry.lock, *.egg-info/, build/, dist/, tool caches...).
+#    User-defined presets are self-registering .py files in
+#    ~/.config/bdbackup/templates/ (honours $XDG_CONFIG_HOME and
+#    $BDBACKUP_CONFIG_DIR) — resolved as the user running the backup, which
+#    matters for cron/systemd jobs. Gitignore syntax: trailing "/" matches
+#    directories only, a leading "/" anchors to the chdir root, "!" negates.
+exclude_templates = ["python-dev"]
+
+# ---------------------------------------------------------------------------
+# mysqldump: logical dump of one database (or all, when using --full on CLI;
+# config jobs dump the `options` databases).
+# ---------------------------------------------------------------------------
+[mysql-dump]
+type = "mysqldump"
+
+# Directory the dump file is written into (created if missing).
+out_dir = "/backup/mysql/dumps"
+
+user = "backup"                  # MySQL user
+# password = "secret"            # prefer omitting; CLI can prompt securely
+host = "localhost"
+port = 3306
+
+# mysqldump options as an array of strings (CLI takes them comma-separated).
+options = ["--single-transaction", "--databases"]
+
+# Parallel dumps when several databases are given (default: 1).
+jobs = 1
+
+# ---------------------------------------------------------------------------
+# xtrabackup/mariabackup: physical backups with retention-based pruning.
+# ---------------------------------------------------------------------------
+[mysql-prod]
+type = "xtrabackup"
+
+# Root directory for this job's backups; dated subdirectories are created
+# underneath and pruned after `retention_days`.
+backup_root = "/backup/mysql/production"
+
+user = "xtrabackup"
+# password = "secret"
+binary = "xtrabackup"            # or "mariabackup"
+compress = "zstd"                # compression algorithm for --compress
+compress_threads = 4
+parallel = 2                     # copy threads
+# throttle = 200                 # optional IOPS limit
+retention_days = 7               # prune backups older than this

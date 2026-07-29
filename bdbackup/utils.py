@@ -44,6 +44,21 @@ def read_template(path: Path | str) -> list[str]:
     ]
 
 
+def config_dir() -> Path:
+    """Return the bdbackup user configuration directory.
+
+    Resolution order: $BDBACKUP_CONFIG_DIR, then $XDG_CONFIG_HOME/bdbackup,
+    then ~/.config/bdbackup. The directory is not created implicitly.
+    """
+    env = os.environ.get("BDBACKUP_CONFIG_DIR")
+    if env:
+        return Path(env)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "bdbackup"
+    return Path.home() / ".config" / "bdbackup"
+
+
 def today_stamp() -> str:
     """Return a UTC YYYY-MM-DD-HHMMSS style timestamp."""
     from datetime import datetime

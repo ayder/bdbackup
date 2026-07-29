@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from bdbackup.backends import BackupError, BackupResult
+from bdbackup.templates import build_matcher, resolve_patterns
 
 
 class FileBackup:
@@ -30,6 +31,7 @@ class FileBackup:
         format: str = "tar",
         exclude: Iterable[str] | None = None,
         exclude_pattern: Iterable[str] | None = None,
+        exclude_templates: Iterable[str] | None = None,
         follow_symlinks: bool = False,
     ):
         self.chdir = Path(chdir) if chdir else None
@@ -41,6 +43,12 @@ class FileBackup:
         self.follow_symlinks = follow_symlinks
         self.exclude = {Path(e).resolve() for e in (exclude or [])}
         self.exclude_patterns = list(exclude_pattern or [])
+        self.exclude_templates = list(exclude_templates or [])
+        self._template_matcher = (
+            build_matcher(resolve_patterns(self.exclude_templates))
+            if self.exclude_templates
+            else None
+        )
         self.tar: tarfile.TarFile | None = None
         self.logger = logging.getLogger("bdbackup.file")
 
@@ -95,7 +103,14 @@ class FileBackup:
             finally:
                 self.tar = None
 
-    def _is_excluded(self, path: Path) -> bool:
+    def _match_roots(self) -> list[Path]:
+        """Roots that relative template patterns are matched against."""
+        # Path() strips trailing slashes, which resolve() may keep on macOS.
+        if self.chdir:
+            return [Path(self.chdir.resolve())]
+        return [Path(p.resolve()) for p in self.backup_paths]
+
+    def _is_excluded(self, path: Path, is_dir: bool | None = None) -> bool:
         """Check whether a path matches an explicit exclude or a glob pattern."""
         resolved = path.resolve()
         if resolved in self.exclude:
@@ -104,6 +119,11 @@ class FileBackup:
             return True
         for pattern in self.exclude_patterns:
             if fnmatch.fnmatch(str(resolved), pattern) or fnmatch.fnmatch(path.name, pattern):
+                return True
+        if self._template_matcher is not None:
+            if is_dir is None:
+                is_dir = path.is_dir()
+            if self._template_matcher.matches(resolved, is_dir, self._match_roots()):
                 return True
         return False
 
@@ -143,7 +163,7 @@ class FileBackup:
                     root_path = Path(root)
                     for filename in files:
                         child = root_path / filename
-                        if self._is_excluded(child):
+                        if self._is_excluded(child, is_dir=False):
                             self.logger.debug("Skipping excluded path: %s", child)
                             continue
                         yield child, self._make_arcname(child, self.chdir)
