@@ -150,8 +150,7 @@ def file(
                 backup_dst=dst,
                 template_filename=template,
                 chdir=chdir,
-                compression=compress,
-                format=archive_format,
+                format="tar.gz" if compress else archive_format,
                 exclude=exclude,
                 exclude_pattern=exclude_pattern,
                 exclude_templates=template_names,
@@ -498,7 +497,7 @@ def xtrabackup_prepare(
     "-c",
     "--chdir",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
-    help="Resolve template paths against this directory (legacy).",
+    help="Resolve template paths against this directory.",
 )
 def restore(
     archive: Path,
@@ -559,99 +558,6 @@ def run(
             failed += 1
 
     return EXIT_BACKUP_FAILED if failed else EXIT_OK
-
-
-# Backwards-compatible single command alias.
-@main.command()
-@click.argument("mode", type=click.Choice(["full", "incremental"], case_sensitive=False))
-@click.option("--database", required=True, help="Database name (used for directory naming).")
-@click.option(
-    "-r",
-    "--root",
-    "backup_root",
-    required=True,
-    type=click.Path(file_okay=False, path_type=Path),
-    help="Backup root directory.",
-)
-@click.option("-u", "--user", default="xtrabackup", show_default=True, help="MySQL user.")
-@click.option(
-    "-p",
-    "--password",
-    default=None,
-    help="MySQL password. If given without a value, you are prompted securely.",
-)
-@click.option(
-    "-b",
-    "--binary",
-    default="xtrabackup",
-    show_default=True,
-    help="Backup binary (xtrabackup or mariabackup).",
-)
-@click.option("--compress", default="zstd", show_default=True, help="Compression algorithm.")
-@click.option(
-    "--compress-threads",
-    default=4,
-    show_default=True,
-    type=int,
-    help="Number of compression threads.",
-)
-@click.option(
-    "--parallel",
-    default=1,
-    show_default=True,
-    type=int,
-    help="Number of copy threads.",
-)
-@click.option(
-    "--throttle",
-    default=None,
-    type=int,
-    help="Limit I/O to this many IOPS.",
-)
-@click.option("--retention", default=5, show_default=True, type=int, help="Retention in days.")
-@click.option(
-    "--verify/--no-verify",
-    default=True,
-    show_default=True,
-    help="Verify the backup after creation.",
-)
-def xtrabackup_legacy(
-    mode: str,
-    database: str,
-    backup_root: Path,
-    user: str,
-    password: str | None,
-    binary: str,
-    compress: str,
-    compress_threads: int,
-    parallel: int,
-    throttle: int | None,
-    retention: int,
-    verify: bool,
-) -> int:
-    """Legacy command: same as 'bdbackup xtrabackup full|incremental'."""
-    xb = XtraBackup(
-        backup_root=backup_root / database,
-        user=user,
-        password=password,
-        binary=binary,
-        compress=compress,
-        compress_threads=compress_threads,
-        parallel=parallel,
-        throttle=throttle,
-        retention_days=retention,
-    )
-
-    def _run() -> None:
-        if mode == "full":
-            result = xb.full_backup()
-        else:
-            result = xb.incremental_backup()
-        if verify:
-            xb.verify(result)
-        click.echo(f"Backup written to: {result.path}")
-
-    return _handle_errors(_run)
 
 
 if __name__ == "__main__":

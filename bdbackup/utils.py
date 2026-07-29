@@ -32,18 +32,6 @@ def process_lock(lock_path: str | Path):
         os.close(fd)
 
 
-def read_template(path: Path | str) -> list[str]:
-    """Read a template file and return non-empty, stripped lines."""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Template file not found: {path}")
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-
 def config_dir() -> Path:
     """Return the bdbackup user configuration directory.
 

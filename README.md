@@ -258,20 +258,6 @@ Run every job:
 bdbackup run --config ~/.config/bdbackup/config.toml --all
 ```
 
-## Bash companion scripts (deprecated)
-
-The `scripts/` directory still contains the original `xtrabackup` workflows as
-standalone Bash scripts. They are kept for reference but are no longer the
-recommended interface; use the Python CLI instead.
-
-```bash
-scripts/full_backup.sh
-scripts/inc_backup.sh
-```
-
-Both scripts respect environment variables such as `BACKUP_ROOT`, `MYSQL_USER`,
-`MYSQL_PASSWORD`, `RETENTION_DAYS` and `BACKUP_BIN`.
-
 ## Development
 
 Run tests and linting:

@@ -27,7 +27,6 @@ class FileBackup:
         backup_dst: str | Path,
         template_filename: str | Path | None = None,
         chdir: str | Path | None = None,
-        compression: bool = False,
         format: str = "tar",
         exclude: Iterable[str] | None = None,
         exclude_pattern: Iterable[str] | None = None,
@@ -38,8 +37,7 @@ class FileBackup:
         self.template_filename = Path(template_filename) if template_filename else None
         self.backup_paths: list[Path] = []
         self.backup_dst = Path(backup_dst)
-        self.compression = compression
-        self.format = "tar.gz" if compression else format
+        self.format = format
         self.follow_symlinks = follow_symlinks
         # Relative exclude entries resolve against chdir (the source path),
         # never against the process working directory.
