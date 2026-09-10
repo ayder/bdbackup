@@ -9,6 +9,7 @@ from typing import Any
 
 from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
+from bdbackup.history import HistorySettings
 
 
 @dataclass
@@ -35,6 +36,7 @@ class Config:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser().resolve()
         self.jobs: dict[str, Job] = {}
+        self.history: HistorySettings | None = None
         self._load()
 
     def _load(self) -> None:
@@ -45,6 +47,18 @@ class Config:
                 data = tomllib.load(f)
         except (OSError, tomllib.TOMLDecodeError) as exc:
             raise ConfigError(f"Cannot read config {self.path}: {exc}") from exc
+
+        if "history" in data:
+            section = data.pop("history")
+            if not isinstance(section, dict) or set(section) - {"database", "restore_root"}:
+                raise ConfigError("[history] accepts only database and restore_root")
+            paths = {}
+            for key, default in (("database", None), ("restore_root", "restores")):
+                value = section.get(key, default)
+                if not isinstance(value, str) or not value.strip() or value == ":memory:":
+                    raise ConfigError(f"[history] {key} must be a nonempty filesystem path")
+                paths[key] = (self.path.parent / Path(value).expanduser()).resolve()
+            self.history = HistorySettings(**paths)
 
         for name, section in data.items():
             if not isinstance(section, dict):

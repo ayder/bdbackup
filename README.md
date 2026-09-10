@@ -32,6 +32,14 @@ being modified by another process during extraction.
 
 ## Installation
 
+Install the current code from the original GitHub repository:
+
+```bash
+pip install "git+https://github.com/ayder/bdbackup.git"
+```
+
+For versions published to PyPI:
+
 ```bash
 pip install bdbackup
 ```
@@ -406,7 +414,8 @@ config file's directory. Template entries and `exclude` entries resolve against
 mysqldump job, set `database = "mydatabase"`; for all databases include
 `--all-databases` in `options`.
 
-Each top-level table is one job; its keys (except `type`) are passed
+Except for the optional `[history]` settings, each top-level table is one job;
+its keys (except `type`) are passed
 to the backend constructor, so they use Python-style underscores
 (`exclude_templates`), not CLI dashes. See [config.toml.example](https://github.com/ayder/bdbackup/blob/main/config.toml.example)
 for a fully annotated config with every option explained.
@@ -422,6 +431,84 @@ Run every job:
 ```bash
 bdbackup run --config ~/.config/bdbackup/config.toml --all
 ```
+
+## Backup history and guided restore
+
+Enable SQLite history in your TOML configuration. No extra Python dependency
+or database server is required:
+
+```toml
+[history]
+database = "state/history.sqlite3"
+restore_root = "/restore/bdbackup"
+```
+
+Both paths expand `~`; relative paths resolve against the configuration file.
+`restore_root` defaults to `restores` beside that file. Omitting `[history]`
+disables history. File jobs automatically exclude this live database and its
+SQLite journal files; keep it outside backup inputs when possible. New history
+databases are created with permissions `0600`.
+
+`run --config` records every selected backup attempt. For direct commands,
+place `--config` before the command:
+
+```bash
+bdbackup run --config config.toml files-daily
+bdbackup --config config.toml mysqldump --database app,analytics --jobs 2
+bdbackup history --config config.toml
+bdbackup history --config config.toml --job files-daily --successful
+```
+
+Each record contains an ID, job name, backup type, UTC start/completion times,
+status (`running`, `success`, or `failed`), and the successful artifact's absolute
+path and size. Direct file commands use the destination name as the job name;
+direct database commands use the database name. Parallel dumps get one record
+per database, including when another dump fails. Physical full and incremental
+commands record their respective types and the root/binary needed for preparation.
+Credentials and raw error messages are not stored; failed rows contain only the
+exception class. Retention, restore operations, and file dry runs are not backup
+attempts and do not create rows. Direct Python backend calls are not automatically
+recorded; applications can wrap them with `History.run`.
+
+History is written before work starts, and success only after the backup and its
+requested verification finish. If history cannot be written, the command fails;
+an artifact already created is preserved. A forcibly killed process may leave a
+`running` row, which is never offered for restore. Existing backups are not
+imported automatically.
+
+Select a successful backup interactively:
+
+```bash
+bdbackup restore --config config.toml
+bdbackup restore --config config.toml --job files-daily
+```
+
+Restore lists successful, available artifacts, asks for the backup ID, suggests
+`<restore_root>/<job>-<id>`, and asks for confirmation. You can edit the suggested
+path. Repeated restores suggest a numbered alternative; history-based restore
+requires a new directory even when `--dst` is supplied. For automation, specify
+the exact backup ID and use `--yes`:
+
+```bash
+bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
+```
+
+- File archives are extracted into the selected directory with the existing
+  safe extraction filters.
+- MySQL dumps are decompressed and checked into `<destination>/backup.sql`.
+  Importing SQL into a running server is a separate administrator action.
+- XtraBackup/MariaDB backups produce a prepared recovery directory, including
+  prerequisite increments. The destination must be outside the backup root.
+  Server ownership, copy-back, and startup remain administrator actions.
+- Custom engines are recorded, but require their own restore support unless
+  they inherit a supported backend.
+
+Deleted artifacts remain in history as unavailable. File identity, size, and
+modification time detect replaced archives, so older rows for a reused filename
+are not offered as older recovery points. These checks are not cryptographic
+integrity checks; restoration still validates the actual archive or physical
+dependency chain. History stores references to artifacts and does not preserve
+an archive that a later backup replaces.
 
 ## Development
 

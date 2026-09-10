@@ -5,15 +5,18 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import click
 
 from bdbackup import __version__, retention
-from bdbackup.backends import BackupError, setup_logging
+from bdbackup.backends import BackupError, BackupResult, setup_logging
 from bdbackup.config import Config, ConfigError, build_backend
 from bdbackup.filebackup import FileBackup
+from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
+from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
 from bdbackup.templates import TemplateError
 
 # Exit-code contract: 0 ok, 1 backup/verify failure, 2 usage, 3 locked.
@@ -26,6 +29,10 @@ EXIT_LOCKED = 3
 @click.group(name="bdbackup", invoke_without_command=False)
 @click.version_option(version=__version__, prog_name="bdbackup")
 @click.option(
+    "--config", "config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="TOML configuration; enables configured history for direct backup commands.",
+)
+@click.option(
     "--logging",
     "log_level",
     default="INFO",
@@ -33,18 +40,44 @@ EXIT_LOCKED = 3
     help="Log level: DEBUG, INFO, WARNING, ERROR.",
 )
 @click.pass_context
-def main(ctx: click.Context, log_level: str) -> None:
+def main(ctx: click.Context, log_level: str, config_path: Path | None) -> None:
     """Brain-dead backup: file archives, mysqldump and xtrabackup helpers."""
     setup_logging(getattr(logging, log_level.upper(), logging.INFO))
     ctx.ensure_object(dict)
     ctx.obj["log_level"] = log_level
+    try:
+        ctx.obj["config"] = Config(config_path) if config_path else None
+    except ConfigError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+def _get_config(path: Path | None = None, *, required: bool = False) -> Config | None:
+    config = Config(path) if path else click.get_current_context().obj.get("config")
+    if required and config is None:
+        raise click.UsageError("Provide --config with a TOML configuration file")
+    return config
+
+
+def _tracked_backup(config, name, backup_type, action, restore_info=None):
+    if config and config.history:
+        return History(config.history).run(name, backup_type, action, restore_info)
+    return action()
+
+
+def _protect_history(backend, config):
+    if config and config.history and isinstance(backend, FileBackup):
+        database = config.history.database
+        excluded = {Path(str(database) + suffix) for suffix in ("", "-journal", "-wal", "-shm")}
+        if backend.tar_filename.resolve() in excluded:
+            raise BackupError("Archive destination conflicts with the history database")
+        backend.exclude.update(excluded)
 
 
 def _handle_errors(func, *args, **kwargs) -> int:
     """Wrap a command body in the exit-code contract."""
     try:
         func(*args, **kwargs)
-    except click.ClickException:
+    except (click.ClickException, click.Abort):
         raise
     except BlockingIOError as exc:
         logging.getLogger("bdbackup.cli").error("Another backup is already running: %s", exc)
@@ -145,8 +178,9 @@ def file(
     template_names = [
         n.strip() for group in exclude_templates for n in group.split(",") if n.strip()
     ]
+    config = _get_config()
 
-    def _run() -> None:
+    def _create() -> BackupResult:
         try:
             fb = FileBackup(
                 backup_dst=dst,
@@ -160,6 +194,7 @@ def file(
             )
         except TemplateError as exc:
             raise click.UsageError(str(exc)) from exc
+        _protect_history(fb, config)
         try:
             result = fb.backup(debug=debug, dry_run=dry_run)
             if verify and not dry_run:
@@ -170,8 +205,13 @@ def file(
             click.echo(f"Dry run; would create: {fb.tar_filename}")
         else:
             click.echo(f"Archive created: {fb.tar_filename}")
+        return result
 
-    return _handle_errors(_run)
+    return _handle_errors(
+        lambda: _tracked_backup(
+            None if dry_run else config, dst.name, "file", _create, {"kind": "file"},
+        )
+    )
 
 
 @main.command()
@@ -239,9 +279,10 @@ def mysqldump(
     databases = [db.strip() for db in (database or "").split(",") if db.strip()]
     if not full and not databases:
         raise click.UsageError("Provide at least one database name")
+    config = _get_config()
 
-    def _run() -> None:
-        mb = MySQLBackup(
+    def _backend():
+        return MySQLBackup(
             out_dir=out_dir,
             user=user,
             password=password,
@@ -250,6 +291,35 @@ def mysqldump(
             options=opts,
             jobs=jobs,
         )
+
+    def _run() -> None:
+        if config and config.history:
+            # Each worker owns its history transactions, so partial batch failures
+            # cannot hide the successful dumps from the other workers.
+            def _one(db):
+                def _create():
+                    mb = _backend()
+                    result = mb.backup(db)
+                    if verify:
+                        mb.verify(result)
+                    return result
+
+                return _tracked_backup(
+                    config, db or "all-databases", "mysqldump", _create, {"kind": "mysqldump"},
+                )
+
+            failures = []
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                futures = [pool.submit(_one, db) for db in ([None] if full else databases)]
+                for future in as_completed(futures):
+                    try:
+                        click.echo(f"Dump written to: {future.result().path}")
+                    except Exception as exc:
+                        failures.append(exc)
+            if failures:
+                raise failures[0]
+            return
+        mb = _backend()
         results = [mb.backup(None)] if full else mb.backup_all(databases)
         for result in results:
             if verify:
@@ -340,8 +410,11 @@ def xtrabackup_full(
     verify: bool,
 ) -> int:
     """Run a full physical backup."""
+    config = _get_config()
+    info = {"kind": "xtrabackup", "backup_root": str((backup_root / database).resolve()),
+            "binary": binary}
 
-    def _run() -> None:
+    def _create() -> BackupResult:
         xb = XtraBackup(
             backup_root=backup_root / database,
             user=user,
@@ -357,8 +430,11 @@ def xtrabackup_full(
         if verify:
             xb.verify(result)
         click.echo(f"Backup written to: {result.path}")
+        return result
 
-    return _handle_errors(_run)
+    return _handle_errors(
+        lambda: _tracked_backup(config, database, "xtrabackup-full", _create, info)
+    )
 
 
 @xtrabackup.command(name="incremental")
@@ -429,8 +505,11 @@ def xtrabackup_incremental(
     verify: bool,
 ) -> int:
     """Run an incremental physical backup based on the latest full."""
+    config = _get_config()
+    info = {"kind": "xtrabackup", "backup_root": str((backup_root / database).resolve()),
+            "binary": binary}
 
-    def _run() -> None:
+    def _create() -> BackupResult:
         xb = XtraBackup(
             backup_root=backup_root / database,
             user=user,
@@ -445,8 +524,11 @@ def xtrabackup_incremental(
         if verify:
             xb.verify(result)
         click.echo(f"Backup written to: {result.path}")
+        return result
 
-    return _handle_errors(_run)
+    return _handle_errors(
+        lambda: _tracked_backup(config, database, "xtrabackup-incremental", _create, info)
+    )
 
 
 @xtrabackup.command(name="prune")
@@ -684,13 +766,18 @@ def retention_cmd(
 
 
 @main.command()
-@click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("archive", required=False,
+                type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--config", "config_path",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--backup-id", type=click.IntRange(min=1), help="Successful backup ID from history.")
+@click.option("--job", help="Limit history choices to this job.")
+@click.option("-y", "--yes", is_flag=True, help="Confirm restore of an explicit --backup-id.")
 @click.option(
     "-d",
     "--dst",
-    required=True,
     type=click.Path(file_okay=False, path_type=Path),
-    help="Directory to extract the archive into.",
+    help="Recovery directory; history mode suggests a new path when omitted.",
 )
 @click.option(
     "-c",
@@ -699,17 +786,91 @@ def retention_cmd(
     help="Resolve template paths against this directory.",
 )
 def restore(
-    archive: Path,
-    dst: Path,
+    archive: Path | None,
+    dst: Path | None,
     chdir: Path | None,
+    config_path: Path | None,
+    backup_id: int | None,
+    job: str | None,
+    yes: bool,
 ) -> int:
-    """Extract a file backup archive to a destination directory."""
-    return _handle_errors(
-        lambda: (
-            FileBackup.restore_archive(archive, dst),
-            click.echo(f"Restored to: {dst}"),
-        )
-    )
+    """Restore an archive, or select a successful backup from configured history."""
+    def _run():
+        if archive is not None:
+            if backup_id is not None or job is not None:
+                raise click.UsageError("ARCHIVE cannot be combined with --backup-id or --job")
+            if dst is None:
+                raise click.UsageError("Provide --dst when restoring an explicit ARCHIVE")
+            FileBackup.restore_archive(archive, dst)
+            click.echo(f"Restored to: {dst}")
+            return
+        config = _get_config(config_path, required=True)
+        if not config.history:
+            raise click.UsageError("Configure [history] database in the TOML file first")
+        history = History(config.history)
+        if backup_id is None:
+            if yes:
+                raise click.UsageError("--yes requires an explicit --backup-id")
+            records = [r for r in history.records(job=job, successful=True) if r.available]
+            if not records:
+                raise BackupError("No successful, available backups found")
+            click.echo("Successful backups (newest first):")
+            for record in records:
+                click.echo(
+                    f"{record.id}: {record.job_name} | {record.backup_type} | "
+                    f"{record.started_at} | {record.path}"
+                )
+            selected_id = click.prompt("Backup ID", type=int, default=records[0].id)
+            choices = {r.id: r for r in records}
+            if selected_id not in choices:
+                raise click.UsageError("Choose a backup ID from the displayed list")
+            record = choices[selected_id]
+        else:
+            record = history.get(backup_id)
+            if job is not None and record.job_name != job:
+                raise click.UsageError("The selected backup does not belong to --job")
+        if not record.available:
+            raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")
+        destination = dst or suggested_destination(record, config.history.restore_root)
+        click.echo(f"Backup: {record.path}")
+        if dst is None and not yes:
+            destination = Path(click.prompt("Restore destination", default=str(destination)))
+        click.echo(f"Recovery destination: {destination}")
+        if not yes:
+            click.confirm("Restore this backup?", abort=True)
+        restored = restore_record(record, destination)
+        if record.backup_type == "mysqldump":
+            click.echo(f"SQL recovered to: {restored / 'backup.sql'} (not imported into a server)")
+        elif record.backup_type.startswith("xtrabackup"):
+            click.echo(f"Prepared recovery directory: {restored}")
+        else:
+            click.echo(f"Restored to: {restored}")
+
+    return _handle_errors(_run)
+
+
+@main.command(name="history")
+@click.option("--config", "config_path",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--job", help="Show only this job.")
+@click.option("--successful", is_flag=True, help="Show only successful runs.")
+def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> int:
+    """List recorded backup attempts and whether their artifacts are still available."""
+    def _run():
+        config = _get_config(config_path, required=True)
+        if not config.history:
+            raise click.UsageError("Configure [history] database in the TOML file first")
+        records = History(config.history).records(job=job, successful=successful)
+        if not records:
+            click.echo("No backup history found.")
+        for record in records:
+            available = "available" if record.available else "unavailable"
+            click.echo(
+                f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
+                f"{record.status} | {available} | {record.path or '-'}"
+            )
+
+    return _handle_errors(_run)
 
 
 @main.command(name="run")
@@ -717,7 +878,6 @@ def restore(
     "-c",
     "--config",
     "config_path",
-    required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="TOML configuration file with job definitions.",
 )
@@ -730,14 +890,14 @@ def restore(
     help="Verify backups after creation.",
 )
 def run(
-    config_path: Path,
+    config_path: Path | None,
     job_name: str | None,
     run_all: bool,
     verify: bool,
 ) -> int:
     """Run one or more configured backup jobs."""
     try:
-        config = Config(config_path)
+        config = _get_config(config_path, required=True)
     except ConfigError as exc:
         raise click.UsageError(str(exc)) from exc
 
@@ -763,12 +923,20 @@ def run(
                 if retention.run_job(**params):
                     failures.append(EXIT_BACKUP_FAILED)
                 continue
-            backend = build_backend(job)
-            result = backend.backup()
-            if not result.success:
-                raise BackupError("Backend reported an unsuccessful backup")
-            if verify:
-                backend.verify(result)
+            info = {}
+
+            def _create(job=job, info=info):
+                backend = build_backend(job)
+                _protect_history(backend, config)
+                info.update(backup_restore_info(backend))
+                result = backend.backup()
+                if not result.success:
+                    raise BackupError("Backend reported an unsuccessful backup")
+                if verify:
+                    backend.verify(result)
+                return result
+
+            result = _tracked_backup(config, job.name, job.type, _create, info)
             click.echo(f"Job {job.name}: {result.path}")
         except BlockingIOError as exc:
             logger.error("Job %r locked: %s", job.name, exc)

@@ -10,7 +10,7 @@
 #   templates/*.py       user-defined exclusion templates (see below)
 #   engines/*.py         user-defined database engines (see README "Database engines")
 #
-# Each top-level table is one job; its name is the table name and it must
+# Except for [history], each top-level table is one job; its name is the table name and it must
 # set `type`: file | mysqldump | xtrabackup | retention, or any engine
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
 # Other keys are passed to the backend/policy constructor
@@ -23,6 +23,21 @@
 #
 # Types must match the constructor: strings for paths, integers for ports,
 # booleans for flags, and arrays of strings for the exclusion lists.
+
+# Optional SQLite backup history. Omit this section to disable recording.
+# Paths expand ~ and resolve relative to this configuration file.
+# Keep the live SQLite database outside paths included in file backups.
+[history]
+database = "history.sqlite3"
+restore_root = "/restore/bdbackup"  # default if omitted: ./restores, beside this config
+
+# Configured jobs record automatically; direct commands opt in via:
+#   bdbackup --config config.toml file ...
+#   bdbackup --config config.toml mysqldump ...
+# Browse and recover successful backups:
+#   bdbackup history --config config.toml
+#   bdbackup restore --config config.toml
+#   bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
 
 # ---------------------------------------------------------------------------
 # File backup: tar archive built from a plain-text template of paths.

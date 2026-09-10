@@ -1,25 +1,30 @@
-# Repair outcome: bdbackup 0.4.0
+# Release preparation: bdbackup 0.5.0
 
-Updated 2026-09-10 after implementing the repair plan in FIX_PLAN.md.
+Updated 2026-09-10 after implementing the repair plan in FIX_PLAN.md and adding
+SQLite backup history and guided restoration.
 
 **The listed code-level findings are fixed and locally validated.** This is a
-release candidate for the documented support scope. Publication still requires
-a configured GitHub remote, successful release-tag CI, and the correct PyPI
-trusted publisher/version availability. No package or repository was published.
+release candidate for the documented support scope. The GitHub destination is
+`ayder/bdbackup`; the authenticated owner has admin access, and the existing
+remote branch is an ancestor of this checkout. Publication can preserve its
+original history. PyPI publication still requires successful release-tag CI and
+the correct trusted publisher/version availability; it is a separate action.
 The original no-go assessment below describes the code before these repairs.
 
 | Final check | Result |
 | --- | --- |
-| Unit/regression tests, Python 3.12, 3.13 and 3.14 | 141 passed on each |
-| Python 3.14 statement coverage | 84% |
+| Unit/regression tests, Python 3.12, 3.13 and 3.14 | 173 passed on each |
+| Python 3.14 statement coverage | 87% |
 | Ruff, whitespace, actionlint 1.7.7, offline lockfile check | Passed |
 | Isolated source/wheel build, Twine, distribution content checks | Passed |
-| Fresh installed-wheel imports, CLI, recovery and failure preservation | Passed on 3.12, 3.13 and 3.14 |
+| Fresh installed-wheel imports, CLI, history, recovery and failure preservation | Passed on 3.12, 3.13 and 3.14 |
 | MySQL 8.4.9 logical recovery | Parallel/full dumps, special-character password, data/routines/events/triggers passed |
 | Percona Server 8.4.10-10 / XtraBackup 8.4.0-6 | Compressed full plus two increments; full and incremental recovery passed |
 | MariaDB 11.4.13 | Full plus two increments; both recovery points passed |
 
-Database checks used actual server and backup binaries inside disposable,
+Database checks were performed during the 0.4.0 safety repairs. The 0.5.0
+history and recovery dispatch additions have unit/regression and installed-wheel
+coverage. Database checks used actual server and backup binaries inside disposable,
 network-isolated containers. The physical test substitutes Docker execution for
 the local process launcher while exercising the backend's actual backup,
 verification, chain metadata, decompression and preparation logic. Restored
@@ -28,6 +33,11 @@ expected records. These tests do not certify every version or production setup.
 
 Repairs by area:
 
+- Optional SQLite history records backup attempts, UTC timestamps, outcomes,
+  artifact identities and recovery routing without storing credentials.
+  Guided restore offers successful, available artifacts and requires a new
+  recovery destination. File extraction, SQL recovery to a file, and physical
+  preparation are supported; importing SQL or starting a database stays separate.
 - File backups stage output under a writer lock, propagate input/traversal
   failures, check selected members and readable payloads, detect ordinary file
   changes, verify before atomic replacement, and discard failed staging files.
@@ -67,11 +77,11 @@ Behavior changes to account for:
 - GFS flat-file retention is not an adapter for XtraBackup's directory layout.
   Use physical prune for those complete dated chains.
 
-Artifacts were validated under `/tmp/bdbackup-fixed-dist/`. The release version
-is declared only in `pyproject.toml`; runtime and CLI versions use generated
+The release version is declared only in `pyproject.toml`; runtime and CLI versions use generated
 package metadata, and the release tag gate reads `pyproject.toml` directly.
-GitHub account permissions, PyPI name/version ownership
-and trusted-publisher configuration were not changed or claimed as verified.
+The MIT license is included explicitly in distribution metadata and artifacts.
+PyPI name/version ownership and trusted-publisher configuration have not been
+changed or claimed as verified.
 
 ---
 
