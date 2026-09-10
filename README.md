@@ -10,6 +10,26 @@ Designed as a general-purpose backup tool with safety nets:
 credential files instead of exposed passwords, post-backup verification,
 process locking, atomic target directories, and config-driven jobs.
 
+## Support and safety
+
+Python 3.12+ on POSIX systems (Linux/macOS); Windows is not supported.
+`tar` and `tar.gz` work on every supported Python; `tar.zst` requires Python 3.14
+with Zstandard support. Database binaries are separate system dependencies.
+
+Every built-in backend verifies staging output before publishing it. A missing
+or unreadable file fails the backup and preserves the previous archive. A process
+lock prevents concurrent writers to the same file destination or physical root.
+`--no-verify` skips only the additional verification pass after publication.
+Verification checks archive readability or physical checkpoints; it does not
+replace testing a restore. File backups are not filesystem snapshots: quiesce
+applications or back up snapshots when files can change during a run.
+
+Safe relative symlinks, hardlinks, empty directories and ordinary directory
+permissions/timestamps round-trip. Restore rejects escaping paths/links and
+special files on all supported Python versions. Ownership and privileged
+permission bits are intentionally not restored. Use a destination that is not
+being modified by another process during extraction.
+
 ## Installation
 
 ```bash
@@ -32,7 +52,8 @@ pip install -e ".[dev]"
 
 ## Global options
 
-All commands support `--logging DEBUG|INFO|WARNING|ERROR`.
+Place the global option before the command: `bdbackup --logging DEBUG file ...`.
+Levels: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 The CLI uses these exit codes:
 
 | Code | Meaning |
@@ -40,7 +61,7 @@ The CLI uses these exit codes:
 | 0 | Success |
 | 1 | Backup/verify failure |
 | 2 | Usage error |
-| 3 | Another backup is already running (lock held) |
+| 3 | Lock held, or retention refused an unsafe/incomplete scan |
 
 ## File backup
 
@@ -73,7 +94,7 @@ Options:
 | `--template` | Template file listing paths to archive |
 | `-d, --dst` | Destination archive path (without extension) |
 | `-c, --chdir` | Source path: resolve template paths and relative excludes against it |
-| `-f, --format` | Archive format: `tar`, `tar.gz`, `tar.zst` |
+| `-f, --format` | Archive format: `tar`, `tar.gz`, `tar.zst` (Python 3.14+) |
 | `-x, --exclude` | Exact resolved path to exclude (repeatable) |
 | `--exclude-pattern` | Glob pattern to exclude (repeatable) |
 | `--exclude-template` | Named exclusion template, e.g. `python-dev` (repeatable, comma-separated allowed) |
@@ -134,7 +155,7 @@ existing wiring code:
 | Engine | Config `type` | Backend | Notes |
 |--------|---------------|---------|-------|
 | `mysqldump` | `mysqldump` | `bdbackup.mysql.MySQLBackup` | Logical, gzip-compressed SQL dumps |
-| `xtrabackup` | `xtrabackup` | `bdbackup.mysql.XtraBackup` | Legacy Percona XtraBackup / MariaDB mariabackup |
+| `xtrabackup` | `xtrabackup` | `bdbackup.mysql.XtraBackup` | Percona XtraBackup / MariaDB mariabackup |
 
 To add an engine, drop a self-registering module into either
 `bdbackup/mysql/` (shipped with the package) or
@@ -202,8 +223,16 @@ Options:
 | `-j, --jobs` | Parallel dumps when multiple databases are specified |
 | `--verify / --no-verify` | Verify the dump after creation (default: on) |
 
-Passwords are never passed on the command line; they are written to a
-temporary credentials file (`0600`) and removed after the run.
+Use a bare `-p` to enter a password securely. Passing `-p PASSWORD` puts it in
+bdbackup's own process arguments and potentially shell history. Child database
+processes receive only a temporary credentials-file path; its contents are
+quoted, its permissions are `0600`, and it is removed after the run.
+
+Mysqldump retains `--single-transaction`, `--routines`, `--events` and `--triggers`
+by default. `--options` adds options; explicit `--skip-*` flags can override
+applicable defaults. `--full` retains these defaults and adds `--all-databases`.
+Single-transaction consistency applies to transactional tables; quiesce writes
+to nontransactional tables and avoid schema changes during a dump.
 
 ## xtrabackup
 
@@ -225,11 +254,35 @@ Prune old backups by retention days:
 bdbackup xtrabackup prune --database production -r /backup/mysql --retention 7
 ```
 
-Prepare a backup to make it restorable:
+Prepare a full backup or an incremental recovery point into a new directory:
 
 ```bash
-bdbackup xtrabackup prepare /backup/mysql/production/2025-01-15/Full_123045 -u xtrabackup -p
+bdbackup xtrabackup prepare /backup/mysql/production/2026-09-10/Full_ID \
+    -r /backup/mysql/production -d /restore/production -u xtrabackup -p
 ```
+
+Use the exact path printed by the backup command in place of `Full_ID`. Passing
+an incremental path prepares its full and every prerequisite incremental up to
+that point. Preparation copies sources to private working directories,
+decompresses compressed copies, applies the increments in dependency order, and
+publishes the recovery directory only on success. The destination must be new
+and outside the backup root. Original backups remain available for new
+incrementals and repeated recovery attempts.
+
+Use XtraBackup matching your MySQL/Percona server series (8.0 with 8.0, 8.4 with
+8.4); use `mariabackup` or `mariadb-backup` matching your MariaDB installation.
+MariaDB preparation omits XtraBackup's `--apply-log-only` option. Compression is
+**off by default**. For a compatible recent XtraBackup, select `--compress zstd`;
+MariaDB's deprecated built-in compression accepts only `quicklz` and requires
+`qpress` for decompression. Compatibility must be established with an actual
+recovery test for the exact server and backup binary versions in use.
+
+New physical backups record parent/full identities and LSNs in `bdbackup.json`.
+Incrementals live under `DATE/Incremental/FULL_ID/UNIQUE_ID`, and cannot attach to
+another full taken on the same day. Older backups without this metadata require
+a new full before taking further incrementals; full backups can still be
+prepared as recovery copies. Retention removes complete dated chains, preserves
+the newest successful full's date, and refuses to prune without a valid full.
 
 Options:
 
@@ -241,7 +294,7 @@ Options:
 | `-u, --user` | MySQL user |
 | `-p, --password` | MySQL password; omit value to be prompted securely |
 | `-b, --binary` | `xtrabackup` or `mariabackup` |
-| `--compress` | Compression algorithm (default: `zstd`) |
+| `--compress` | Compression algorithm (default: uncompressed) |
 | `--compress-threads` | Compression threads (default: 4) |
 | `--parallel` | Number of copy threads (default: 1) |
 | `--throttle` | Limit I/O to this many IOPS |
@@ -283,12 +336,18 @@ bdbackup retention ... --apply
 | Safety | `--min-keep-fulls N` | Never leave fewer than N newest fulls |
 | Pick | `--pick first/last` | Which backup survives in a weekly/monthly bucket |
 
-**Chain safety:** incrementals are attached to the newest full at or before
-their timestamp. An incremental whose parent full has expired is dropped as an
-orphan; a full that still anchors a live incremental is kept past the GFS tiers
-and marked as a **chain anchor**. This prevents the classic data-loss bug
-where a weekly bucket evicts the full that daily-window incrementals still
-depend on.
+**Chain safety:** this flat-file policy expects one chronological backup
+stream: each new full starts a chain, and subsequent increments continue that
+chain until the next full. A retained incremental pins its full and every
+preceding incremental in that chain, including prerequisites older than the age
+window. A missing full makes an incremental an orphan. If a full/incremental
+scan skips a file (for example while it is being written), expiration is deferred
+because its dependencies are uncertain. Keep all files for a stream together;
+arbitrary overlapping chains or missing intermediate backups require explicit
+external metadata and are not supported by this filename-based policy.
+
+This command handles flat backup files such as `full_*.mbi`, not the dated
+XtraBackup directory tree. Use `bdbackup xtrabackup prune` for physical backups.
 
 Only `--full-dir` is required. `--incr-dir` and `--log-dir` are optional.
 `--full-glob`, `--incr-glob`, and `--log-glob` default to `full_*.mbi`,
@@ -309,7 +368,7 @@ type = "file"
 template_filename = "~/.config/bdbackup/files.template"
 backup_dst = "/backup/files/daily"
 chdir = "/srv/www"   # source path: template/exclude entries resolve against it
-format = "tar.zst"
+format = "tar.gz"  # tar.zst requires Python 3.14+
 exclude_pattern = ["*.log", "node_modules"]
 exclude_templates = ["python-dev"]
 
@@ -328,9 +387,9 @@ options = ["--single-transaction", "--all-databases"]
 
 [mysql-prod-retention]
 type = "retention"
-full_dir = "/backup/mysql/production"
-incr_dir = "/backup/mysql/production/incr"
-log_dir = "/backup/mysql/production/log"
+full_dir = "/backup/flat/full"
+incr_dir = "/backup/flat/incr"
+log_dir = "/backup/flat/log"
 daily = 7
 weekly = 4
 monthly = 6
@@ -341,9 +400,15 @@ pick = "first"
 apply = false           # set true once the dry-run output looks right
 ```
 
-Each top-level table is one job; its keys (except `type`) are passed verbatim
+Configuration paths expand `~`; relative config paths resolve against the
+config file's directory. Template entries and `exclude` entries resolve against
+`chdir` (or the process working directory if omitted). For a single-database
+mysqldump job, set `database = "mydatabase"`; for all databases include
+`--all-databases` in `options`.
+
+Each top-level table is one job; its keys (except `type`) are passed
 to the backend constructor, so they use Python-style underscores
-(`exclude_templates`), not CLI dashes. See [config.toml.example](config.toml.example)
+(`exclude_templates`), not CLI dashes. See [config.toml.example](https://github.com/ayder/bdbackup/blob/main/config.toml.example)
 for a fully annotated config with every option explained.
 
 Run one job:
@@ -364,15 +429,46 @@ Run tests and linting:
 
 ```bash
 pytest
-ruff check bdbackup tests
+ruff check bdbackup tests scripts
 ```
 
-Build a release:
+Optional database integration tests use disposable, network-isolated Docker
+containers with synthetic data. They remove only the containers and volumes
+created for that run. Pull the matching images before running:
+
+```bash
+python scripts/integration_mysql.py           # mysql:8.4
+python scripts/integration_physical.py percona # percona-server/xtrabackup:8.4
+python scripts/integration_physical.py mariadb # mariadb:11.4
+```
+
+Physical recovery returns a prepared data directory; copying it into a server's
+data directory, assigning ownership to the server user, and starting that server
+are separate administrator actions. Use the same database version and
+filesystem case-sensitivity as the source.
+
+`pyproject.toml` (`project.version`) is the sole version source. The package's
+`__version__` and CLI read installed distribution metadata generated from it.
+After changing the version, run `uv lock` to refresh the generated lockfile and
+reinstall with `pip install -e '.[dev]'` to refresh local metadata. Source
+development requires this editable installation.
+
+Build and validate a release:
 
 ```bash
 python -m build
 twine check dist/*
+python scripts/smoke_install.py dist
 ```
+
+Commit the validated changes and create an annotated tag named
+`v<project.version>`. The publishing workflow accepts only that matching tag. It
+runs the reusable CI workflow on that commit (tests on Python 3.12–3.14, lint,
+real MySQL/Percona/MariaDB recovery tests, source/wheel build, Twine, and an
+installed-wheel recovery smoke test), then
+uploads those exact artifacts. Configure the PyPI trusted publisher for
+`ayder/bdbackup`, `publish.yml`, environment `pypi` before releasing. Account
+configuration and actual database recovery evidence are release prerequisites.
 
 ## License
 

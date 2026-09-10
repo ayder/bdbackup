@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import subprocess
+import io
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -23,9 +23,9 @@ def test_mysql_cnf_file_permissions():
         mode = path.stat().st_mode
         assert mode & 0o777 == 0o600
         text = path.read_text(encoding="utf-8")
-        assert "user=root" in text
-        assert "password=hunter2" in text
-        assert "host=db" in text
+        assert 'user="root"' in text
+        assert 'password="hunter2"' in text
+        assert 'host="db"' in text
         assert "port=3307" in text
     assert not path.exists()
 
@@ -33,14 +33,10 @@ def test_mysql_cnf_file_permissions():
 def test_mysqlbackup_uses_defaults_extra_file(tmp_path: Path):
     called_cmds: list[list[str]] = []
 
-    class FakeStdout:
-        def read(self, _size: int = -1) -> bytes:
-            return b""
-
     def fake_popen(cmd, **kwargs):
         called_cmds.append(cmd)
         mock = Mock()
-        mock.stdout = FakeStdout()
+        mock.stdout = io.BytesIO(b"CREATE TABLE demo (id INT);\n")
         mock.returncode = 0
         mock.wait = Mock(return_value=0)
         mock.__enter__ = Mock(return_value=mock)
@@ -66,18 +62,12 @@ def test_mysqlbackup_uses_defaults_extra_file(tmp_path: Path):
     assert "secret123" not in " ".join(cmd)
 
 
-def test_xtrabackup_uses_defaults_extra_file(tmp_path: Path):
+def test_xtrabackup_uses_defaults_extra_file(tmp_path: Path, physical_runner):
     called_cmds: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         called_cmds.append(cmd)
-        # The command line includes the target tmp dir; create it so rename works.
-        for part in cmd:
-            if part.startswith("--target-dir="):
-                target = Path(part.split("=", 1)[1])
-                target.mkdir(parents=True, exist_ok=True)
-        result = subprocess.CompletedProcess(cmd, returncode=0, stdout="ok")
-        return result
+        return physical_runner(cmd, **kwargs)
 
     xb = XtraBackup(
         backup_root=tmp_path,

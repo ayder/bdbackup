@@ -10,10 +10,9 @@ sufficient for backup exclusions without pulling in an external dependency:
 - ``/build/``              leading slash: additionally anchored to the root
 - ``!important.log``       negation: re-includes a previously excluded path
 
-Unlike gitignore, a directory match does not automatically prune its contents
-from the walk; FileBackup's traversal tests every path individually, so
-templates should list contents explicitly (e.g. ``node_modules/**``) when the
-directory itself is only an intermediate component of backup roots.
+Directory rules apply to descendants. Later negation rules can re-include
+individual descendants; traversal keeps excluded directories open when such
+rules are present.
 """
 
 from __future__ import annotations
@@ -137,11 +136,20 @@ class GitignoreMatcher:
 
     def __init__(self, patterns: Iterable[str]):
         self.rules = [_Rule(p) for p in patterns if p and p.strip()]
+        self.has_negations = any(rule.negated for rule in self.rules)
 
     def matches(self, path: Path, is_dir: bool, roots: Iterable[Path]) -> bool:
+        roots = tuple(roots)
+        ancestors = [
+            parent
+            for parent in path.parents
+            if any(parent == root or parent.is_relative_to(root) for root in roots)
+        ]
         excluded = False
         for rule in self.rules:
-            if rule.matches(path, is_dir, roots):
+            if rule.matches(path, is_dir, roots) or any(
+                rule.matches(parent, True, roots) for parent in ancestors
+            ):
                 excluded = not rule.negated
         return excluded
 

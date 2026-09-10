@@ -62,26 +62,42 @@ DEFAULTS = {
 # Markers for files still being written; matched as dot-separated components
 # so both "full_x.mbi.tmp" and "full_x.tmp.mbi" are recognised.
 IGNORE_TOKENS = frozenset(
-    {"tmp", "temp", "part", "partial", "inprogress", "incomplete",
-     "lock", "writing", "new"}
+    {"tmp", "temp", "part", "partial", "inprogress", "incomplete", "lock", "writing", "new"}
 )
 GRACE_MINUTES = 60
 USE_FILENAME_TIMESTAMP = True
 
 # Never operate on these, ever.
 FORBIDDEN_DIRS = frozenset(
-    {"/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib",
-     "/proc", "/root", "/sbin", "/sys", "/usr", "/var"}
+    {
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/home",
+        "/lib",
+        "/proc",
+        "/root",
+        "/sbin",
+        "/sys",
+        "/usr",
+        "/var",
+    }
 )
 
 # Ordered most-specific first; each exposes named groups Y/m/d[/H/M/S].
 _TS_PATTERNS = (
     # 2026-07-29T14-30-00 / 2026-07-29_14-30-00 / 2026-07-29 14:30:00
-    re.compile(r"(?P<Y>\d{4})[-_.](?P<m>\d{2})[-_.](?P<d>\d{2})"
-               r"[T_ -](?P<H>\d{2})[-:.]?(?P<M>\d{2})[-:.]?(?P<S>\d{2})"),
+    re.compile(
+        r"(?P<Y>\d{4})[-_.](?P<m>\d{2})[-_.](?P<d>\d{2})"
+        r"[T_ -](?P<H>\d{2})[-:.]?(?P<M>\d{2})[-:.]?(?P<S>\d{2})"
+    ),
     # 20260729_143000 / 20260729-143000 / 20260729143000
-    re.compile(r"(?P<Y>\d{4})(?P<m>\d{2})(?P<d>\d{2})"
-               r"[-_T]?(?P<H>\d{2})(?P<M>\d{2})(?P<S>\d{2})"),
+    re.compile(
+        r"(?P<Y>\d{4})(?P<m>\d{2})(?P<d>\d{2})"
+        r"[-_T]?(?P<H>\d{2})(?P<M>\d{2})(?P<S>\d{2})"
+    ),
     # 2026-07-29
     re.compile(r"(?P<Y>\d{4})[-_.](?P<m>\d{2})[-_.](?P<d>\d{2})"),
     # 20260729
@@ -93,6 +109,7 @@ _TS_PATTERNS = (
 # Filename timestamp parsing
 # --------------------------------------------------------------------------
 
+
 def parse_timestamp_from_name(name: str) -> datetime | None:
     """Return a datetime parsed out of *name*, or None."""
     for pattern in _TS_PATTERNS:
@@ -102,7 +119,9 @@ def parse_timestamp_from_name(name: str) -> datetime | None:
         parts = match.groupdict()
         try:
             stamp = datetime(
-                int(parts["Y"]), int(parts["m"]), int(parts["d"]),
+                int(parts["Y"]),
+                int(parts["m"]),
+                int(parts["d"]),
                 int(parts.get("H") or 0),
                 int(parts.get("M") or 0),
                 int(parts.get("S") or 0),
@@ -119,6 +138,7 @@ def parse_timestamp_from_name(name: str) -> datetime | None:
 # Model
 # --------------------------------------------------------------------------
 
+
 def looks_temporary(entry: str) -> bool:
     """True if *entry* looks like a file the backup job is still writing."""
     lowered = entry.lower()
@@ -132,10 +152,10 @@ class BackupFile:
     """One file on disk, with the timestamp we make decisions from."""
 
     path: str | Path
-    kind: str           # "full" | "incr" | "log"
+    kind: str  # "full" | "incr" | "log"
     ts: datetime
     size: int
-    ts_source: str      # "name" | "mtime"
+    ts_source: str  # "name" | "mtime"
     keep: bool = False
     reason: str = "expired"
     parent: BackupFile | None = None  # for incrementals: the BackupFile full
@@ -228,6 +248,7 @@ def scan(
 # Bucket helpers
 # --------------------------------------------------------------------------
 
+
 def week_start(day: date) -> date:
     """Monday of the ISO week containing *day*."""
     return day - timedelta(days=day.weekday())
@@ -259,6 +280,7 @@ def pick(bucket_files: list[BackupFile], mode: str) -> BackupFile | None:
 # --------------------------------------------------------------------------
 # The policy
 # --------------------------------------------------------------------------
+
 
 @dataclass(slots=True)
 class Policy:
@@ -312,16 +334,14 @@ class Policy:
 
         # Tier 2 -- one per ISO week, only for what the daily tier did not take.
         for index, (start, end) in enumerate(self.weekly_buckets(today), 1):
-            bucket = [f for f in fulls
-                      if start <= f.day <= end and f.day < daily_floor]
+            bucket = [f for f in fulls if start <= f.day <= end and f.day < daily_floor]
             chosen = pick(bucket, self.bucket_pick)
             if chosen is not None:
                 chosen.mark(f"weekly -{index} (week of {start})")
 
         # Tier 3 -- one per calendar month, older than the weekly range.
         for index, (start, end) in enumerate(self.monthly_buckets(today), 1):
-            bucket = [f for f in fulls
-                      if start <= f.day <= end and f.day < weekly_floor]
+            bucket = [f for f in fulls if start <= f.day <= end and f.day < weekly_floor]
             chosen = pick(bucket, self.bucket_pick)
             if chosen is not None:
                 chosen.mark(f"monthly -{index} ({start.strftime('%Y-%m')})")
@@ -356,11 +376,15 @@ class Policy:
             if incr.day >= incr_floor:
                 incr.mark(f"incremental (last {self.incr_days} days)")
 
-        # ...then pin the fulls those survivors depend on. A full that anchors
-        # a live chain must outlive the GFS tiers or the chain is unrestorable.
-        for incr in incrs:
-            if incr.keep and incr.parent is not None:
-                incr.parent.mark(f"chain anchor for {incr.name}")
+        # Pin every earlier incremental since the full, not only the full.
+        # Flat files have no LSN metadata: conservatively retain the whole
+        # chronological chain through the newest surviving incremental.
+        for survivor in list(incrs):
+            if survivor.keep and survivor.parent is not None:
+                survivor.parent.mark(f"chain anchor for {survivor.name}")
+                for prerequisite in incrs:
+                    if prerequisite.parent is survivor.parent and prerequisite.ts <= survivor.ts:
+                        prerequisite.mark(f"chain prerequisite for {survivor.name}")
 
         # Finally drop any incremental whose parent did not survive.
         for incr in incrs:
@@ -379,6 +403,7 @@ class Policy:
 # --------------------------------------------------------------------------
 # Reporting / execution
 # --------------------------------------------------------------------------
+
 
 def human(size: int) -> str:
     value = float(size)
@@ -412,8 +437,7 @@ def report(
                 bytes_del += f.size
             if verbose or not f.keep:
                 lines.append(
-                    f"  {flag} {f.name:<42} {f.ts:%Y-%m-%d %H:%M}  "
-                    f"{human(f.size):<10}  {f.reason}"
+                    f"  {flag} {f.name:<42} {f.ts:%Y-%m-%d %H:%M}  {human(f.size):<10}  {f.reason}"
                 )
         if not verbose:
             kept = sum(1 for f in files if f.keep)
@@ -421,8 +445,7 @@ def report(
 
     lines.append("")
     lines.append(
-        f"Summary: keep {total_keep} ({human(bytes_keep)}), "
-        f"delete {total_del} ({human(bytes_del)})"
+        f"Summary: keep {total_keep} ({human(bytes_keep)}), delete {total_del} ({human(bytes_del)})"
     )
     return "\n".join(lines), total_del, bytes_del
 
@@ -451,6 +474,7 @@ def execute(files: list[BackupFile], apply_changes: bool) -> tuple[int, int, int
 # --------------------------------------------------------------------------
 # Runner / CLI core
 # --------------------------------------------------------------------------
+
 
 def run_job(
     *,
@@ -481,20 +505,21 @@ def run_job(
         sys.stderr.write("ERROR: weekly/monthly must be >= 0\n")
         return EXIT_USAGE
 
+    if incr_days < 0 or log_days < 0 or min_keep_fulls < 1:
+        sys.stderr.write("ERROR: incr_days/log_days must be >= 0; min_keep_fulls must be >= 1\n")
+        return EXIT_USAGE
+    if pick_mode not in {"first", "last"} or not isinstance(apply_changes, bool):
+        sys.stderr.write("ERROR: invalid pick mode or apply flag\n")
+        return EXIT_USAGE
     now = now or datetime.now()
     today = now.date()
 
-    policy = Policy(daily, weekly, monthly, incr_days, log_days,
-                    pick_mode, min_keep_fulls)
+    policy = Policy(daily, weekly, monthly, incr_days, log_days, pick_mode, min_keep_fulls)
 
     try:
         fulls, skipped_f = scan(full_dir, full_glob, "full", now)
-        incrs, skipped_i = (
-            scan(incr_dir, incr_glob, "incr", now) if incr_dir else ([], [])
-        )
-        logs, skipped_l = (
-            scan(log_dir, log_glob, "log", now) if log_dir else ([], [])
-        )
+        incrs, skipped_i = scan(incr_dir, incr_glob, "incr", now) if incr_dir else ([], [])
+        logs, skipped_l = scan(log_dir, log_glob, "log", now) if log_dir else ([], [])
     except (NotADirectoryError, ValueError, OSError) as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
         return EXIT_USAGE
@@ -505,6 +530,12 @@ def run_job(
             "refusing to expire anything, because that is what a broken "
             "backup job looks like.\n"
         )
+        return EXIT_REFUSED
+
+    # If an incremental is still being written or cannot be classified, its
+    # prerequisites are unknown. Defer deletion rather than strand that backup.
+    if incr_dir and (skipped_i or skipped_f):
+        sys.stderr.write("ERROR: incomplete backup scan; refusing to expire chain prerequisites\n")
         return EXIT_REFUSED
 
     policy.apply_to_fulls(fulls, today)
@@ -520,8 +551,7 @@ def run_job(
     text, _planned, _planned_bytes = report(groups, verbose)
 
     header = (
-        f"Retention run {now:%Y-%m-%d %H:%M}  --  mode: "
-        f"{'APPLY' if apply_changes else 'DRY RUN'}"
+        f"Retention run {now:%Y-%m-%d %H:%M}  --  mode: {'APPLY' if apply_changes else 'DRY RUN'}"
     )
     policy_line = (
         f"Policy: keep all of last {daily} days, then {weekly} weekly, then "
@@ -553,8 +583,7 @@ def main(argv: list[str] | None = None) -> int:
     """argparse-compatible entry point (script parity with the reference tool)."""
     import argparse
 
-    p = argparse.ArgumentParser(
-        description="GFS retention for backups (dry run unless --apply).")
+    p = argparse.ArgumentParser(description="GFS retention for backups (dry run unless --apply).")
     p.add_argument("--full-dir", required=True)
     p.add_argument("--incr-dir", default=None)
     p.add_argument("--log-dir", default=None)
@@ -566,8 +595,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--monthly", type=int, default=DEFAULTS["monthly"])
     p.add_argument("--incr-days", type=int, default=DEFAULTS["incr_days"])
     p.add_argument("--log-days", type=int, default=DEFAULTS["log_days"])
-    p.add_argument("--pick", choices=("first", "last"),
-                   dest="pick_mode", default=DEFAULTS["pick"])
+    p.add_argument("--pick", choices=("first", "last"), dest="pick_mode", default=DEFAULTS["pick"])
     p.add_argument("--min-keep-fulls", type=int, default=DEFAULTS["min_keep_fulls"])
     p.add_argument("--now", default=None, help="pretend it is this date (YYYY-MM-DD)")
     p.add_argument("--apply", action="store_true")
@@ -578,9 +606,7 @@ def main(argv: list[str] | None = None) -> int:
     now = None
     if args.now:
         try:
-            now = datetime.strptime(args.now, "%Y-%m-%d").replace(
-                hour=23, minute=59, second=59
-            )
+            now = datetime.strptime(args.now, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
         except ValueError:
             sys.stderr.write("ERROR: --now must be YYYY-MM-DD\n")
             return EXIT_USAGE

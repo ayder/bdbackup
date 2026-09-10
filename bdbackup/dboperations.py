@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
-
-from bdbackup.utils import setup_logging
 
 
 class MySQLOps:
@@ -27,7 +26,7 @@ class MySQLOps:
         self.db: Any | None = None
         self.cursor: Any | None = None
         self.dblist: list[str] = []
-        self.logger = setup_logging("bdbackup.db")
+        self.logger = logging.getLogger("bdbackup.db")
         self._connect()
 
     def _connect(self) -> None:
@@ -54,10 +53,7 @@ class MySQLOps:
 
     def get_dblist(self) -> list[str]:
         """Return the list of active databases from tbl_backup."""
-        sql = (
-            "SELECT `ID`, `DATABASE`, `LAST_BACKUP_TIMESTAMP` "
-            "FROM tbl_backup WHERE `STATUS` = 1"
-        )
+        sql = "SELECT `ID`, `DATABASE`, `LAST_BACKUP_TIMESTAMP` FROM tbl_backup WHERE `STATUS` = 1"
         try:
             self.cursor.execute(sql)
             rows = self.cursor.fetchall()

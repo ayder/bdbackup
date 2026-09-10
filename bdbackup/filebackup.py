@@ -1,25 +1,29 @@
-"""Template-driven tar archive backup."""
+"""Template-driven, atomically published tar archive backups."""
 
 from __future__ import annotations
 
 import fnmatch
 import logging
 import os
+import stat
+import sys
 import tarfile
+import tempfile
 from collections.abc import Iterable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from bdbackup.backends import BackupError, BackupResult
 from bdbackup.templates import build_matcher, resolve_patterns
+from bdbackup.utils import process_lock
 
 
 class FileBackup:
-    """Create a tar archive from a list of paths supplied by a template file."""
+    """Create a verified archive without replacing a good backup on failure."""
 
     FORMATS = {
         "tar": ("w", ".tar", "r"),
         "tar.gz": ("w:gz", ".tar.gz", "r:gz"),
-        "tar.zst": ("w:zstd", ".tar.zst", "r:zstd"),
+        "tar.zst": ("w:zst", ".tar.zst", "r:zst"),
     }
 
     def __init__(
@@ -33,20 +37,14 @@ class FileBackup:
         exclude_templates: Iterable[str] | None = None,
         follow_symlinks: bool = False,
     ):
-        self.chdir = Path(chdir) if chdir else None
-        self.template_filename = Path(template_filename) if template_filename else None
+        self.chdir = Path(chdir).expanduser().absolute() if chdir else None
+        self.template_filename = Path(template_filename).expanduser() if template_filename else None
         self.backup_paths: list[Path] = []
-        self.backup_dst = Path(backup_dst)
+        self.backup_dst = Path(backup_dst).expanduser().absolute()
         self.format = format
         self.follow_symlinks = follow_symlinks
-        # Relative exclude entries resolve against chdir (the source path),
-        # never against the process working directory.
-        self.exclude = {
-            (Path(e) if Path(e).is_absolute() else self.chdir / Path(e)).resolve()
-            if self.chdir
-            else Path(e).resolve()
-            for e in (exclude or [])
-        }
+        base = self.chdir or Path.cwd()
+        self.exclude = {(base / Path(e).expanduser()).resolve() for e in (exclude or [])}
         self.exclude_patterns = list(exclude_pattern or [])
         self.exclude_templates = list(exclude_templates or [])
         self._template_matcher = (
@@ -55,203 +53,253 @@ class FileBackup:
             else None
         )
         self.tar: tarfile.TarFile | None = None
+        self._pending: Path | None = None
+        self._lock = None
+        self._expected: list[str] = []
         self.logger = logging.getLogger("bdbackup.file")
-
-        if self.format not in self.FORMATS:
-            raise ValueError(
-                f"Unsupported format {self.format!r}; choose from {set(self.FORMATS)}"
-            )
-        self.tar_opt, self.tar_ext, self.tar_read_opt = self.FORMATS[self.format]
+        if format not in self.FORMATS:
+            raise ValueError(f"Unsupported format {format!r}; choose from {set(self.FORMATS)}")
+        if format == "tar.zst" and sys.version_info < (3, 14):
+            raise ValueError("tar.zst requires Python 3.14 or newer; use tar or tar.gz")
+        self.tar_opt, self.tar_ext, self.tar_read_opt = self.FORMATS[format]
         self.tar_filename = Path(str(self.backup_dst) + self.tar_ext)
-
+        self.lock_filename = Path(str(self.tar_filename) + ".lock")
         if self.backup_dst.is_dir():
-            raise IsADirectoryError(
-                f"backup_dst must be a file path, got directory: {self.backup_dst}"
-            )
-
-        self.backup_dst.parent.mkdir(parents=True, exist_ok=True)
-
+            raise IsADirectoryError(f"backup_dst must be a file path: {self.backup_dst}")
         if self.template_filename:
             self.load_template(self.template_filename)
 
     def load_template(self, template: str | Path) -> list[Path]:
-        """Load paths from a template file."""
-        template = Path(template)
-        if not template.exists():
-            raise FileNotFoundError(f"Template file not found: {template}")
-        lines = [
-            line.strip()
+        template = Path(template).expanduser()
+        self.backup_paths = [
+            Path(line.strip()).expanduser()
             for line in template.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
-        self.backup_paths = [Path(line) for line in lines]
-        self.logger.info("Loaded %d paths from %s", len(self.backup_paths), template)
         return self.backup_paths
 
     def open_archive(self) -> tarfile.TarFile:
-        """Open the destination tar archive."""
+        """Open a private staging archive under the destination's process lock."""
+        if self.tar is not None:
+            return self.tar
+        lock = process_lock(self.lock_filename)
+        lock.__enter__()
+        self._lock = lock
         try:
-            self.tar = tarfile.open(self.tar_filename, self.tar_opt)
-        except Exception as exc:  # pragma: no cover
-            self.logger.error("Unable to open %s: %s", self.tar_filename, exc)
+            fd, name = tempfile.mkstemp(
+                prefix=f".{self.tar_filename.name}.",
+                suffix=".tmp",
+                dir=self.tar_filename.parent,
+            )
+            os.close(fd)
+            self._pending = Path(name)
+            self._expected = []
+            self.tar = tarfile.open(
+                self._pending,
+                self.tar_opt,
+                dereference=self.follow_symlinks,
+            )
+            return self.tar
+        except BaseException:
+            self.close_archive(publish=False)
             raise
-        return self.tar
 
-    def close_archive(self) -> None:
-        """Close the archive if it is open."""
-        if self.tar:
-            try:
+    def close_archive(self, *, publish: bool = True) -> None:
+        """Close, verify and publish; on any error discard only staging output."""
+        try:
+            if self.tar is not None:
                 self.tar.close()
-            except Exception as exc:  # pragma: no cover
-                self.logger.error("Unable to close %s: %s", self.tar_filename, exc)
-                raise
-            finally:
                 self.tar = None
+            if self._pending is not None and publish:
+                self.verify(BackupResult(self._pending))
+                with tarfile.open(self._pending, "r:*") as archive:
+                    if self._expected and archive.getnames() != self._expected:
+                        raise BackupError("Archive members do not match the selected inputs")
+                with self._pending.open("rb") as stream:
+                    os.fsync(stream.fileno())
+                os.replace(self._pending, self.tar_filename)
+        finally:
+            self.tar = None
+            try:
+                if self._pending is not None:
+                    self._pending.unlink(missing_ok=True)
+            finally:
+                self._pending = None
+                if self._lock is not None:
+                    self._lock.__exit__(None, None, None)
+                    self._lock = None
 
     def _match_roots(self) -> list[Path]:
-        """Roots that relative template patterns are matched against."""
-        # Path() strips trailing slashes, which resolve() may keep on macOS.
         if self.chdir:
-            return [Path(self.chdir.resolve())]
-        return [Path(p.resolve()) for p in self.backup_paths]
+            return [self.chdir]
+        return [self._resolve_path(p) for p in self.backup_paths]
+
+    def _hard_excluded(self, path: Path) -> bool:
+        if path in {self.tar_filename, self.lock_filename, self._pending}:
+            return True
+        resolved = path.resolve()
+        internal = {self.tar_filename.resolve(), self.lock_filename.resolve()}
+        if self._pending is not None:
+            internal.add(self._pending.resolve())
+        if resolved in internal:
+            return True
+        if any(resolved.is_relative_to(e) for e in self.exclude):
+            return True
+        roots = self._match_roots()
+        candidates = [path]
+        for parent in path.parents:
+            if any(parent == root or parent.is_relative_to(root) for root in roots):
+                candidates.append(parent)
+        return any(
+            fnmatch.fnmatch(str(candidate), pattern) or fnmatch.fnmatch(candidate.name, pattern)
+            for candidate in candidates
+            for pattern in self.exclude_patterns
+        )
 
     def _is_excluded(self, path: Path, is_dir: bool | None = None) -> bool:
-        """Check whether a path matches an explicit exclude or a glob pattern."""
-        resolved = path.resolve()
-        if resolved in self.exclude:
+        if self._hard_excluded(path):
             return True
-        if any(resolved.is_relative_to(excluded) for excluded in self.exclude):
-            return True
-        for pattern in self.exclude_patterns:
-            if fnmatch.fnmatch(str(resolved), pattern) or fnmatch.fnmatch(path.name, pattern):
-                return True
-        if self._template_matcher is not None:
-            if is_dir is None:
-                is_dir = path.is_dir()
-            if self._template_matcher.matches(resolved, is_dir, self._match_roots()):
-                return True
-        return False
+        return bool(
+            self._template_matcher
+            and self._template_matcher.matches(
+                path,
+                path.is_dir() if is_dir is None else is_dir,
+                self._match_roots(),
+            )
+        )
 
     def _resolve_path(self, raw_path: Path) -> Path:
-        """Resolve a template path against the configured base directory."""
-        if self.chdir:
-            return self.chdir / raw_path
-        return raw_path
+        return Path(os.path.abspath((self.chdir or Path.cwd()) / raw_path))
 
     @staticmethod
     def _make_arcname(path: Path, base: Path | None) -> str:
-        """Produce a non-colliding archive member name.
-
-        If a base directory is supplied, the returned name is the path relative
-        to that base. Otherwise the raw path is preserved as-is (with a leading
-        slash stripped to avoid tar warnings about absolute paths).
-        """
+        # Keep the lexical name: resolving symlinks changes names and creates collisions.
         if base is not None:
             try:
-                return str(path.resolve().relative_to(base.resolve()))
+                return path.relative_to(base).as_posix()
             except ValueError:
                 pass
-        return str(path).lstrip("/")
+        return path.as_posix().lstrip("/")
 
     def _walk(self) -> Iterable[tuple[Path, str]]:
-        """Yield (path, arcname) pairs for all items to be archived."""
+        emitted: set[str] = set()
+
+        def visit(path: Path, ancestors: frozenset[tuple[int, int]], base: Path | None):
+            if self._hard_excluded(path):
+                return
+            info = path.stat() if self.follow_symlinks else path.lstat()
+            is_dir = stat.S_ISDIR(info.st_mode)
+            if not (is_dir or stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+                raise BackupError(f"Unsupported special input file: {path}")
+            excluded = self._is_excluded(path, is_dir)
+            arcname = self._make_arcname(path, base)
+            if not excluded and arcname not in emitted:
+                emitted.add(arcname)
+                yield path, arcname
+            if not is_dir:
+                return
+            if excluded and not (self._template_matcher and self._template_matcher.has_negations):
+                return
+            inode = (info.st_dev, info.st_ino)
+            if inode in ancestors:
+                raise BackupError(f"Symlink directory cycle: {path}")
+            with os.scandir(path) as entries:
+                children = sorted(entry.name for entry in entries)
+            for name in children:
+                yield from visit(path / name, ancestors | {inode}, base)
+
         for raw_path in self.backup_paths:
-            path = self._resolve_path(raw_path)
-            if self._is_excluded(path):
-                self.logger.debug("Skipping excluded path: %s", path)
-                continue
-            if not path.exists():
-                self.logger.warning("Backup path not found: %s", path)
-                continue
-            if path.is_dir():
-                for root, _dirs, files in os.walk(path, followlinks=self.follow_symlinks):
-                    root_path = Path(root)
-                    for filename in files:
-                        child = root_path / filename
-                        if self._is_excluded(child, is_dir=False):
-                            self.logger.debug("Skipping excluded path: %s", child)
-                            continue
-                        yield child, self._make_arcname(child, self.chdir)
-            else:
-                yield path, self._make_arcname(path, self.chdir)
+            base = self.chdir or (None if raw_path.is_absolute() else Path.cwd())
+            yield from visit(self._resolve_path(raw_path), frozenset(), base)
 
     def backup(self, *, debug: bool = False, dry_run: bool = False) -> BackupResult:
-        """Add every template path to the archive and verify it opens."""
-        if not dry_run and not self.tar:
-            self.open_archive()
-
         if not self.backup_paths:
-            self.logger.warning("No information to backup. Is the template loaded?")
-            return BackupResult(path=self.tar_filename, size_bytes=0, success=True)
-
-        total_size = 0
-        backed_up = 0
-        for path, arcname in self._walk():
-            if debug or dry_run:
-                self.logger.info("Would back up: %s -> %s", path, arcname)
+            self.close_archive(publish=False)
+            raise BackupError("No backup paths selected; the template is empty")
+        total_size = count = 0
+        try:
             if not dry_run:
-                try:
-                    self.tar.add(path, arcname=arcname)
-                    backed_up += 1
-                except Exception as exc:  # pragma: no cover
-                    self.logger.error("Error adding %s: %s", path, exc)
-            if path.exists():
-                try:
-                    total_size += path.stat().st_size
-                except OSError:
-                    pass
-
-        self.logger.info("Backed up %d items to %s", backed_up, self.tar_filename)
-
-        if not dry_run:
-            self.close_archive()
-            size_bytes = self.tar_filename.stat().st_size
-        else:
-            size_bytes = total_size
-        return BackupResult(path=self.tar_filename, size_bytes=size_bytes, success=True)
+                self.open_archive()
+            for path, arcname in self._walk():
+                if debug or dry_run:
+                    self.logger.info("Would back up: %s -> %s", path, arcname)
+                before = path.stat() if self.follow_symlinks else path.lstat()
+                if not dry_run:
+                    self.tar.add(path, arcname=arcname, recursive=False)
+                    after = path.stat() if self.follow_symlinks else path.lstat()
+                    if stat.S_ISREG(before.st_mode) and (
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ino,
+                    ) != (after.st_size, after.st_mtime_ns, after.st_ino):
+                        raise BackupError(f"Input changed during backup: {path}")
+                    self._expected.append(arcname)
+                count += 1
+                total_size += before.st_size if stat.S_ISREG(before.st_mode) else 0
+            if not count:
+                raise BackupError("No archive members selected after exclusions")
+            if not dry_run:
+                self.close_archive()
+        except BaseException:
+            self.close_archive(publish=False)
+            raise
+        return BackupResult(
+            self.tar_filename,
+            size_bytes=total_size if dry_run else self.tar_filename.stat().st_size,
+            success=True,
+        )
 
     def verify(self, result: BackupResult | None = None) -> BackupResult:
-        """Verify the produced archive can be opened and contains members."""
         archive = result.path if result else self.tar_filename
-        if not archive.exists():
-            raise BackupError(f"Archive not found for verification: {archive}")
         try:
-            with tarfile.open(archive, self.tar_read_opt) as tar:
-                members = tar.getmembers()
-                if not members:
+            with tarfile.open(archive, "r:*") as tar:
+                count = 0
+                for member in tar:
+                    count += 1
+                    if member.isfile():
+                        with tar.extractfile(member) as stream:
+                            while stream.read(1024 * 1024):
+                                pass
+                if not count:
                     raise BackupError(f"Archive {archive} contains no members")
-                self.logger.info("Verified archive %s with %d members", archive, len(members))
-                return BackupResult(
-                    path=archive,
-                    size_bytes=archive.stat().st_size,
-                    success=True,
-                )
-        except tarfile.TarError as exc:
+                # Consume the compressed trailer too, so gzip/zstd corruption is surfaced.
+                while tar.fileobj.read(1024 * 1024):
+                    pass
+        except (tarfile.TarError, OSError, EOFError) as exc:
             raise BackupError(f"Archive verification failed for {archive}: {exc}") from exc
+        return BackupResult(archive, size_bytes=archive.stat().st_size, success=True)
 
     def prune(self) -> list[Path]:
-        """FileBackup has no built-in retention policy; return an empty list."""
         return []
 
-    def restore(self, extract_dir: str | Path, archive: str | Path | None = None) -> Path:
-        """Extract the archive to *extract_dir*."""
-        archive_path = Path(archive) if archive else self.tar_filename
-        dest = Path(extract_dir)
+    @staticmethod
+    def _restore_filter(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
+        if PurePosixPath(member.name).is_absolute() or ".." in PurePosixPath(member.name).parts:
+            raise BackupError(f"Unsafe archive member path: {member.name}")
+        filtered = tarfile.data_filter(member, destination)
+        # Preserve ordinary directory permissions; discard special permission bits.
+        if filtered.isdir():
+            filtered.mode = member.mode & 0o777
+        return filtered
+
+    @classmethod
+    def restore_archive(cls, archive: str | Path, extract_dir: str | Path) -> Path:
+        """Restore safe files, directories and contained links on every supported Python."""
+        dest = Path(extract_dir).expanduser()
         dest.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(archive_path, self.tar_read_opt) as tar:
-            for member in tar.getmembers():
-                # Only extract regular files and directories; avoid unsafe links.
-                if member.isdev() or member.issym() or member.islnk():
-                    self.logger.warning("Skipping unsafe tar member: %s", member.name)
-                    continue
-                tar.extract(member, path=dest)  # noqa: S202
-        self.logger.info("Restored %s to %s", archive_path, dest)
+        try:
+            with tarfile.open(Path(archive).expanduser(), "r:*") as tar:
+                # extractall restores directory metadata after its children.
+                tar.extractall(dest, filter=cls._restore_filter)  # noqa: S202
+        except (tarfile.TarError, OSError, EOFError) as exc:
+            raise BackupError(f"Restore failed: {exc}") from exc
         return dest
 
+    def restore(self, extract_dir: str | Path, archive: str | Path | None = None) -> Path:
+        return self.restore_archive(archive or self.tar_filename, extract_dir)
+
     def __enter__(self) -> FileBackup:
-        if not self.tar:
-            self.open_archive()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close_archive()
+        self.close_archive(publish=exc_type is None)

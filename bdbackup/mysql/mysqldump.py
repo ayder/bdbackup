@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import gzip
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import quote
+from uuid import uuid4
 
 from bdbackup.backends import BackupError, BackupResult
 from bdbackup.engines import EngineInfo, register_engine
@@ -18,6 +22,14 @@ from bdbackup.utils import redact_cmd, today_stamp
 class MySQLBackup:
     """Create compressed logical MySQL backups with mysqldump."""
 
+    DEFAULT_OPTIONS = (
+        "--single-transaction",
+        "--databases",
+        "--routines",
+        "--events",
+        "--triggers",
+    )
+
     def __init__(
         self,
         out_dir: str | Path = ".",
@@ -27,22 +39,20 @@ class MySQLBackup:
         port: int = 3306,
         options: Iterable[str] | None = None,
         jobs: int = 1,
+        database: str | None = None,
     ):
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.out_dir = Path(out_dir).expanduser().absolute()
         self.user = user
         self.password = password
         self.host = host
         self.port = port
-        self.jobs = max(1, jobs)
-        default_opts = [
-            "--single-transaction",
-            "--databases",
-            "--routines",
-            "--events",
-            "--triggers",
-        ]
-        self.options = list(options) if options is not None else default_opts
+        self.database = database
+        if jobs < 1:
+            raise ValueError("jobs must be >= 1")
+        self.jobs = jobs
+        self.options = list(dict.fromkeys([*self.DEFAULT_OPTIONS, *(options or [])]))
+        if "--all-databases" in self.options:
+            self.options.remove("--databases")
         self.logger = logging.getLogger("bdbackup.mysql.mysqldump")
 
     def _build_cmd(self, database: str | None, defaults_file: Path) -> list[str]:
@@ -56,63 +66,76 @@ class MySQLBackup:
         return cmd
 
     def backup(self, database: str | None = None) -> BackupResult:
-        """Dump a single database to a gzip-compressed SQL file."""
-        out_filename = self.out_dir / f"{database or 'all-databases'}-{today_stamp()}.sql.gz"
-        with mysql_cnf_file(
-            user=self.user,
-            password=self.password,
-            host=self.host,
-            port=self.port,
-        ) as defaults_file:
-            cmd = self._build_cmd(database, defaults_file)
-            self.logger.info(
-                "Running: %s",
-                " ".join(redact_cmd(cmd, [self.password])),
-            )
-
+        """Stream only SQL to a private gzip file, then verify and publish it."""
+        database = database if database is not None else self.database
+        if database is not None and (
+            not database or database.startswith("-") or "\x00" in database
+        ):
+            raise BackupError("Invalid database name")
+        if not database and "--all-databases" not in self.options:
+            raise BackupError("Specify a database or include --all-databases")
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        label = quote(database or "all-databases", safe="")
+        out_filename = self.out_dir / f"{label}-{today_stamp()}-{uuid4().hex}.sql.gz"
+        fd, raw = tempfile.mkstemp(prefix=".bdbackup-dump-", suffix=".tmp", dir=self.out_dir)
+        os.close(fd)
+        pending = Path(raw)
+        try:
             with (
-                subprocess.Popen(  # noqa: S603
+                mysql_cnf_file(
+                    user=self.user,
+                    password=self.password,
+                    host=self.host,
+                    port=self.port,
+                ) as defaults_file,
+                tempfile.TemporaryFile() as errors,
+            ):
+                cmd = self._build_cmd(database, defaults_file)
+                self.logger.info("Running: %s", " ".join(redact_cmd(cmd, [self.password])))
+                with subprocess.Popen(  # noqa: S603
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                ) as proc,
-                gzip.open(out_filename, "wb") as gz,
-            ):
-                if proc.stdout is None:
-                    raise RuntimeError("mysqldump stdout was unexpectedly None")
-                shutil.copyfileobj(proc.stdout, gz, 1024 * 1024)
-                proc.wait()
-                if proc.returncode != 0:
-                    error = "mysqldump failed"
-                    if proc.stdout:
-                        error = proc.stdout.read().decode("utf-8", errors="replace")
-                    self.logger.error("mysqldump failed for %s: %s", database, error)
-                    out_filename.unlink(missing_ok=True)
-                    raise subprocess.CalledProcessError(
-                        proc.returncode, cmd, output=error
-                    )
-
-        self.logger.info("Wrote compressed dump to %s", out_filename)
-        size_bytes = out_filename.stat().st_size if out_filename.exists() else 0
-        return BackupResult(path=out_filename, size_bytes=size_bytes, success=True)
+                    stderr=errors,
+                ) as proc:
+                    try:
+                        if proc.stdout is None:
+                            raise BackupError("mysqldump stdout was unexpectedly None")
+                        with gzip.open(pending, "wb") as gz:
+                            shutil.copyfileobj(proc.stdout, gz, 1024 * 1024)
+                        proc.wait()
+                    except BaseException:
+                        proc.kill()
+                        proc.wait()
+                        raise
+                    errors.seek(max(0, errors.tell() - 65536))
+                    diagnostic = errors.read().decode("utf-8", errors="replace")
+                    if proc.returncode:
+                        raise BackupError(f"mysqldump failed ({proc.returncode}): {diagnostic}")
+                    if diagnostic:
+                        self.logger.warning("mysqldump: %s", diagnostic.rstrip())
+            self.verify(BackupResult(pending))
+            with pending.open("rb") as stream:
+                os.fsync(stream.fileno())
+            # A unique name and exclusive hard-link publication never replace an older dump.
+            os.link(pending, out_filename)
+        finally:
+            pending.unlink(missing_ok=True)
+        return BackupResult(out_filename, size_bytes=out_filename.stat().st_size, success=True)
 
     def verify(self, result: BackupResult | None = None) -> BackupResult:
-        """Verify the gzip dump is readable and non-empty."""
-        dump = result.path if result else self.out_dir
-        if not dump.exists():
-            raise BackupError(f"Dump not found for verification: {dump}")
-        if dump.stat().st_size == 0:
-            raise BackupError(f"Dump is empty: {dump}")
+        """Read the entire gzip stream, including its checksum, and reject empty SQL."""
+        if result is None:
+            raise BackupError("A dump result is required for verification")
+        dump = result.path
         try:
             with gzip.open(dump, "rb") as gz:
-                # Read a small trailer to ensure gzip structure is valid.
-                gz.read(1024)
-                gz.seek(-8, 2)
-                gz.read()
-        except (gzip.BadGzipFile, OSError) as exc:
+                if not gz.read(1):
+                    raise BackupError(f"Dump contains no SQL: {dump}")
+                while gz.read(1024 * 1024):
+                    pass
+        except (OSError, EOFError) as exc:
             raise BackupError(f"Dump verification failed for {dump}: {exc}") from exc
-        self.logger.info("Verified compressed dump %s", dump)
-        return BackupResult(path=dump, size_bytes=dump.stat().st_size, success=True)
+        return BackupResult(dump, size_bytes=dump.stat().st_size, success=True)
 
     def backup_all(self, databases: Iterable[str]) -> list[BackupResult]:
         """Dump multiple databases, optionally in parallel."""

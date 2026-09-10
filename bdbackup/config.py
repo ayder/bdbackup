@@ -33,15 +33,18 @@ class Config:
     """Load and validate a TOML job configuration file."""
 
     def __init__(self, path: str | Path):
-        self.path = Path(path)
+        self.path = Path(path).expanduser().resolve()
         self.jobs: dict[str, Job] = {}
         self._load()
 
     def _load(self) -> None:
         if not self.path.exists():
             raise ConfigError(f"Config file not found: {self.path}")
-        with self.path.open("rb") as f:
-            data = tomllib.load(f)
+        try:
+            with self.path.open("rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ConfigError(f"Cannot read config {self.path}: {exc}") from exc
 
         for name, section in data.items():
             if not isinstance(section, dict):
@@ -53,6 +56,23 @@ class Config:
                     f"expected one of {sorted(supported_types())}"
                 )
             params = {k: v for k, v in section.items() if k != "type"}
+            # Config paths are relative to the config file; file-template entries
+            # and excludes remain relative to the explicitly selected source path.
+            for key in (
+                "template_filename",
+                "backup_dst",
+                "chdir",
+                "out_dir",
+                "backup_root",
+                "full_dir",
+                "incr_dir",
+                "log_dir",
+            ):
+                if key in params:
+                    try:
+                        params[key] = self.path.parent / Path(params[key]).expanduser()
+                    except TypeError as exc:
+                        raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
             self.jobs[name] = Job(name=name, type=job_type, params=params)
 
     def get(self, name: str) -> Job:

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from bdbackup.filebackup import FileBackup
 from bdbackup.mysql import XtraBackup
+from tests.conftest import write_checkpoints
 
 
 def test_xtrabackup_atomic_target_cleanup_on_failure(tmp_path: Path):
@@ -26,7 +27,8 @@ def test_xtrabackup_atomic_target_cleanup_on_failure(tmp_path: Path):
 
     date_dir = tmp_path / xb.date_dir.name
     successful = [
-        p.name for p in date_dir.iterdir()
+        p.name
+        for p in date_dir.iterdir()
         if p.name.startswith("Full_") and not p.name.endswith(".tmp")
     ]
     assert not successful
@@ -44,7 +46,7 @@ def test_xtrabackup_valid_base_accepts_to_lsn(tmp_path: Path):
     xb = XtraBackup(backup_root=tmp_path, user="xtrabackup")
     base = tmp_path / "base"
     base.mkdir()
-    (base / "xtrabackup_checkpoints").write_text("to_lsn = 1234567890\n")
+    write_checkpoints(base, end=1234567890)
     assert xb._valid_base(base)
 
 

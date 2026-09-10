@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
+from bdbackup.backends import BackupResult
 from bdbackup.cli import main
 
 
@@ -25,7 +26,7 @@ def test_file_backup(tmp_path: Path):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["file", "--template", str(template), "-d", str(dst)],
+        ["file", "--template", str(template), "-d", str(dst), "-c", str(tmp_path)],
     )
     assert result.exit_code == 0, result.output
     assert dst.with_suffix(".tar").exists()
@@ -51,7 +52,7 @@ def test_mysqldump_full_without_database():
     runner = CliRunner()
     with patch("bdbackup.cli.MySQLBackup") as mock_cls:
         instance = mock_cls.return_value
-        instance.backup.return_value = Path("/tmp/all-databases.sql.gz")
+        instance.backup.return_value = BackupResult(Path("/tmp/all-databases.sql.gz"), success=True)
         result = runner.invoke(main, ["mysqldump", "--full"])
         assert result.exit_code == 0, result.output
         instance.backup.assert_called_once_with(None)

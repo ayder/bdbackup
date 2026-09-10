@@ -9,6 +9,13 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+def _quote_option(value: str) -> str:
+    """Serialize a MySQL option value without comments or escape interpretation."""
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("MySQL credentials must not contain control characters")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 @contextmanager
 def mysql_cnf_file(
     *,
@@ -27,11 +34,11 @@ def mysql_cnf_file(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("[client]\n")
-            f.write(f"user={user}\n")
-            if password:
-                f.write(f"password={password}\n")
+            f.write(f"user={_quote_option(user)}\n")
+            if password is not None:
+                f.write(f"password={_quote_option(password)}\n")
             if host:
-                f.write(f"host={host}\n")
+                f.write(f"host={_quote_option(host)}\n")
             if port is not None:
                 f.write(f"port={port}\n")
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)

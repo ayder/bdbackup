@@ -29,6 +29,7 @@ EXIT_LOCKED = 3
     "--logging",
     "log_level",
     default="INFO",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
     help="Log level: DEBUG, INFO, WARNING, ERROR.",
 )
 @click.pass_context
@@ -47,16 +48,18 @@ def _handle_errors(func, *args, **kwargs) -> int:
         raise
     except BlockingIOError as exc:
         logging.getLogger("bdbackup.cli").error("Another backup is already running: %s", exc)
-        return EXIT_LOCKED
+        click.get_current_context().exit(EXIT_LOCKED)
+    except (ConfigError, TemplateError, ValueError, TypeError) as exc:
+        raise click.UsageError(str(exc)) from exc
     except BackupError as exc:
         logging.getLogger("bdbackup.cli").error("Backup/verify failed: %s", exc)
-        return EXIT_BACKUP_FAILED
+        click.get_current_context().exit(EXIT_BACKUP_FAILED)
     except subprocess.CalledProcessError as exc:
         logging.getLogger("bdbackup.cli").error("External command failed: %s", exc)
-        return EXIT_BACKUP_FAILED
+        click.get_current_context().exit(EXIT_BACKUP_FAILED)
     except Exception as exc:  # pragma: no cover - safety net
         logging.getLogger("bdbackup.cli").exception("Unexpected error: %s", exc)
-        return EXIT_BACKUP_FAILED
+        click.get_current_context().exit(EXIT_BACKUP_FAILED)
     return EXIT_OK
 
 
@@ -186,15 +189,19 @@ def file(
     "-p",
     "--password",
     default=None,
+    prompt="MySQL password",
+    prompt_required=False,
+    hide_input=True,
+    is_flag=False,
     help="MySQL password. If given without a value, you are prompted securely.",
 )
 @click.option("-h", "--host", default="localhost", show_default=True, help="MySQL host.")
 @click.option("-P", "--port", default=3306, show_default=True, type=int, help="MySQL port.")
 @click.option(
     "--options",
-    default="--single-transaction,--databases",
+    default="",
     show_default=True,
-    help="Comma-separated mysqldump options.",
+    help="Additional comma-separated mysqldump options (safe defaults are retained).",
 )
 @click.option("--full/--no-full", default=False, help="Add --all-databases and dump everything.")
 @click.option(
@@ -202,7 +209,7 @@ def file(
     "--jobs",
     default=1,
     show_default=True,
-    type=int,
+    type=click.IntRange(min=1),
     help="Parallel dumps when multiple databases are specified.",
 )
 @click.option(
@@ -226,10 +233,12 @@ def mysqldump(
     """Dump a MySQL database with mysqldump."""
     if not full and not database:
         raise click.UsageError("--database is required unless --full is used.")
+    opts = [option.strip() for option in options.split(",") if option.strip()]
     if full:
-        opts = ["--all-databases"]
-    else:
-        opts = options.split(",")
+        opts.append("--all-databases")
+    databases = [db.strip() for db in (database or "").split(",") if db.strip()]
+    if not full and not databases:
+        raise click.UsageError("Provide at least one database name")
 
     def _run() -> None:
         mb = MySQLBackup(
@@ -241,10 +250,11 @@ def mysqldump(
             options=opts,
             jobs=jobs,
         )
-        result = mb.backup(database if not full else None)
-        if verify:
-            mb.verify(result)
-        click.echo(f"Dump written to: {result.path}")
+        results = [mb.backup(None)] if full else mb.backup_all(databases)
+        for result in results:
+            if verify:
+                mb.verify(result)
+            click.echo(f"Dump written to: {result.path}")
 
     return _handle_errors(_run)
 
@@ -269,6 +279,10 @@ def xtrabackup() -> None:
     "-p",
     "--password",
     default=None,
+    prompt="MySQL password",
+    prompt_required=False,
+    hide_input=True,
+    is_flag=False,
     help="MySQL password. If given without a value, you are prompted securely.",
 )
 @click.option(
@@ -278,28 +292,34 @@ def xtrabackup() -> None:
     show_default=True,
     help="Backup binary (xtrabackup or mariabackup).",
 )
-@click.option("--compress", default="zstd", show_default=True, help="Compression algorithm.")
+@click.option("--compress", default="", help="Compression algorithm; default: uncompressed.")
 @click.option(
     "--compress-threads",
     default=4,
     show_default=True,
-    type=int,
+    type=click.IntRange(min=1),
     help="Number of compression threads.",
 )
 @click.option(
     "--parallel",
     default=1,
     show_default=True,
-    type=int,
+    type=click.IntRange(min=1),
     help="Number of copy threads.",
 )
 @click.option(
     "--throttle",
     default=None,
-    type=int,
+    type=click.IntRange(min=1),
     help="Limit I/O to this many IOPS.",
 )
-@click.option("--retention", default=5, show_default=True, type=int, help="Retention in days.")
+@click.option(
+    "--retention",
+    default=5,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Retention in days.",
+)
 @click.option(
     "--verify/--no-verify",
     default=True,
@@ -320,19 +340,19 @@ def xtrabackup_full(
     verify: bool,
 ) -> int:
     """Run a full physical backup."""
-    xb = XtraBackup(
-        backup_root=backup_root / database,
-        user=user,
-        password=password,
-        binary=binary,
-        compress=compress,
-        compress_threads=compress_threads,
-        parallel=parallel,
-        throttle=throttle,
-        retention_days=retention,
-    )
 
     def _run() -> None:
+        xb = XtraBackup(
+            backup_root=backup_root / database,
+            user=user,
+            password=password,
+            binary=binary,
+            compress=compress,
+            compress_threads=compress_threads,
+            parallel=parallel,
+            throttle=throttle,
+            retention_days=retention,
+        )
         result = xb.full_backup()
         if verify:
             xb.verify(result)
@@ -356,6 +376,10 @@ def xtrabackup_full(
     "-p",
     "--password",
     default=None,
+    prompt="MySQL password",
+    prompt_required=False,
+    hide_input=True,
+    is_flag=False,
     help="MySQL password. If given without a value, you are prompted securely.",
 )
 @click.option(
@@ -365,25 +389,25 @@ def xtrabackup_full(
     show_default=True,
     help="Backup binary (xtrabackup or mariabackup).",
 )
-@click.option("--compress", default="zstd", show_default=True, help="Compression algorithm.")
+@click.option("--compress", default="", help="Compression algorithm; default: uncompressed.")
 @click.option(
     "--compress-threads",
     default=4,
     show_default=True,
-    type=int,
+    type=click.IntRange(min=1),
     help="Number of compression threads.",
 )
 @click.option(
     "--parallel",
     default=1,
     show_default=True,
-    type=int,
+    type=click.IntRange(min=1),
     help="Number of copy threads.",
 )
 @click.option(
     "--throttle",
     default=None,
-    type=int,
+    type=click.IntRange(min=1),
     help="Limit I/O to this many IOPS.",
 )
 @click.option(
@@ -405,18 +429,18 @@ def xtrabackup_incremental(
     verify: bool,
 ) -> int:
     """Run an incremental physical backup based on the latest full."""
-    xb = XtraBackup(
-        backup_root=backup_root / database,
-        user=user,
-        password=password,
-        binary=binary,
-        compress=compress,
-        compress_threads=compress_threads,
-        parallel=parallel,
-        throttle=throttle,
-    )
 
     def _run() -> None:
+        xb = XtraBackup(
+            backup_root=backup_root / database,
+            user=user,
+            password=password,
+            binary=binary,
+            compress=compress,
+            compress_threads=compress_threads,
+            parallel=parallel,
+            throttle=throttle,
+        )
         result = xb.incremental_backup()
         if verify:
             xb.verify(result)
@@ -435,7 +459,13 @@ def xtrabackup_incremental(
     type=click.Path(file_okay=False, path_type=Path),
     help="Backup root directory.",
 )
-@click.option("--retention", default=5, show_default=True, type=int, help="Retention in days.")
+@click.option(
+    "--retention",
+    default=5,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Retention in days.",
+)
 def xtrabackup_prune(
     database: str,
     backup_root: Path,
@@ -446,18 +476,36 @@ def xtrabackup_prune(
         backup_root=backup_root / database,
         retention_days=retention,
     )
-    removed = xb.prune()
-    click.echo(f"Pruned {len(removed)} backup directories")
-    return EXIT_OK
+    return _handle_errors(lambda: click.echo(f"Pruned {len(xb.prune())} backup directories"))
 
 
 @xtrabackup.command(name="prepare")
 @click.argument("target", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "-r",
+    "--root",
+    "backup_root",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="The database's backup root (containing dated directories).",
+)
+@click.option(
+    "-d",
+    "--dst",
+    "destination",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="New recovery directory outside the backup root.",
+)
 @click.option("-u", "--user", default="xtrabackup", show_default=True, help="MySQL user.")
 @click.option(
     "-p",
     "--password",
     default=None,
+    prompt="MySQL password",
+    prompt_required=False,
+    hide_input=True,
+    is_flag=False,
     help="MySQL password. If given without a value, you are prompted securely.",
 )
 @click.option(
@@ -469,20 +517,20 @@ def xtrabackup_prune(
 )
 def xtrabackup_prepare(
     target: Path,
+    backup_root: Path,
+    destination: Path,
     user: str,
     password: str | None,
     binary: str,
 ) -> int:
     """Run --prepare on a backup directory to make it restorable."""
     xb = XtraBackup(
-        backup_root=target.parent,
+        backup_root=backup_root,
         user=user,
         password=password,
         binary=binary,
     )
-    return _handle_errors(lambda: (xb.prepare(target), click.echo(f"Prepared: {target}")))
-
-
+    return _handle_errors(lambda: click.echo(f"Prepared: {xb.prepare(target, destination)}"))
 
 
 @main.command()
@@ -504,30 +552,77 @@ def xtrabackup_prepare(
     type=click.Path(file_okay=False, path_type=Path),
     help="Directory containing backup logs to expire by age (optional).",
 )
-@click.option("--full-glob", default=retention.DEFAULTS["full_glob"], show_default=True,
-              help="Glob matching full backup files.")
-@click.option("--incr-glob", default=retention.DEFAULTS["incr_glob"], show_default=True,
-              help="Glob matching incremental backup files.")
-@click.option("--log-glob", default=retention.DEFAULTS["log_glob"], show_default=True,
-              help="Glob matching log files.")
-@click.option("--daily", default=retention.DEFAULTS["daily"], show_default=True, type=int,
-              help="Keep EVERY backup of the last N calendar days.")
-@click.option("--weekly", default=retention.DEFAULTS["weekly"], show_default=True, type=int,
-              help="Then one backup per ISO week, for N weeks.")
-@click.option("--monthly", default=retention.DEFAULTS["monthly"], show_default=True, type=int,
-              help="Then one backup per calendar month, for N months.")
-@click.option("--incr-days", default=retention.DEFAULTS["incr_days"], show_default=True,
-              type=int, help="Keep incrementals for N days, never past their full.")
-@click.option("--log-days", default=retention.DEFAULTS["log_days"], show_default=True,
-              type=int, help="Keep logs for N days.")
-@click.option("--pick", "pick_mode", default=retention.DEFAULTS["pick"], show_default=True,
-              type=click.Choice(["first", "last"]),
-              help="Which backup survives inside a week/month bucket.")
-@click.option("--min-keep-fulls", default=retention.DEFAULTS["min_keep_fulls"],
-              show_default=True, type=int,
-              help="Safety floor: never leave fewer than N fulls on disk.")
-@click.option("--now", default=None, metavar="YYYY-MM-DD",
-              help="Pretend it is this date (for testing).")
+@click.option(
+    "--full-glob",
+    default=retention.DEFAULTS["full_glob"],
+    show_default=True,
+    help="Glob matching full backup files.",
+)
+@click.option(
+    "--incr-glob",
+    default=retention.DEFAULTS["incr_glob"],
+    show_default=True,
+    help="Glob matching incremental backup files.",
+)
+@click.option(
+    "--log-glob",
+    default=retention.DEFAULTS["log_glob"],
+    show_default=True,
+    help="Glob matching log files.",
+)
+@click.option(
+    "--daily",
+    default=retention.DEFAULTS["daily"],
+    show_default=True,
+    type=int,
+    help="Keep EVERY backup of the last N calendar days.",
+)
+@click.option(
+    "--weekly",
+    default=retention.DEFAULTS["weekly"],
+    show_default=True,
+    type=int,
+    help="Then one backup per ISO week, for N weeks.",
+)
+@click.option(
+    "--monthly",
+    default=retention.DEFAULTS["monthly"],
+    show_default=True,
+    type=int,
+    help="Then one backup per calendar month, for N months.",
+)
+@click.option(
+    "--incr-days",
+    default=retention.DEFAULTS["incr_days"],
+    show_default=True,
+    type=int,
+    help="Keep incrementals for N days, never past their full.",
+)
+@click.option(
+    "--log-days",
+    default=retention.DEFAULTS["log_days"],
+    show_default=True,
+    type=int,
+    help="Keep logs for N days.",
+)
+@click.option(
+    "--pick",
+    "pick_mode",
+    default=retention.DEFAULTS["pick"],
+    show_default=True,
+    type=click.Choice(["first", "last"]),
+    help="Which backup survives inside a week/month bucket.",
+)
+@click.option(
+    "--min-keep-fulls",
+    default=retention.DEFAULTS["min_keep_fulls"],
+    show_default=True,
+    type=int,
+    help="Safety floor: never leave fewer than N fulls on disk.",
+)
+@click.option(
+    "--now", default=None, metavar="YYYY-MM-DD", help="Pretend it is this date (for testing)."
+)
 @click.option("--apply", is_flag=True, help="Actually delete; default is a dry run.")
 @click.option("-q", "--quiet", is_flag=True, help="Only print the summary line.")
 def retention_cmd(
@@ -559,9 +654,7 @@ def retention_cmd(
     now_dt = None
     if now:
         try:
-            now_dt = _dt.datetime.strptime(now, "%Y-%m-%d").replace(
-                hour=23, minute=59, second=59
-            )
+            now_dt = _dt.datetime.strptime(now, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
         except ValueError:
             raise click.UsageError("--now must be YYYY-MM-DD") from None
 
@@ -588,6 +681,8 @@ def retention_cmd(
     if rc:
         click.get_current_context().exit(rc)
     return rc
+
+
 @main.command()
 @click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
@@ -609,8 +704,12 @@ def restore(
     chdir: Path | None,
 ) -> int:
     """Extract a file backup archive to a destination directory."""
-    fb = FileBackup(backup_dst=dst, chdir=chdir)
-    return _handle_errors(lambda: (fb.restore(dst, archive), click.echo(f"Restored to: {dst}")))
+    return _handle_errors(
+        lambda: (
+            FileBackup.restore_archive(archive, dst),
+            click.echo(f"Restored to: {dst}"),
+        )
+    )
 
 
 @main.command(name="run")
@@ -646,39 +745,42 @@ def run(
     if not names or any(n is None for n in names):
         raise click.UsageError("Provide a JOB_NAME or use --all.")
 
+    try:
+        selected = [config.get(name) for name in names]
+    except ConfigError as exc:
+        raise click.UsageError(str(exc)) from exc
     logger = logging.getLogger("bdbackup.cli")
-    failed = 0
-    for name in names:
-        job = config.get(name)
-        logger.info("Running job %r (%s)", name, job.type)
-
-        if job.type == "retention":
-            params = dict(job.params)
-            # Config uses CLI-style names; map to run_job's parameters.
-            if "apply" in params:
-                params["apply_changes"] = params.pop("apply")
-            if "pick" in params:
-                params["pick_mode"] = params.pop("pick")
-            rc = retention.run_job(**params)
-            if rc:
-                logger.error("Job %r failed (exit %s)", name, rc)
-                failed += 1
-            continue
-
-        backend = build_backend(job)
+    failures = []
+    for job in selected:
+        logger.info("Running job %r (%s)", job.name, job.type)
         try:
+            if job.type == "retention":
+                params = dict(job.params)
+                if "apply" in params:
+                    params["apply_changes"] = params.pop("apply")
+                if "pick" in params:
+                    params["pick_mode"] = params.pop("pick")
+                if retention.run_job(**params):
+                    failures.append(EXIT_BACKUP_FAILED)
+                continue
+            backend = build_backend(job)
             result = backend.backup()
+            if not result.success:
+                raise BackupError("Backend reported an unsuccessful backup")
             if verify:
                 backend.verify(result)
-            click.echo(f"Job {name}: {result.path}")
-        except (BackupError, subprocess.CalledProcessError) as exc:
-            logger.error("Job %r failed: %s", name, exc)
-            failed += 1
-
-    rc = EXIT_BACKUP_FAILED if failed else EXIT_OK
-    if rc:
-        click.get_current_context().exit(rc)
-    return rc
+            click.echo(f"Job {job.name}: {result.path}")
+        except BlockingIOError as exc:
+            logger.error("Job %r locked: %s", job.name, exc)
+            failures.append(EXIT_LOCKED)
+        except Exception as exc:
+            logger.error("Job %r failed: %s", job.name, exc)
+            failures.append(EXIT_BACKUP_FAILED)
+    if failures:
+        click.get_current_context().exit(
+            EXIT_BACKUP_FAILED if EXIT_BACKUP_FAILED in failures else EXIT_LOCKED,
+        )
+    return EXIT_OK
 
 
 if __name__ == "__main__":

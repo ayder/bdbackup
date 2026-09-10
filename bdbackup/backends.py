@@ -48,7 +48,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     root.setLevel(level)
     if not root.handlers:
         handler = logging.StreamHandler()
-        handler.setLevel(level)
+        handler.setLevel(logging.NOTSET)
         formatter = logging.Formatter(
             "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
         )

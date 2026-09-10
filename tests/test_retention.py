@@ -86,7 +86,12 @@ class TestTiers:
         assert len(monthly) == 6
         assert [f.ts.day for f in monthly] == [1] * 6
         assert [f.ts.strftime("%Y-%m") for f in monthly] == [
-            "2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06",
+            "2026-01",
+            "2026-02",
+            "2026-03",
+            "2026-04",
+            "2026-05",
+            "2026-06",
         ]
 
     def test_pick_last_takes_newest_in_bucket(self, tree):
@@ -109,12 +114,17 @@ class TestTiers:
         for month in range(1, 8):
             add_full(tree, datetime(2026, month, 15, 2, 0))
         fulls, _ = plan(tree)
-        assert kept(fulls) == sorted([
-            "full_20260115_020000.mbi", "full_20260215_020000.mbi",
-            "full_20260315_020000.mbi", "full_20260415_020000.mbi",
-            "full_20260515_020000.mbi", "full_20260615_020000.mbi",
-            "full_20260715_020000.mbi",
-        ])
+        assert kept(fulls) == sorted(
+            [
+                "full_20260115_020000.mbi",
+                "full_20260215_020000.mbi",
+                "full_20260315_020000.mbi",
+                "full_20260415_020000.mbi",
+                "full_20260515_020000.mbi",
+                "full_20260615_020000.mbi",
+                "full_20260715_020000.mbi",
+            ]
+        )
 
 
 class TestChainSafety:
@@ -122,23 +132,21 @@ class TestChainSafety:
         """The classic data-loss bug: weekly picks the Monday full, the Sunday
         full expires, and the incrementals still inside the daily window that
         descend from it become unrestorable."""
-        add_full(tree, datetime(2026, 7, 13, 2, 0))   # Mon -> weekly winner
-        add_full(tree, datetime(2026, 7, 19, 2, 0))   # Sun -> chain anchor
+        add_full(tree, datetime(2026, 7, 13, 2, 0))  # Mon -> weekly winner
+        add_full(tree, datetime(2026, 7, 19, 2, 0))  # Sun -> chain anchor
         for day in (23, 24, 25):
             add_incr(tree, datetime(2026, 7, day, 2, 0))
 
         fulls, incrs = plan(tree, min_keep=0)
         anchor = [f for f in fulls if "20260719" in f.name][0]
 
-        assert anchor.keep, (
-            "full_20260719 was expired while incrementals still depend on it"
-        )
+        assert anchor.keep, "full_20260719 was expired while incrementals still depend on it"
         assert "chain anchor" in anchor.reason
         assert len(kept(incrs)) == 3
 
     def test_incremental_without_parent_is_dropped(self, tree):
         add_full(tree, datetime(2026, 7, 26, 2, 0))
-        add_incr(tree, datetime(2026, 7, 24, 2, 0))    # predates every full
+        add_incr(tree, datetime(2026, 7, 24, 2, 0))  # predates every full
         _fulls, incrs = plan(tree)
         assert kept(incrs) == []
         assert "orphan" in incrs[0].reason
@@ -148,8 +156,8 @@ class TestChainSafety:
         for day in range(2, 10):
             add_incr(tree, datetime(2026, 3, day, 2, 0))
         fulls, incrs = plan(tree)
-        assert fulls[0].keep               # monthly -4
-        assert kept(incrs) == []           # but no incrementals
+        assert fulls[0].keep  # monthly -4
+        assert kept(incrs) == []  # but no incrementals
         assert "chain anchor" not in fulls[0].reason
 
 
@@ -160,7 +168,8 @@ class TestSafety:
         add_full(tree, datetime(2025, 1, 7, 2, 0))
         fulls, _ = plan(tree, min_keep=2)
         assert kept(fulls) == [
-            "full_20250106_020000.mbi", "full_20250107_020000.mbi",
+            "full_20250106_020000.mbi",
+            "full_20250107_020000.mbi",
         ]
 
     def test_temp_and_symlink_are_skipped(self, tree):
@@ -191,10 +200,14 @@ class TestCLI:
     def _args(self, tree, *extra, apply=False):
         args = [
             "retention",
-            "--full-dir", str(tree.full),
-            "--incr-dir", str(tree.incr),
-            "--log-dir", str(tree.log),
-            "--now", "2026-07-29",
+            "--full-dir",
+            str(tree.full),
+            "--incr-dir",
+            str(tree.incr),
+            "--log-dir",
+            str(tree.log),
+            "--now",
+            "2026-07-29",
             "-q",
         ]
         if apply:
@@ -252,8 +265,7 @@ class TestTimestampParsing:
     def test_falls_back_to_mtime(self, tmp_path):
         when = datetime(2026, 7, 20, 3, 0)
         mkfile(tmp_path, "full_nodate.mbi", when)
-        files, _ = br.scan(tmp_path, "full_*.mbi", "full",
-                           datetime(2026, 7, 29, 23, 59))
+        files, _ = br.scan(tmp_path, "full_*.mbi", "full", datetime(2026, 7, 29, 23, 59))
         assert files[0].ts_source == "mtime"
         assert files[0].ts == when
 
@@ -283,11 +295,17 @@ class TestConfigJobs:
             f'log_dir = "{tree.log}"\n'
             f"apply = {'true' if apply else 'false'}\n"
             "daily = 7\nweekly = 4\nmonthly = 6\n"
-            'quiet = true\n'
+            "quiet = true\n"
         )
         return cfg
 
-    def test_config_job_dry_run_then_apply(self, tree):
+    def test_config_job_dry_run_then_apply(self, tree, monkeypatch):
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return NOW
+
+        monkeypatch.setattr(br, "datetime", FrozenDatetime)
         for i in range(400):
             add_full(tree, NOW - timedelta(days=i, hours=22))
 

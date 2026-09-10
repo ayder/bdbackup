@@ -13,10 +13,12 @@
 # Each top-level table is one job; its name is the table name and it must
 # set `type`: file | mysqldump | xtrabackup | retention, or any engine
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
-# Every other key is passed verbatim to the backend/policy constructor
+# Other keys are passed to the backend/policy constructor
 # (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup /
 # bdbackup.retention.run_job), so key names use Python-style underscores
 # (e.g. exclude_templates), NOT the CLI's dashes (--exclude-template).
+# Paths expand ~ and resolve relative to this config file; template/exclude
+# entries resolve relative to chdir (or the process working directory).
 # A key that doesn't match a constructor/parameter fails the job with a TypeError.
 #
 # Types must match the constructor: strings for paths, integers for ports,
@@ -37,7 +39,7 @@ template_filename = "~/.config/bdbackup/files.template"
 # (.tar / .tar.gz / .tar.zst) is appended automatically.
 backup_dst = "/backup/files/daily"
 
-# REQUIRED for file jobs: the source path being backed up. Relative entries
+# Source for file jobs: the source path being backed up. Relative entries
 # in the template file, relative `exclude` entries, and relative
 # exclusion-template patterns (e.g. "tests/containers/*") are all resolved
 # against this directory — never against the process working directory.
@@ -45,7 +47,7 @@ backup_dst = "/backup/files/daily"
 chdir = "/srv/www"
 
 # Archive format: "tar", "tar.gz" or "tar.zst".
-format = "tar.zst"
+format = "tar.gz"  # tar.zst requires Python 3.14+
 
 # Follow symbolic links while walking directories (default: false).
 follow_symlinks = false
@@ -77,7 +79,7 @@ exclude_templates = ["python-dev"]
 
 # ---------------------------------------------------------------------------
 # mysqldump: logical dump of one database (or all, when using --full on CLI;
-# config jobs dump the `options` databases).
+# config jobs select `database`, or --all-databases in options).
 # ---------------------------------------------------------------------------
 [mysql-dump]
 type = "mysqldump"
@@ -91,9 +93,11 @@ host = "localhost"
 port = 3306
 
 # mysqldump options as an array of strings (CLI takes them comma-separated).
-options = ["--single-transaction", "--databases"]
+database = "mydatabase"
+options = []  # safe defaults include single-transaction, routines, events, triggers
 
-# Parallel dumps when several databases are given (default: 1).
+# Parallel multi-database dumps are available through the CLI. Each config
+# job selects one database, or --all-databases in options.
 jobs = 1
 
 # ---------------------------------------------------------------------------
@@ -109,7 +113,7 @@ backup_root = "/backup/mysql/production"
 user = "xtrabackup"
 # password = "secret"
 binary = "xtrabackup"            # or "mariabackup"
-compress = "zstd"                # compression algorithm for --compress
+compress = ""                    # off; zstd for compatible XtraBackup, quicklz for MariaDB
 compress_threads = 4
 parallel = 2                     # copy threads
 # throttle = 200                 # optional IOPS limit
@@ -122,10 +126,12 @@ parallel = 2                     # copy threads
 [mysql-prod-retention]
 type = "retention"
 
+# Flat files from ONE chronological stream; not the XtraBackup directory layout.
+# Kept increments also pin their preceding increments and full backup.
 # Required. Directories containing full / incremental / log backups.
-full_dir = "/backup/mysql/production"
-incr_dir = "/backup/mysql/production/incr"   # optional; omit if none
-log_dir = "/backup/mysql/production/log"     # optional; omit if none
+full_dir = "/backup/flat/full"
+incr_dir = "/backup/flat/incr"   # optional; omit if none
+log_dir = "/backup/flat/log"     # optional; omit if none
 
 # GFS tier counts.
 daily = 7                # keep EVERY backup of the last 7 calendar days
