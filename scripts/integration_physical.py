@@ -112,9 +112,11 @@ def main(engine="percona"):
                     if "--backup" in cmd
                     else []
                 )
-                target = next(
-                    arg.split("=", 1)[1] for arg in cmd if arg.startswith("--target-dir=")
-                )
+                writable_paths = [
+                    arg.split("=", 1)[1]
+                    for arg in cmd
+                    if arg.startswith(("--target-dir=", "--incremental-dir="))
+                ]
                 try:
                     command(
                         "run",
@@ -136,6 +138,7 @@ def main(engine="percona"):
                 finally:
                     # Linux bind mounts preserve container UIDs. Give the caller
                     # access to generated files before verification and cleanup.
+                    # Prepare can also create redo files in its incremental copy.
                     command(
                         "run",
                         "--rm",
@@ -150,8 +153,7 @@ def main(engine="percona"):
                         backup_image,
                         "-R",
                         f"{os.getuid()}:{os.getgid()}",
-                        target,
-                        check=False,
+                        *writable_paths,
                     )
 
             with (

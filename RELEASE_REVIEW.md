@@ -1,7 +1,13 @@
-# Release preparation: bdbackup 0.5.0
+# Release preparation: bdbackup 0.5.1
 
 Updated 2026-09-10 after implementing the repair plan in FIX_PLAN.md and adding
 SQLite backup history and guided restoration.
+
+The first hosted run passed all Python, MySQL and MariaDB checks. Its Percona
+job exposed root-owned files created inside incremental working copies by the
+Docker test harness. The harness now restores ownership on both target and
+incremental copies before host-side cleanup. This correction is versioned as
+0.5.1; already published tags remain intact.
 
 **The listed code-level findings are fixed and locally validated.** This is a
 release candidate for the documented support scope. The GitHub destination is
