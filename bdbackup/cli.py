@@ -17,7 +17,9 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
+from bdbackup.scheduling import recommend_cron
 from bdbackup.templates import TemplateError
+from bdbackup.validation import validate_config
 
 # Exit-code contract: 0 ok, 1 backup/verify failure, 2 usage, 3 locked.
 EXIT_OK = 0
@@ -26,7 +28,7 @@ EXIT_USAGE = 2
 EXIT_LOCKED = 3
 
 
-@click.group(name="bdbackup", invoke_without_command=False)
+@click.group(name="bdbackup", invoke_without_command=True, no_args_is_help=True)
 @click.version_option(version=__version__, prog_name="bdbackup")
 @click.option(
     "--config", "config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -40,7 +42,14 @@ EXIT_LOCKED = 3
     help="Log level: DEBUG, INFO, WARNING, ERROR.",
 )
 @click.pass_context
-def main(ctx: click.Context, log_level: str, config_path: Path | None) -> None:
+@click.option("--validate", "validate_only", is_flag=True,
+              help="Check configured settings, filesystem access and MySQL grants; do not back up.")
+@click.option("--cron", "cron_only", is_flag=True,
+              help="Read crontab -l and recommend entries for configured jobs; do not install.")
+def main(
+    ctx: click.Context, log_level: str, config_path: Path | None,
+    validate_only: bool, cron_only: bool,
+) -> None:
     """Brain-dead backup: file archives, mysqldump and xtrabackup helpers."""
     setup_logging(getattr(logging, log_level.upper(), logging.INFO))
     ctx.ensure_object(dict)
@@ -49,6 +58,28 @@ def main(ctx: click.Context, log_level: str, config_path: Path | None) -> None:
         ctx.obj["config"] = Config(config_path) if config_path else None
     except ConfigError as exc:
         raise click.UsageError(str(exc)) from exc
+    if validate_only or cron_only:
+        if ctx.invoked_subcommand:
+            raise click.UsageError("Use global --validate/--cron without a subcommand, "
+                                   "or put these options after run")
+        config = _get_config(required=True)
+        ctx.exit(_configuration_helpers(config, list(config.jobs.values()),
+                                        validate_only, cron_only))
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+        ctx.exit(EXIT_USAGE)
+
+
+def _configuration_helpers(config, jobs, validate_only, cron_only) -> int:
+    ok = True
+    if not jobs:
+        raise click.UsageError("No configured jobs selected")
+    for enabled, helper in ((validate_only, validate_config), (cron_only, recommend_cron)):
+        if enabled:
+            lines, success = helper(config, jobs)
+            click.echo("\n".join(lines))
+            ok = ok and success
+    return EXIT_OK if ok else EXIT_BACKUP_FAILED
 
 
 def _get_config(path: Path | None = None, *, required: bool = False) -> Config | None:
@@ -58,9 +89,11 @@ def _get_config(path: Path | None = None, *, required: bool = False) -> Config |
     return config
 
 
-def _tracked_backup(config, name, backup_type, action, restore_info=None):
+def _tracked_backup(config, name, backup_type, action, restore_info=None, *, encrypted=False):
     if config and config.history:
-        return History(config.history).run(name, backup_type, action, restore_info)
+        return History(config.history).run(
+            name, backup_type, action, restore_info, encrypted=encrypted,
+        )
     return action()
 
 
@@ -362,6 +395,10 @@ def xtrabackup() -> None:
     show_default=True,
     help="Backup binary (xtrabackup or mariabackup).",
 )
+@click.option("--encrypt/--no-encrypt", default=False,
+              help="Encrypt with AES256; requires a key file.")
+@click.option("--encrypt-key-file", type=click.Path(dir_okay=False, path_type=Path),
+              help="32-byte AES256 key file (e.g. /etc/mysql/xtrabackup.key).")
 @click.option("--compress", default="", help="Compression algorithm; default: uncompressed.")
 @click.option(
     "--compress-threads",
@@ -402,6 +439,8 @@ def xtrabackup_full(
     user: str,
     password: str | None,
     binary: str,
+    encrypt: bool,
+    encrypt_key_file: Path | None,
     compress: str,
     compress_threads: int,
     parallel: int,
@@ -420,12 +459,15 @@ def xtrabackup_full(
             user=user,
             password=password,
             binary=binary,
+            encrypt=encrypt,
+            encrypt_key_file=encrypt_key_file,
             compress=compress,
             compress_threads=compress_threads,
             parallel=parallel,
             throttle=throttle,
             retention_days=retention,
         )
+        info.update(backup_restore_info(xb))
         result = xb.full_backup()
         if verify:
             xb.verify(result)
@@ -433,7 +475,9 @@ def xtrabackup_full(
         return result
 
     return _handle_errors(
-        lambda: _tracked_backup(config, database, "xtrabackup-full", _create, info)
+        lambda: _tracked_backup(
+            config, database, "xtrabackup-full", _create, info, encrypted=encrypt,
+        )
     )
 
 
@@ -465,6 +509,10 @@ def xtrabackup_full(
     show_default=True,
     help="Backup binary (xtrabackup or mariabackup).",
 )
+@click.option("--encrypt/--no-encrypt", default=False,
+              help="Encrypt with AES256; requires a key file.")
+@click.option("--encrypt-key-file", type=click.Path(dir_okay=False, path_type=Path),
+              help="32-byte AES256 key file (e.g. /etc/mysql/xtrabackup.key).")
 @click.option("--compress", default="", help="Compression algorithm; default: uncompressed.")
 @click.option(
     "--compress-threads",
@@ -498,6 +546,8 @@ def xtrabackup_incremental(
     user: str,
     password: str | None,
     binary: str,
+    encrypt: bool,
+    encrypt_key_file: Path | None,
     compress: str,
     compress_threads: int,
     parallel: int,
@@ -515,11 +565,14 @@ def xtrabackup_incremental(
             user=user,
             password=password,
             binary=binary,
+            encrypt=encrypt,
+            encrypt_key_file=encrypt_key_file,
             compress=compress,
             compress_threads=compress_threads,
             parallel=parallel,
             throttle=throttle,
         )
+        info.update(backup_restore_info(xb))
         result = xb.incremental_backup()
         if verify:
             xb.verify(result)
@@ -527,7 +580,9 @@ def xtrabackup_incremental(
         return result
 
     return _handle_errors(
-        lambda: _tracked_backup(config, database, "xtrabackup-incremental", _create, info)
+        lambda: _tracked_backup(
+            config, database, "xtrabackup-incremental", _create, info, encrypted=encrypt,
+        )
     )
 
 
@@ -597,6 +652,8 @@ def xtrabackup_prune(
     show_default=True,
     help="Backup binary (xtrabackup or mariabackup).",
 )
+@click.option("--encrypt-key-file", type=click.Path(dir_okay=False, path_type=Path),
+              help="32-byte AES256 key file for encrypted backups.")
 def xtrabackup_prepare(
     target: Path,
     backup_root: Path,
@@ -604,6 +661,7 @@ def xtrabackup_prepare(
     user: str,
     password: str | None,
     binary: str,
+    encrypt_key_file: Path | None,
 ) -> int:
     """Run --prepare on a backup directory to make it restorable."""
     xb = XtraBackup(
@@ -611,6 +669,7 @@ def xtrabackup_prepare(
         user=user,
         password=password,
         binary=binary,
+        encrypt_key_file=encrypt_key_file,
     )
     return _handle_errors(lambda: click.echo(f"Prepared: {xb.prepare(target, destination)}"))
 
@@ -785,18 +844,23 @@ def retention_cmd(
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Resolve template paths against this directory.",
 )
+@click.option("--encrypt-key-file", type=click.Path(dir_okay=False, path_type=Path),
+              help="Override the encryption key file recorded in physical backup history.")
 def restore(
     archive: Path | None,
     dst: Path | None,
     chdir: Path | None,
     config_path: Path | None,
     backup_id: int | None,
+    encrypt_key_file: Path | None,
     job: str | None,
     yes: bool,
 ) -> int:
     """Restore an archive, or select a successful backup from configured history."""
     def _run():
         if archive is not None:
+            if encrypt_key_file is not None:
+                raise click.UsageError("--encrypt-key-file requires physical backup history")
             if backup_id is not None or job is not None:
                 raise click.UsageError("ARCHIVE cannot be combined with --backup-id or --job")
             if dst is None:
@@ -818,7 +882,8 @@ def restore(
             for record in records:
                 click.echo(
                     f"{record.id}: {record.job_name} | {record.backup_type} | "
-                    f"{record.started_at} | {record.path}"
+                    f"{record.started_at} | "
+                    f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path}"
                 )
             selected_id = click.prompt("Backup ID", type=int, default=records[0].id)
             choices = {r.id: r for r in records}
@@ -838,7 +903,12 @@ def restore(
         click.echo(f"Recovery destination: {destination}")
         if not yes:
             click.confirm("Restore this backup?", abort=True)
-        restored = restore_record(record, destination)
+        if encrypt_key_file is not None:
+            if not record.backup_type.startswith("xtrabackup"):
+                raise click.UsageError("--encrypt-key-file requires a physical backup")
+            restored = restore_record(record, destination, encrypt_key_file=encrypt_key_file)
+        else:
+            restored = restore_record(record, destination)
         if record.backup_type == "mysqldump":
             click.echo(f"SQL recovered to: {restored / 'backup.sql'} (not imported into a server)")
         elif record.backup_type.startswith("xtrabackup"):
@@ -867,7 +937,8 @@ def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> 
             available = "available" if record.available else "unavailable"
             click.echo(
                 f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
-                f"{record.status} | {available} | {record.path or '-'}"
+                f"{record.status} | {available} | "
+                f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path or '-'}"
             )
 
     return _handle_errors(_run)
@@ -883,6 +954,10 @@ def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> 
 )
 @click.argument("job_name", required=False)
 @click.option("--all", "run_all", is_flag=True, help="Run every job in the config.")
+@click.option("--validate", "validate_only", is_flag=True,
+              help="Validate selected jobs without running backups or retention.")
+@click.option("--cron", "cron_only", is_flag=True,
+              help="Recommend cron entries for selected jobs without installing them.")
 @click.option(
     "--verify/--no-verify",
     default=True,
@@ -894,6 +969,8 @@ def run(
     job_name: str | None,
     run_all: bool,
     verify: bool,
+    validate_only: bool,
+    cron_only: bool,
 ) -> int:
     """Run one or more configured backup jobs."""
     try:
@@ -901,7 +978,10 @@ def run(
     except ConfigError as exc:
         raise click.UsageError(str(exc)) from exc
 
-    names = list(config.jobs.keys()) if run_all else [job_name]
+    if run_all and job_name:
+        raise click.UsageError("Choose JOB_NAME or --all, not both")
+    select_all = run_all or ((validate_only or cron_only) and job_name is None)
+    names = list(config.jobs.keys()) if select_all else [job_name]
     if not names or any(n is None for n in names):
         raise click.UsageError("Provide a JOB_NAME or use --all.")
 
@@ -909,6 +989,10 @@ def run(
         selected = [config.get(name) for name in names]
     except ConfigError as exc:
         raise click.UsageError(str(exc)) from exc
+    if validate_only or cron_only:
+        click.get_current_context().exit(
+            _configuration_helpers(config, selected, validate_only, cron_only)
+        )
     logger = logging.getLogger("bdbackup.cli")
     failures = []
     for job in selected:
@@ -936,7 +1020,10 @@ def run(
                     backend.verify(result)
                 return result
 
-            result = _tracked_backup(config, job.name, job.type, _create, info)
+            result = _tracked_backup(
+                config, job.name, job.type, _create, info,
+                encrypted=job.params.get("encrypt") is True,
+            )
             click.echo(f"Job {job.name}: {result.path}")
         except BlockingIOError as exc:
             logger.error("Job %r locked: %s", job.name, exc)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,8 @@ class XtraBackup:
         parallel: int = 1,
         throttle: int | None = None,
         retention_days: int = 5,
+        encrypt: bool = False,
+        encrypt_key_file: str | Path | None = None,
     ):
         self.backup_root = Path(backup_root).expanduser().resolve()
         self.user = user
@@ -43,6 +46,14 @@ class XtraBackup:
         self.binary = binary
         self.compress = compress
         self.is_mariadb = Path(binary).name in {"mariabackup", "mariadb-backup"}
+        if not isinstance(encrypt, bool):
+            raise ValueError("encrypt must be a boolean (true or false in TOML)")
+        self.encrypt = encrypt
+        self.encrypt_key_file = (
+            Path(encrypt_key_file).expanduser().resolve() if encrypt_key_file else None
+        )
+        if encrypt:
+            self._encryption_key_id()
         if self.is_mariadb and compress not in {"", "quicklz"}:
             raise ValueError("mariabackup supports only quicklz compression; omit for uncompressed")
         self.compress_threads = compress_threads
@@ -54,6 +65,25 @@ class XtraBackup:
         if throttle is not None and throttle < 1:
             raise ValueError("throttle must be >= 1")
         self.logger = logging.getLogger("bdbackup.mysql.xtrabackup")
+
+    def _encryption_key_id(self) -> str:
+        """Validate AES256 key material without putting it in commands or metadata."""
+        if self.is_mariadb:
+            raise ValueError("Backup encryption requires Percona XtraBackup, not mariabackup")
+        if self.encrypt_key_file is None:
+            raise ValueError(
+                "Encryption requires encrypt_key_file (e.g. /etc/mysql/xtrabackup.key)"
+            )
+        try:
+            if not self.encrypt_key_file.is_file():
+                raise OSError("not a regular file")
+            with self.encrypt_key_file.open("rb") as key_file:
+                key = key_file.read(33)
+        except OSError as exc:
+            raise BackupError(f"Cannot read encryption key file: {self.encrypt_key_file}") from exc
+        if len(key) != 32:
+            raise ValueError("AES256 encryption key file must contain exactly 32 bytes")
+        return hashlib.sha256(key).hexdigest()
 
     @property
     def date_dir(self) -> Path:
@@ -109,6 +139,8 @@ class XtraBackup:
             cmd.extend(
                 [f"--compress={self.compress}", f"--compress-threads={self.compress_threads}"]
             )
+        if self.encrypt:
+            cmd.extend(["--encrypt=AES256", f"--encrypt-key-file={self.encrypt_key_file}"])
         if self.parallel > 1:
             cmd.append(f"--parallel={self.parallel}")
         if self.throttle:
@@ -221,11 +253,19 @@ class XtraBackup:
         return chain
 
     def _create(self, target: Path, full: Path | None = None, parent: Path | None = None):
+        key_id = self._encryption_key_id() if self.encrypt else None
+        if parent is not None:
+            parent_meta = self._metadata(parent)
+            if (parent_meta.get("encrypted", False) != self.encrypt
+                    or parent_meta.get("encryption_key_id") != key_id):
+                raise BackupError("Encryption settings/key changed; take a new full backup")
         pending = Path(str(target) + ".tmp")
         pending.mkdir(parents=True, mode=0o700)
         try:
             with mysql_cnf_file(user=self.user, password=self.password) as defaults:
                 self._run(self._base_cmd(pending, defaults, parent))
+            if self.encrypt and not any(pending.rglob("*.xbcrypt")):
+                raise BackupError("Encrypted backup produced no encrypted files")
             self.verify(BackupResult(pending))
             checkpoints = self._checkpoints(pending)
             if parent is not None:
@@ -242,6 +282,8 @@ class XtraBackup:
                 "full": str((full or target).relative_to(self.backup_root)),
                 "parent": str(parent.relative_to(self.backup_root)) if parent else None,
                 "created": self._utc_now().isoformat(),
+                "encrypted": self.encrypt,
+                "encryption_key_id": key_id,
                 **checkpoints,
             }
             (pending / self.METADATA).write_text(json.dumps(metadata, indent=2) + "\n")
@@ -332,6 +374,22 @@ class XtraBackup:
                     # Database recovery tools may follow symlinks; reject them in the work copy.
                     if any(p.is_symlink() for p in copy.rglob("*")):
                         raise BackupError("Physical backup contains unsupported symlinks")
+                    if any(copy.rglob("*.xbcrypt")):
+                        key_id = self._encryption_key_id()
+                        if (copy / self.METADATA).exists():
+                            expected_key = self._metadata(copy).get("encryption_key_id")
+                            if expected_key is not None and expected_key != key_id:
+                                raise BackupError("Encryption key does not match this backup")
+                        self._run([
+                            self.binary,
+                            f"--defaults-extra-file={defaults}",
+                            "--decrypt=AES256",
+                            f"--encrypt-key-file={self.encrypt_key_file}",
+                            "--remove-original",
+                            f"--target-dir={copy}",
+                        ])
+                        if any(copy.rglob("*.xbcrypt")):
+                            raise BackupError("Decryption left encrypted files in recovery copy")
                     if any(p.suffix in {".zst", ".qp", ".lz4"} for p in copy.rglob("*")):
                         self._run(
                             [

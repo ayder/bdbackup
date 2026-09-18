@@ -67,7 +67,7 @@ The CLI uses these exit codes:
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Backup/verify failure |
+| 1 | Backup/verify failure, or configuration helper checks failed/incomplete |
 | 2 | Usage error |
 | 3 | Lock held, or retention refused an unsafe/incomplete scan |
 
@@ -304,6 +304,8 @@ Options:
 | `-b, --binary` | `xtrabackup` or `mariabackup` |
 | `--compress` | Compression algorithm (default: uncompressed) |
 | `--compress-threads` | Compression threads (default: 4) |
+| `--encrypt / --no-encrypt` | AES256 backup encryption (default: off; Percona only) |
+| `--encrypt-key-file` | Required 32-byte key file when encrypting; also used by `prepare` |
 | `--parallel` | Number of copy threads (default: 1) |
 | `--throttle` | Limit I/O to this many IOPS |
 | `--retention` | Days of backups to keep (default: 5) |
@@ -312,6 +314,65 @@ Options:
 A process lock prevents two backup runs from corrupting the same backup root.
 Failed backups are written to a temporary directory first and cleaned up on
 error, so a partial backup can never be mistaken for a complete one.
+
+### Encrypted physical backups
+
+Percona XtraBackup jobs can optionally encrypt full and incremental backups with
+AES256. In the existing job's TOML section, add:
+
+```toml
+encrypt = true
+encrypt_key_file = "/etc/mysql/xtrabackup.key"
+```
+
+TOML uses `true`/`false`, not `yes`/`no`. The key file must already exist, be
+readable by the backup account, and contain exactly 32 bytes. To create a new
+key once (this command refuses to overwrite an existing key):
+
+```bash
+sudo python3 - <<'PY'
+import os
+from pathlib import Path
+
+key_path = Path("/etc/mysql/xtrabackup.key")
+fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "wb") as key_file:
+    key_file.write(os.urandom(32))
+PY
+```
+
+Keep this key outside the backup tree and store a separate secure copy: losing
+it makes its encrypted backups unrecoverable. Take a new full backup when changing
+keys or encryption settings; incrementals must use their parent's settings and
+key. Encryption is not supported by the mariabackup backend.
+
+Run the configured job normally, or use the direct command:
+
+```bash
+bdbackup run --config /opt/dbs/config.toml mysql-prod
+bdbackup --config /opt/dbs/config.toml xtrabackup full \
+  --database production --root /backup/mysql \
+  --encrypt --encrypt-key-file /etc/mysql/xtrabackup.key -u mysql -p
+```
+
+History records `encrypted = 1` in SQLite's `backup_runs` table for encrypted
+attempts (`0` otherwise), including failed attempts. The `status` column indicates
+whether an attempt succeeded. History also stores the algorithm and key-file
+path for recovery, never the key itself. Existing history databases upgrade
+automatically on the next backup; old entries remain unencrypted.
+
+History restore uses the recorded key path. If the key has moved, provide its
+new location:
+
+```bash
+bdbackup restore --config /opt/dbs/config.toml --backup-id 12 \
+  --dst /restore/mysql-prod-12 --encrypt-key-file /secure/saved-xtrabackup.key --yes
+```
+
+Recovery decrypts each full/incremental work copy, then decompresses and prepares
+it. Original backups remain encrypted; the recovery directory contains plaintext.
+For manual `xtrabackup prepare`, supply `--encrypt-key-file` as well.
+See [Percona's encryption documentation](https://docs.percona.com/percona-xtrabackup/8.4/encrypt-backups.html).
 
 ## Retention policy (GFS)
 
@@ -415,7 +476,7 @@ mysqldump job, set `database = "mydatabase"`; for all databases include
 `--all-databases` in `options`.
 
 Except for the optional `[history]` settings, each top-level table is one job;
-its keys (except `type`) are passed
+its keys (except `type` and optional `schedule`) are passed
 to the backend constructor, so they use Python-style underscores
 (`exclude_templates`), not CLI dashes. See [config.toml.example](https://github.com/ayder/bdbackup/blob/main/config.toml.example)
 for a fully annotated config with every option explained.
@@ -431,6 +492,96 @@ Run every job:
 ```bash
 bdbackup run --config ~/.config/bdbackup/config.toml --all
 ```
+
+### Validate configuration and permissions
+
+Check all configured jobs without creating a backup or running retention:
+
+```bash
+bdbackup --config /opt/dbs/config.toml --validate
+# Or validate only one job:
+bdbackup run --config /opt/dbs/config.toml mysql-prod --validate
+```
+
+Run validation as the OS account that will run your cron jobs. It checks backend
+settings, required executables, destination access, SQLite/recovery directories,
+file-template sources, and encryption key requirements. Missing directories are
+reported with `mkdir -p` guidance and the required OS-user permissions. A missing
+directory that the backend can create under a writable parent is reported as
+creatable; validation does not create it.
+
+For MySQL jobs, the installed `mysql`/`mariadb` client authenticates using the job's
+credentials and reads `CURRENT_USER()`, server version, datadir and `SHOW GRANTS`.
+Passwords are passed through a temporary mode-0600 options file, removed afterward.
+No `CREATE USER` or `GRANT` is executed. Missing privileges produce SQL for an
+administrator, for example:
+
+```sql
+GRANT RELOAD, BACKUP_ADMIN, REPLICATION CLIENT, PROCESS, LOCK TABLES
+ON *.* TO 'xtrabackup_user'@'localhost';
+GRANT SELECT ON `performance_schema`.`log_status`
+TO 'xtrabackup_user'@'localhost';
+```
+
+The helper also checks the performance-schema tables used by current Percona
+XtraBackup and prints `CREATE TABLESPACE` separately as an optional privilege for
+importing individual tables. MariaDB Backup gets its own privilege recommendations.
+See [Percona privileges](https://docs.percona.com/percona-xtrabackup/8.4/privileges.html)
+and [MariaDB Backup privileges](https://mariadb.com/docs/server/server-usage/backup-and-restore/mariadb-backup/mariadb-backup-overview).
+
+Checks cover direct grants; role-derived privileges and partial revokes may need
+manual review. Physical datadir checks cover root-directory access, not every data
+file or external tablespace. Custom mysqldump options, routine visibility, GTID
+settings and exact server/binary version compatibility still need review.
+An unreachable database or missing client is a failed/incomplete check, not a pass.
+Retention validation checks settings and directory permissions without scanning
+for deletions, even when `apply = true`. Helpers do not add SQLite history rows.
+
+### Recommend cron entries
+
+Inspect the invoking OS account's `crontab -l` and print suggested entries:
+
+```bash
+bdbackup --config /opt/dbs/config.toml --cron
+bdbackup run --config /opt/dbs/config.toml mysql-prod --cron
+# Both helpers can be used together:
+bdbackup --config /opt/dbs/config.toml --validate --cron
+```
+
+Nothing is installed or edited. Defaults are daily backups starting at 02:00 and
+retention starting at 04:00, staggered by 15 minutes within each group. Override
+the time inside any job's existing TOML section:
+
+```toml
+[mysql-prod]
+type = "xtrabackup"
+backup_root = "/backup/mysql/production"
+schedule = "30 1 * * *"
+
+[mysql-prod-retention]
+type = "retention"
+full_dir = "/backup/flat/full"
+schedule = "0 5 * * 0"
+apply = false
+```
+
+`schedule` accepts five numeric cron fields with wildcards, lists, ranges and
+steps. It is job metadata, never passed to the backup backend. The recommendations
+use absolute executable/config paths, quote shell arguments, preserve the current
+working directory and suggest the current PATH for cron. Times use the cron
+daemon's timezone. Allow enough time for backups before retention; separate cron
+entries do not establish a dependency.
+
+Matching active `bdbackup run` entries for the same config/job (or `--all`) are
+reported without suggesting duplicates. Commented entries and other configs do
+not count. Shell wrappers such as `flock`, scripts, and system-wide cron files
+are not inspected; review those separately. If crontab cannot be read, suggested
+entries are still shown but the helper exits with status 1.
+
+XtraBackup job entries run full backups, including their built-in pruning.
+Separate retention jobs remain for flat backup files; `apply = false` stays a dry
+run in cron too. Validation/cron helpers exit 0 when their checks pass, 1 for failed
+or incomplete checks, and 2 for invalid command/configuration syntax.
 
 ## Backup history and guided restore
 
@@ -526,6 +677,7 @@ created for that run. Pull the matching images before running:
 ```bash
 python scripts/integration_mysql.py           # mysql:8.4
 python scripts/integration_physical.py percona # percona-server/xtrabackup:8.4
+python scripts/integration_physical.py percona-encrypted # AES256 + zstd recovery
 python scripts/integration_physical.py mariadb # mariadb:11.4
 ```
 

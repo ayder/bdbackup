@@ -1,6 +1,7 @@
 """Opt-in disposable physical full/incremental recovery test.
 
 Use `percona` for Percona Server/XtraBackup 8.4 with Zstandard compression,
+or `percona-encrypted` to also test AES256 encryption and decryption,
 or `mariadb` for MariaDB 11.4 with no compression. Requires Docker and images.
 Only task-created containers and volumes are accessed or removed.
 """
@@ -28,6 +29,7 @@ def main(engine="percona"):
     restorations = []
     recovery_volumes = []
     maria = engine == "mariadb"
+    encrypted = engine == "percona-encrypted"
     server_image = "mariadb:11.4" if maria else "percona/percona-server:8.4"
     backup_image = server_image if maria else "percona/percona-xtrabackup:8.4"
     client = "mariadb" if maria else "mysql"
@@ -98,12 +100,18 @@ def main(engine="percona"):
                 "CREATE DATABASE audit; CREATE TABLE audit.data(id INT PRIMARY KEY); "
                 "INSERT INTO audit.data VALUES(1);",
             )
+            key_file = work / "xtrabackup.key"
+            if encrypted:
+                key_file.write_bytes(os.urandom(32))
+                key_file.chmod(0o600)
             xb = XtraBackup(
                 work / "backups",
                 user="root",
                 compress="" if maria else "zstd",
                 parallel=2,
                 binary=binary,
+                encrypt=encrypted,
+                encrypt_key_file=key_file if encrypted else None,
             )
 
             def backup_command(cmd):

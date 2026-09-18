@@ -46,6 +46,7 @@ class BackupRecord:
     identity: str | None
     restore_info: str
     error: str | None
+    encrypted: bool = False
 
     @property
     def available(self) -> bool:
@@ -85,7 +86,7 @@ class History:
                 if create:
                     connection.execute("BEGIN IMMEDIATE")
                 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-                if schema not in (0, 1) or (not create and schema != 1):
+                if schema not in (0, 1, 2) or (not create and schema == 0):
                     raise HistoryError(f"Unsupported history schema version: {schema}")
                 if create and schema == 0:
                     connection.execute(
@@ -107,6 +108,12 @@ class History:
                         "CREATE INDEX backup_runs_job ON backup_runs(job_name, id DESC)"
                     )
                     connection.execute("PRAGMA user_version = 1")
+                if create and schema in (0, 1):
+                    connection.execute(
+                        "ALTER TABLE backup_runs ADD COLUMN encrypted INTEGER NOT NULL "
+                        "DEFAULT 0 CHECK(encrypted IN (0, 1))"
+                    )
+                    connection.execute("PRAGMA user_version = 2")
                 yield connection
         except (OSError, sqlite3.Error) as exc:
             raise HistoryError(f"Cannot access history database {path}: {exc}") from exc
@@ -120,14 +127,16 @@ class History:
         backup_type: str,
         action: Callable[[], BackupResult],
         restore_info: dict[str, str] | None = None,
+        *,
+        encrypted: bool = False,
     ) -> BackupResult:
         with self._connect(create=True) as db:
             cursor = db.execute(
                 """INSERT INTO backup_runs
-                   (job_name, backup_type, started_at, status, restore_info)
-                   VALUES (?, ?, ?, 'running', ?)""",
+                   (job_name, backup_type, started_at, status, restore_info, encrypted)
+                   VALUES (?, ?, ?, 'running', ?, ?)""",
                 (job_name, backup_type, datetime.now(UTC).isoformat(),
-                 json.dumps(restore_info or {})),
+                 json.dumps(restore_info or {}), int(encrypted)),
             )
             run_id = cursor.lastrowid
         try:

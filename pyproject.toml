@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bdbackup"
-version = "0.5.1"
+version = "0.6.0"
 description = "Brain-dead backup: template-driven file backups and MySQL/xtrabackup helpers"
 readme = "README.md"
 license = "MIT"

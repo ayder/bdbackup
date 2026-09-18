@@ -10,6 +10,7 @@ from typing import Any
 from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
 from bdbackup.history import HistorySettings
+from bdbackup.scheduling import validate_schedule
 
 
 @dataclass
@@ -19,6 +20,7 @@ class Job:
     name: str
     type: str
     params: dict[str, Any]
+    schedule: str | None = None
 
 
 class ConfigError(Exception):
@@ -69,7 +71,13 @@ class Config:
                     f"Job {name!r} has unsupported type {job_type!r}; "
                     f"expected one of {sorted(supported_types())}"
                 )
-            params = {k: v for k, v in section.items() if k != "type"}
+            schedule = section.get("schedule")
+            if "schedule" in section:
+                try:
+                    schedule = validate_schedule(schedule)
+                except ValueError as exc:
+                    raise ConfigError(f"Job {name!r}: {exc}") from exc
+            params = {k: v for k, v in section.items() if k not in {"type", "schedule"}}
             # Config paths are relative to the config file; file-template entries
             # and excludes remain relative to the explicitly selected source path.
             for key in (
@@ -78,6 +86,7 @@ class Config:
                 "chdir",
                 "out_dir",
                 "backup_root",
+                "encrypt_key_file",
                 "full_dir",
                 "incr_dir",
                 "log_dir",
@@ -87,7 +96,7 @@ class Config:
                         params[key] = self.path.parent / Path(params[key]).expanduser()
                     except TypeError as exc:
                         raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
-            self.jobs[name] = Job(name=name, type=job_type, params=params)
+            self.jobs[name] = Job(name=name, type=job_type, params=params, schedule=schedule)
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:
