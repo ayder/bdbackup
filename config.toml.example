@@ -2,6 +2,8 @@
 #
 # Usage:  bdbackup run --config ~/.config/bdbackup/config.toml <job-name>
 #         bdbackup run --config ~/.config/bdbackup/config.toml --all
+#         bdbackup --config ~/.config/bdbackup/config.toml --validate
+#         bdbackup --config ~/.config/bdbackup/config.toml --cron
 #
 # All bdbackup settings live under ~/.config/bdbackup/ (honours
 # $XDG_CONFIG_HOME and $BDBACKUP_CONFIG_DIR):
@@ -13,7 +15,11 @@
 # Except for [history], each top-level table is one job; its name is the table name and it must
 # set `type`: file | mysqldump | xtrabackup | retention, or any engine
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
-# Other keys are passed to the backend/policy constructor
+# Optional schedule = "0 2 * * *" sets a five-field numeric cron recommendation.
+# --cron reads crontab -l and prints suggestions; it never installs entries.
+# Without schedule, backups start daily at 02:00 and retention at 04:00,
+# staggered by 15 minutes. --validate checks settings/access/grants without backups.
+# Other keys (except type and schedule) are passed to the backend/policy constructor
 # (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup /
 # bdbackup.retention.run_job), so key names use Python-style underscores
 # (e.g. exclude_templates), NOT the CLI's dashes (--exclude-template).
@@ -120,6 +126,7 @@ jobs = 1
 # ---------------------------------------------------------------------------
 [mysql-prod]
 type = "xtrabackup"
+# schedule = "0 2 * * *"         # optional override for --cron
 
 # Root directory for this job's backups; dated subdirectories are created
 # underneath.
@@ -133,6 +140,15 @@ compress_threads = 4
 parallel = 2                     # copy threads
 # throttle = 200                 # optional IOPS limit
 
+# Optional AES256 backup encryption (Percona XtraBackup only).
+# TOML booleans are true/false, not yes/no. Enabling encryption requires an
+# existing, readable key file containing exactly 32 bytes (no trailing newline).
+encrypt = false
+# encrypt_key_file = "/etc/mysql/xtrabackup.key"
+# Keep the key outside the backup tree and retain it for as long as its backups.
+# History records encryption status and the key path, never the key contents.
+# Start a new full backup when changing the key or enabling/disabling encryption.
+
 # ---------------------------------------------------------------------------
 # GFS retention policy for a backup tree (dry-run by default; set apply=true
 # to actually delete files). Incrementals are chain-safe: they never outlive
@@ -140,6 +156,7 @@ parallel = 2                     # copy threads
 # ---------------------------------------------------------------------------
 [mysql-prod-retention]
 type = "retention"
+# schedule = "0 4 * * *"         # optional override for --cron
 
 # Flat files from ONE chronological stream; not the XtraBackup directory layout.
 # Kept increments also pin their preceding increments and full backup.

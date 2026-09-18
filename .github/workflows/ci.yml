@@ -42,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        engine: [mysql, percona, mariadb]
+        engine: [mysql, percona, percona-encrypted, mariadb]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -59,10 +59,10 @@ jobs:
               docker pull mysql:8.4
               python scripts/integration_mysql.py
               ;;
-            percona)
+            percona|percona-encrypted)
               docker pull percona/percona-server:8.4
               docker pull percona/percona-xtrabackup:8.4
-              python scripts/integration_physical.py percona
+              python scripts/integration_physical.py "$ENGINE"
               ;;
             mariadb)
               docker pull mariadb:11.4

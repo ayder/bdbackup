@@ -21,8 +21,11 @@ def backup_restore_info(backend) -> dict[str, str]:
     if isinstance(backend, MySQLBackup):
         return {"kind": "mysqldump"}
     if isinstance(backend, XtraBackup):
-        return {"kind": "xtrabackup", "backup_root": str(backend.backup_root),
+        info = {"kind": "xtrabackup", "backup_root": str(backend.backup_root),
                 "binary": backend.binary}
+        if backend.encrypt:
+            info.update(encryption="AES256", encrypt_key_file=str(backend.encrypt_key_file))
+        return info
     return {}
 
 
@@ -37,7 +40,9 @@ def suggested_destination(record: BackupRecord, root: Path) -> Path:
     return target
 
 
-def restore_record(record: BackupRecord, destination: Path) -> Path:
+def restore_record(
+    record: BackupRecord, destination: Path, *, encrypt_key_file: Path | None = None,
+) -> Path:
     if not record.available:
         raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")
     source = Path(record.path)
@@ -48,7 +53,11 @@ def restore_record(record: BackupRecord, destination: Path) -> Path:
     info = json.loads(record.restore_info)
     kind = info.get("kind")
     if kind == "xtrabackup":
-        backend = XtraBackup(backup_root=info["backup_root"], binary=info["binary"])
+        backend = XtraBackup(
+            backup_root=info["backup_root"], binary=info["binary"],
+            encrypt=bool(record.encrypted),
+            encrypt_key_file=encrypt_key_file or info.get("encrypt_key_file"),
+        )
         return backend.prepare(source, destination)
     if kind not in {"file", "mysqldump"}:
         raise BackupError(f"History restore is not supported for engine {record.backup_type!r}")
