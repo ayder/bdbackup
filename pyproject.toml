@@ -1,11 +1,11 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
 name = "bdbackup"
-version = "0.6.0"
-description = "Brain-dead backup: template-driven file backups and MySQL/xtrabackup helpers"
+version = "0.6.1"
+description = "File and MySQL/MariaDB backups with verification, retention, and guided recovery"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
