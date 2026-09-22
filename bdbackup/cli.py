@@ -50,7 +50,10 @@ def main(
     ctx: click.Context, log_level: str, config_path: Path | None,
     validate_only: bool, cron_only: bool,
 ) -> None:
-    """Brain-dead backup: file archives, mysqldump and xtrabackup helpers."""
+    """Backups by design.
+
+    File and MySQL/MariaDB backups with verification, retention, and guided recovery.
+    """
     setup_logging(getattr(logging, log_level.upper(), logging.INFO))
     ctx.ensure_object(dict)
     ctx.obj["log_level"] = log_level

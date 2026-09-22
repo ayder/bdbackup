@@ -1,4 +1,4 @@
-"""bdbackup: template-driven file backups and MySQL/xtrabackup helpers."""
+"""bdbackup: file and database backups with verification, retention, and guided recovery."""
 
 from importlib.metadata import version
 

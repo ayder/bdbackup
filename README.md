@@ -1,14 +1,21 @@
 # bdbackup
 
-A small, opinionated backup helper for day-to-day operations:
+**Backups by design.**
+
+`bdbackup` is a Python library and command-line tool for file and MySQL/MariaDB
+backups with verification, retention, and guided recovery. Define repeatable jobs,
+track their outcomes, and prepare recovery copies with explicit safeguards at
+each step.
+
+Choose the backup method that fits your data:
 
 - **file** backups from a plain-text template file into a tar archive
 - **mysqldump** logical backups (gzip-compressed)
 - **xtrabackup / mariabackup** physical full and incremental backups
 
-Designed as a general-purpose backup tool with safety nets:
-credential files instead of exposed passwords, post-backup verification,
-process locking, atomic target directories, and config-driven jobs.
+Built for day-to-day system administration: TOML configuration, credential files,
+verification before publication, process locking, atomic publication, and optional
+SQLite history keep backup operations explicit and inspectable.
 
 ## Support and safety
 
@@ -47,7 +54,7 @@ pip install bdbackup
 With optional MySQL metadata support:
 
 ```bash
-pip install bdbackup[mysql]
+pip install "bdbackup[mysql]"
 ```
 
 For development:
@@ -711,4 +718,4 @@ configuration and actual database recovery evidence are release prerequisites.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](https://github.com/ayder/bdbackup/blob/main/LICENSE).
