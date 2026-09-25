@@ -132,6 +132,25 @@ type = "xtrabackup"
 # underneath.
 backup_root = "/backup/mysql/production"
 
+# MySQL 8.0/8.4: run the following SQL as a MySQL administrator for local
+# XtraBackup connections. Replace the password; skip CREATE USER if it exists.
+# These are SQL examples only; bdbackup does not execute these comments.
+# CREATE USER 'xtrabackup'@'localhost'
+#   IDENTIFIED BY 'REPLACE_WITH_A_STRONG_PASSWORD';
+# GRANT BACKUP_ADMIN, PROCESS, RELOAD, LOCK TABLES, REPLICATION CLIENT
+#   ON *.* TO 'xtrabackup'@'localhost';
+# GRANT SELECT ON performance_schema.log_status
+#   TO 'xtrabackup'@'localhost';
+# GRANT SELECT ON performance_schema.keyring_component_status
+#   TO 'xtrabackup'@'localhost';
+# GRANT SELECT ON performance_schema.replication_group_members
+#   TO 'xtrabackup'@'localhost';
+# SHOW GRANTS FOR 'xtrabackup'@'localhost';
+# If using --safe-slave-backup to stop/start replication threads, also run:
+# GRANT REPLICATION_SLAVE_ADMIN ON *.* TO 'xtrabackup'@'localhost';
+# MySQL 5.7 and MariaDB require different grants. The operating-system user
+# running the backup must also have access to MySQL's data files.
+# Reference: https://docs.percona.com/percona-xtrabackup/8.4/privileges.html
 user = "xtrabackup"
 # password = "secret"
 binary = "xtrabackup"            # or "mariabackup"
