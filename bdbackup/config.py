@@ -84,7 +84,9 @@ class Config:
                 if not isinstance(value, str) or not value.strip():
                     raise ConfigError(f"Job {name!r}: restore_root must be a nonempty path string")
                 if job_type == "retention":
-                    raise ConfigError(f"Job {name!r}: restore_root is not allowed in retention jobs")
+                    raise ConfigError(
+                        f"Job {name!r}: restore_root is not allowed in retention jobs"
+                    )
                 if self.history is None:
                     raise ConfigError(f"Job {name!r}: restore_root requires a [history] section")
                 restore_root = (self.path.parent / Path(value).expanduser()).resolve()
@@ -110,7 +112,8 @@ class Config:
                     except TypeError as exc:
                         raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
             self.jobs[name] = Job(
-                name=name, type=job_type, params=params, schedule=schedule, restore_root=restore_root,
+                name=name, type=job_type, params=params, schedule=schedule,
+                restore_root=restore_root,
             )
 
     def get(self, name: str) -> Job:

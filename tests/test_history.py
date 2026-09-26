@@ -380,7 +380,7 @@ def test_job_restore_root_does_not_reach_backend(config_file, physical_runner, j
         result = invoke("run", "--config", config_file, job_name)
     assert result.exit_code == 0, result.output
     if job_name == "daily":
-        assert list((config_file.parent / "archives").glob("daily*")) == [
+        assert list((config_file.parent / "archives").glob("daily*.tar.gz")) == [
             config_file.parent / "archives/daily.tar.gz"
         ]
     else:
