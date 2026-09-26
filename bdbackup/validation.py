@@ -320,6 +320,8 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
     for job in jobs:
         report.lines.append(f"\nJob {job.name!r} ({job.type})")
         try:
+            if job.restore_root is not None:
+                _directory(report, job.restore_root, "Recovery root", write=True, create=True)
             if job.type == "retention":
                 _retention(report, job)
                 continue

@@ -899,7 +899,12 @@ def restore(
                 raise click.UsageError("The selected backup does not belong to --job")
         if not record.available:
             raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")
-        destination = dst or suggested_destination(record, config.history.restore_root)
+        current_job = config.jobs.get(record.job_name)
+        restore_root = (
+            current_job.restore_root if current_job and current_job.restore_root
+            else config.history.restore_root
+        )
+        destination = dst or suggested_destination(record, restore_root)
         click.echo(f"Backup: {record.path}")
         if dst is None and not yes:
             destination = Path(click.prompt("Restore destination", default=str(destination)))

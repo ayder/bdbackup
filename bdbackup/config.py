@@ -21,6 +21,7 @@ class Job:
     type: str
     params: dict[str, Any]
     schedule: str | None = None
+    restore_root: Path | None = None
 
 
 class ConfigError(Exception):
@@ -77,7 +78,19 @@ class Config:
                     schedule = validate_schedule(schedule)
                 except ValueError as exc:
                     raise ConfigError(f"Job {name!r}: {exc}") from exc
-            params = {k: v for k, v in section.items() if k not in {"type", "schedule"}}
+            restore_root = None
+            if "restore_root" in section:
+                value = section["restore_root"]
+                if not isinstance(value, str) or not value.strip():
+                    raise ConfigError(f"Job {name!r}: restore_root must be a nonempty path string")
+                if job_type == "retention":
+                    raise ConfigError(f"Job {name!r}: restore_root is not allowed in retention jobs")
+                if self.history is None:
+                    raise ConfigError(f"Job {name!r}: restore_root requires a [history] section")
+                restore_root = (self.path.parent / Path(value).expanduser()).resolve()
+            params = {
+                k: v for k, v in section.items() if k not in {"type", "schedule", "restore_root"}
+            }
             # Config paths are relative to the config file; file-template entries
             # and excludes remain relative to the explicitly selected source path.
             for key in (
@@ -96,7 +109,9 @@ class Config:
                         params[key] = self.path.parent / Path(params[key]).expanduser()
                     except TypeError as exc:
                         raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
-            self.jobs[name] = Job(name=name, type=job_type, params=params, schedule=schedule)
+            self.jobs[name] = Job(
+                name=name, type=job_type, params=params, schedule=schedule, restore_root=restore_root,
+            )
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:
