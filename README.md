@@ -162,6 +162,9 @@ TEMPLATE = ExclusionTemplate(
 
 ## Database engines
 
+`schedule` and `restore_root` are job metadata and are not passed to an engine backend.
+Custom engines accepting arbitrary keyword arguments no longer receive `restore_root`.
+
 Database engines are pluggable and live in per-database family packages
 (`bdbackup/mysql/` today; `bdbackup/postgres/` is planned). Each engine maps a
 config `type` name to a backend class; adding one never requires editing
@@ -483,7 +486,7 @@ mysqldump job, set `database = "mydatabase"`; for all databases include
 `--all-databases` in `options`.
 
 Except for the optional `[history]` settings, each top-level table is one job;
-its keys (except `type` and optional `schedule`) are passed
+its keys (except `type`, `schedule`, and `restore_root`) are passed
 to the backend constructor, so they use Python-style underscores
 (`exclude_templates`), not CLI dashes. See [config.toml.example](https://github.com/ayder/bdbackup/blob/main/config.toml.example)
 for a fully annotated config with every option explained.
@@ -499,6 +502,32 @@ Run every job:
 ```bash
 bdbackup run --config ~/.config/bdbackup/config.toml --all
 ```
+
+For an xtrabackup job, take an incremental using its own `backup_root`, credentials,
+binary, and encryption settings:
+
+```bash
+bdbackup run mysql-prod --incremental
+```
+
+`--full` is the default; an incremental requires a successful full in that job's
+root and chains to the latest successful incremental, if present. `--full` and
+`--incremental` together exit 2. Selecting any non-xtrabackup job with
+`--incremental` also exits 2 before any job runs. `--verify/--no-verify` applies to
+both backup kinds. Validation and cron recommendations ignore the selector.
+
+For example, schedule a weekly full on Sunday and incrementals on the other days:
+
+```cron
+0 2 * * 0 bdbackup --config /opt/dbs/config.toml run mysql-prod
+0 2 * * 1-6 bdbackup --config /opt/dbs/config.toml run mysql-prod --incremental
+```
+
+Pruning after each full deletes whole dated chains older than `retention_days`.
+Set `retention_days` longer than the interval between fulls to preserve the previous
+full's incrementals. History now records configured physical backups as
+`xtrabackup-full` / `xtrabackup-incremental` (previously `xtrabackup`); update filters
+that use the old type. Existing history rows are unchanged.
 
 ### Validate configuration and permissions
 
@@ -586,6 +615,14 @@ are not inspected; review those separately. If crontab cannot be read, suggested
 entries are still shown but the helper exits with status 1.
 
 XtraBackup job entries run full backups, including their built-in pruning.
+The helper recommends fulls only; add an incremental cron entry yourself, for example:
+
+```cron
+0 2 * * 1-6 bdbackup --config /opt/dbs/config.toml run mysql-prod --incremental
+```
+
+Adjust the recommended full entry to your intended full-backup schedule.
+
 Separate retention jobs remain for flat backup files; `apply = false` stays a dry
 run in cron too. Validation/cron helpers exit 0 when their checks pass, 1 for failed
 or incomplete checks, and 2 for invalid command/configuration syntax.
@@ -640,6 +677,18 @@ Select a successful backup interactively:
 bdbackup restore --config config.toml
 bdbackup restore --config config.toml --job files-daily
 ```
+
+Each backup job may set `restore_root = "/restore/mysql-prod"` to override
+`[history] restore_root` for its guided-restore suggestions. It must be a nonempty
+path string; `~` expands and relative paths resolve against the config file.
+Job-level `restore_root` requires `[history]` and is not allowed on retention jobs.
+Validation checks that each job's root is writable or can be created.
+Physical jobs usually need a separate root with room for the full and its
+incrementals, staged near the database datadir.
+
+The current config's job is matched by the history record's job name. If that job
+has no `restore_root`, or is no longer configured, the history root is used.
+An explicit `--dst` always wins.
 
 Restore lists successful, available artifacts, asks for the backup ID, suggests
 `<restore_root>/<job>-<id>`, and asks for confirmation. You can edit the suggested

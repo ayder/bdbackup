@@ -35,7 +35,7 @@
 # Keep the live SQLite database outside paths included in file backups.
 [history]
 database = "history.sqlite3"
-restore_root = "/restore/bdbackup"  # default if omitted: ./restores, beside this config
+restore_root = "/restore/bdbackup"  # default: ./restores beside this config; jobs may override it
 
 # Configured jobs record automatically; direct commands opt in via:
 #   bdbackup --config config.toml file ...
@@ -126,6 +126,8 @@ jobs = 1
 # ---------------------------------------------------------------------------
 [mysql-prod]
 type = "xtrabackup"
+# Guided recovery staging root for this job; requires [history].
+# restore_root = "/restore/mysql-prod"
 # schedule = "0 2 * * *"         # optional override for --cron
 
 # Root directory for this job's backups; dated subdirectories are created
