@@ -957,6 +957,8 @@ def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> 
 )
 @click.argument("job_name", required=False)
 @click.option("--all", "run_all", is_flag=True, help="Run every job in the config.")
+@click.option("--full", is_flag=True, help="Take a full backup (the default).")
+@click.option("--incremental", is_flag=True, help="Take an incremental backup of xtrabackup jobs.")
 @click.option("--validate", "validate_only", is_flag=True,
               help="Validate selected jobs without running backups or retention.")
 @click.option("--cron", "cron_only", is_flag=True,
@@ -971,6 +973,8 @@ def run(
     config_path: Path | None,
     job_name: str | None,
     run_all: bool,
+    full: bool,
+    incremental: bool,
     verify: bool,
     validate_only: bool,
     cron_only: bool,

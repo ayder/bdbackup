@@ -401,3 +401,13 @@ def test_partial_revokes_never_claim_effective_access(config_path, mysql_client)
         result = CliRunner().invoke(main, ["--config", str(config_path), "--validate"])
     assert result.exit_code == 1
     assert "Partial revokes require manual privilege review" in result.output
+
+
+def test_selector_does_not_change_validate_or_cron(config_path, mysql_client):
+    runner = CliRunner()
+    for mode in ("--validate", "--cron"):
+        args = ["--config", str(config_path), "run", mode]
+        default = runner.invoke(main, args)
+        incremental = runner.invoke(main, [*args, "--incremental"])
+        assert default.exit_code == incremental.exit_code == 0
+        assert default.output == incremental.output
