@@ -130,7 +130,7 @@ def test_run_selector_usage_errors(xb_config, args, message):
     full.assert_not_called()
     incremental.assert_not_called()
     file.assert_not_called()
-    assert records(xb_config) == []
+    assert not Config(xb_config).history.database.exists() or records(xb_config) == []
 
 
 def test_run_incremental_without_full_fails(xb_config, recording_runner, caplog):
