@@ -162,6 +162,10 @@ parallel = 2                     # copy threads
 # Optional AES256 backup encryption (Percona XtraBackup only).
 # TOML booleans are true/false, not yes/no. Enabling encryption requires an
 # existing, readable key file containing exactly 32 bytes (no trailing newline).
+# Create a readable 32-character key once (do not overwrite a key in use):
+#   openssl rand -base64 24 | tr -d '\n' > /etc/mysql/xtrabackup.key
+#   chmod 600 /etc/mysql/xtrabackup.key
+#   stat -c %s /etc/mysql/xtrabackup.key    # must print 32
 encrypt = false
 # encrypt_key_file = "/etc/mysql/xtrabackup.key"
 # Keep the key outside the backup tree and retain it for as long as its backups.
