@@ -899,7 +899,12 @@ def restore(
                 raise click.UsageError("The selected backup does not belong to --job")
         if not record.available:
             raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")
-        destination = dst or suggested_destination(record, config.history.restore_root)
+        current_job = config.jobs.get(record.job_name)
+        restore_root = (
+            current_job.restore_root if current_job and current_job.restore_root
+            else config.history.restore_root
+        )
+        destination = dst or suggested_destination(record, restore_root)
         click.echo(f"Backup: {record.path}")
         if dst is None and not yes:
             destination = Path(click.prompt("Restore destination", default=str(destination)))
@@ -957,6 +962,8 @@ def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> 
 )
 @click.argument("job_name", required=False)
 @click.option("--all", "run_all", is_flag=True, help="Run every job in the config.")
+@click.option("--full", is_flag=True, help="Take a full backup (the default).")
+@click.option("--incremental", is_flag=True, help="Take an incremental backup of xtrabackup jobs.")
 @click.option("--validate", "validate_only", is_flag=True,
               help="Validate selected jobs without running backups or retention.")
 @click.option("--cron", "cron_only", is_flag=True,
@@ -971,11 +978,15 @@ def run(
     config_path: Path | None,
     job_name: str | None,
     run_all: bool,
+    full: bool,
+    incremental: bool,
     verify: bool,
     validate_only: bool,
     cron_only: bool,
 ) -> int:
     """Run one or more configured backup jobs."""
+    if full and incremental:
+        raise click.UsageError("Choose --full or --incremental, not both")
     try:
         config = _get_config(config_path, required=True)
     except ConfigError as exc:
@@ -996,6 +1007,12 @@ def run(
         click.get_current_context().exit(
             _configuration_helpers(config, selected, validate_only, cron_only)
         )
+    if incremental:
+        unsupported = [job.name for job in selected if job.type != "xtrabackup"]
+        if unsupported:
+            raise click.UsageError(
+                "--incremental applies only to xtrabackup jobs: " + ", ".join(unsupported)
+            )
     logger = logging.getLogger("bdbackup.cli")
     failures = []
     for job in selected:
@@ -1016,15 +1033,21 @@ def run(
                 backend = build_backend(job)
                 _protect_history(backend, config)
                 info.update(backup_restore_info(backend))
-                result = backend.backup()
+                result = (
+                    backend.incremental_backup()
+                    if job.type == "xtrabackup" and incremental else backend.backup()
+                )
                 if not result.success:
                     raise BackupError("Backend reported an unsuccessful backup")
                 if verify:
                     backend.verify(result)
                 return result
 
+            backup_type = job.type
+            if job.type == "xtrabackup":
+                backup_type = "xtrabackup-incremental" if incremental else "xtrabackup-full"
             result = _tracked_backup(
-                config, job.name, job.type, _create, info,
+                config, job.name, backup_type, _create, info,
                 encrypted=job.params.get("encrypt") is True,
             )
             click.echo(f"Job {job.name}: {result.path}")

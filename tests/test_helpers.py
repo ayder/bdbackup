@@ -401,3 +401,36 @@ def test_partial_revokes_never_claim_effective_access(config_path, mysql_client)
         result = CliRunner().invoke(main, ["--config", str(config_path), "--validate"])
     assert result.exit_code == 1
     assert "Partial revokes require manual privilege review" in result.output
+
+
+def test_selector_does_not_change_validate_or_cron(config_path, mysql_client):
+    runner = CliRunner()
+    for mode in ("--validate", "--cron"):
+        args = ["--config", str(config_path), "run", mode]
+        default = runner.invoke(main, args)
+        incremental = runner.invoke(main, [*args, "--incremental"])
+        assert default.exit_code == incremental.exit_code == 0
+        assert default.output == incremental.output
+
+
+@pytest.mark.parametrize("creatable", [True, False], ids=["creatable", "blocked"])
+def test_validate_reports_job_restore_root(tmp_path, creatable):
+    (tmp_path / "source.txt").write_text("source")
+    (tmp_path / "paths").write_text("source.txt\n")
+    root = tmp_path / "new/rr"
+    if not creatable:
+        (tmp_path / "blocker").write_text("not a directory")
+        root = tmp_path / "blocker/rr"
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[history]\ndatabase="state/history.db"\n'
+        '[files]\ntype="file"\ntemplate_filename="paths"\n'
+        'chdir="."\nbackup_dst="backup.tar"\n'
+        f'restore_root="{root}"\n'
+    )
+    result = CliRunner().invoke(main, ["--config", str(config), "run", "--validate", "files"])
+    section = result.output.split("Job 'files' (file)", 1)[1]
+    status = "OK" if creatable else "FAIL"
+    assert f"[{status}] Recovery root: {root.resolve()}" in section
+    assert result.exit_code == (0 if creatable else 1), result.output
+    assert not root.exists()

@@ -365,3 +365,59 @@ def test_suggestion_avoids_existing_paths_and_job_path_traversal(tmp_path):
     first.mkdir(parents=True)
     second = suggested_destination(record, tmp_path / "restore")
     assert second != first and second.parent == first.parent
+
+
+@pytest.mark.parametrize("job_name", ["daily", "mysql-prod"])
+def test_job_restore_root_does_not_reach_backend(config_file, physical_runner, job_name):
+    text = config_file.read_text()
+    if job_name == "daily":
+        text = text.replace('[daily]', '[daily]\nrestore_root="job-recovery"')
+    else:
+        text += ('[mysql-prod]\ntype="xtrabackup"\nbackup_root="backups"\n'
+                 'restore_root="job-recovery"\n')
+    config_file.write_text(text)
+    with patch("subprocess.run", side_effect=physical_runner):
+        result = invoke("run", "--config", config_file, job_name)
+    assert result.exit_code == 0, result.output
+    if job_name == "daily":
+        assert list((config_file.parent / "archives").glob("daily*.tar.gz")) == [
+            config_file.parent / "archives/daily.tar.gz"
+        ]
+    else:
+        assert len([p for p in (config_file.parent / "backups").glob("*/Full_*")
+                    if not p.is_symlink()]) == 1
+    assert "restore_root" not in Config(config_file).get(job_name).params
+
+
+def test_restore_suggests_job_root_then_history_root(config_file):
+    config_file.write_text(config_file.read_text() +
+        '[other]\ntype="file"\ntemplate_filename="paths"\n'
+        'chdir="source"\nbackup_dst="archives/other"\nformat="tar.gz"\n')
+    for job in ("daily", "other"):
+        result = invoke("run", "--config", config_file, job)
+        assert result.exit_code == 0, result.output
+    config_file.write_text(config_file.read_text().replace(
+        '[daily]', '[daily]\nrestore_root="job-recovery"'))
+    for backup_id, relative in ((1, "job-recovery/daily-1"), (2, "recovery/other-2")):
+        result = invoke("restore", "--config", config_file, "--backup-id", backup_id, input="\nn\n")
+        assert str(config_file.parent / relative) in result.output
+        assert result.exit_code == 1  # user declined recovery
+    assert not (config_file.parent / "job-recovery").exists()
+    assert not (config_file.parent / "recovery").exists()
+
+
+@pytest.mark.parametrize("case", ["retention", "no-history", "number", "empty"])
+def test_restore_root_misplaced_or_invalid_is_config_error(config_file, case):
+    text = config_file.read_text()
+    value = '5' if case == "number" else '""' if case == "empty" else '"r"'
+    text = text.replace('[daily]', f'[daily]\nrestore_root={value}')
+    if case == "retention":
+        text = text.replace('type="file"', 'type="retention"')
+    elif case == "no-history":
+        text = text[text.index('[daily]'):]
+    config_file.write_text(text)
+    for flags in (("--validate",), ()):
+        result = invoke("run", "--config", config_file, "daily", *flags)
+        assert result.exit_code == 2, result.output
+        assert "restore_root" in result.output
+        assert "daily" in result.output
