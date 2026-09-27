@@ -507,7 +507,7 @@ For an xtrabackup job, take an incremental using its own `backup_root`, credenti
 binary, and encryption settings:
 
 ```bash
-bdbackup run mysql-prod --incremental
+bdbackup run --config ~/.config/bdbackup/config.toml mysql-prod --incremental
 ```
 
 `--full` is the default; an incremental requires a successful full in that job's
