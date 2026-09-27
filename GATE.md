@@ -6,7 +6,12 @@ The source of truth for commands and expected results is `CLAUDE.md` (sections C
 Layers and environments); if this file and `CLAUDE.md` disagree, stop and report that.
 
 Write each step's full output to `<evidence dir>/gate/<step number>-<name>.log`, where the
-evidence directory is the one named in your brief.
+evidence directory is the one named in your brief. Capture every step the same way, so that
+the output of every command in the step lands in its log, not only the last one:
+
+```bash
+sh -c '<commands of the step>' > <log> 2>&1; echo "exit=$?" >> <log>
+```
 
 ## Steps
 
@@ -29,8 +34,11 @@ evidence directory is the one named in your brief.
    Expected: exit 0 and the line `Real full and two-incremental database recovery passed`.
 8. **Integration percona-encrypted.** Same with `percona-encrypted`. Same expectation.
 9. **Integration mariadb.** Same with `mariadb`. Same expectation.
-10. **Package.** Run `rm -rf dist && .venv/bin/python -m build -q && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist`.
-    Expected: every twine line ends in `PASSED`; exit 0.
+10. **Package.** Run `rm -rf dist && .venv/bin/python -m build -q && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist`
+    as one `sh -c '…'`, captured as above.
+    Expected: the log contains one `Checking dist/… PASSED` line for the wheel and one for the
+    sdist, then the smoke line `Installed wheel: … passed`, then `exit=0`. A log without the
+    two twine lines is a FAIL of this step, even when it ends in `exit=0`.
 11. **Clean after.** Run `git status --porcelain`.
     Expected: prints nothing except `dist/` if it is not ignored (it is ignored today).
 
