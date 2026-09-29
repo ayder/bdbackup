@@ -7,16 +7,25 @@ Only task-created containers and volumes are accessed or removed.
 """
 
 import hashlib
+import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from click.testing import CliRunner
+
+from bdbackup.cli import main as cli
+from bdbackup.config import Config
+from bdbackup.gfs import runner
 from bdbackup.history import History, HistorySettings
 from bdbackup.mysql import XtraBackup
 from bdbackup.recovery import backup_restore_info
@@ -46,6 +55,49 @@ def check_ledger(records, root):
         unit = root.resolve() / path.relative_to(root.resolve()).parts[0]
         if record.unit != str(unit):
             raise RuntimeError(f"ledger unit {record.unit} is not the date directory {unit}")
+
+
+def move_and_restore_tip(work, history, xb, info, tip_path):
+    """Spec 2 §6: GFS moves the chain's date directory to a cold daily stage, and
+    ``bdbackup restore`` prepares its tip from there. Returns the recovery directory."""
+    tomorrow = xb._utc_now() + timedelta(days=1)
+    with patch.object(xb, "_utc_now", return_value=tomorrow):
+        history.run("physical", "xtrabackup-full", xb.full_backup, info)
+    records = history.records()
+    chain = [r for r in records if r.unit == records[1].unit]
+    if len(chain) != 3 or records[1].path != str(tip_path):
+        raise RuntimeError("expected the second full newest and the chain of three before it")
+    week_ago = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+    with closing(sqlite3.connect(work / "history.sqlite3")) as db, db:
+        db.executemany("UPDATE backup_runs SET completed_at=? WHERE id=?",
+                       [(week_ago, r.id) for r in chain])
+    cold = work / "cold-daily"
+    cold.mkdir()
+    (cold / ".bdbackup-destination").touch()
+    cfg = work / "gfs.toml"
+    cfg.write_text(
+        f"[history]\ndatabase = {json.dumps(str(work / 'history.sqlite3'))}\n"
+        f"restore_root = {json.dumps(str(work / 'restores'))}\n"
+        '[gfs-main]\ntype = "gfs"\napply = true\n'
+        f"[[gfs-main.stage]]\npaths = [{json.dumps(str(work / 'backups'))}]\n"
+        'period = "daily"\nkeep = "5d"\n'
+        f"[[gfs-main.stage]]\npaths = [{json.dumps(str(cold))}]\n"
+        'period = "daily"\nkeep = "20d"\n'
+    )
+    config = Config(cfg)
+    code = runner.run_job(config, config.get("gfs-main"), out=print)
+    date_name = Path(chain[0].unit).name
+    if code or not (cold / date_name).is_dir() or (work / "backups" / date_name).exists():
+        raise RuntimeError(f"GFS did not move {date_name} to the cold daily stage (exit {code})")
+    recovery = work / "moved-recovery"
+    result = CliRunner().invoke(cli, ["restore", "--config", str(cfg), "--backup-id",
+                                      str(records[1].id), "--yes", "--dst", str(recovery)])
+    if result.exit_code:
+        raise RuntimeError(f"restore of the moved tip exited {result.exit_code}: "
+                           f"{result.output} {result.exception!r}")
+    print("GFS moved the chain to the cold daily stage and its tip restored from there",
+          flush=True)
+    return recovery
 
 
 def main(engine="percona"):
@@ -138,6 +190,7 @@ def main(engine="percona"):
                 user="root",
                 compress="" if maria else "zstd",
                 parallel=2,
+                retention_days=0,
                 binary=binary,
                 encrypt=encrypted,
                 encrypt_key_file=key_file if encrypted else None,
@@ -194,7 +247,8 @@ def main(engine="percona"):
                     )
 
             with (
-                patch.object(xb, "_run", side_effect=backup_command),
+                # Class-level, so the XtraBackup `bdbackup restore` builds also runs in Docker.
+                patch.object(XtraBackup, "_run", side_effect=backup_command),
                 patch.object(tempfile, "tempdir", str(work)),
             ):
                 history = History(HistorySettings(work / "history.sqlite3", work / "restores"))
@@ -214,7 +268,9 @@ def main(engine="percona"):
                 full_copy = xb.prepare(full.path, work / "full-recovery")
                 chain_copy = xb.prepare(tip.path, work / "chain-recovery")
                 print("Full and incremental recovery copies prepared", flush=True)
-            for index, (copy, expected) in enumerate([(full_copy, "1"), (chain_copy, "1,2,3")]):
+                moved_copy = move_and_restore_tip(work, history, xb, info, tip.path)
+            recoveries = [(full_copy, "1"), (chain_copy, "1,2,3"), (moved_copy, "1,2,3")]
+            for index, (copy, expected) in enumerate(recoveries):
                 restored = prefix + f"-restore-{index}"
                 restore_volume = prefix + f"-recovery-data-{index}"
                 restorations.append(restored)

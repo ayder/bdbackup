@@ -6,11 +6,12 @@ import gzip
 import json
 import re
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 from bdbackup.backends import BackupError
 from bdbackup.filebackup import FileBackup
-from bdbackup.history import BackupRecord
+from bdbackup.history import BackupRecord, History
 from bdbackup.mysql import MySQLBackup, XtraBackup
 
 
@@ -42,6 +43,7 @@ def suggested_destination(record: BackupRecord, root: Path) -> Path:
 
 def restore_record(
     record: BackupRecord, destination: Path, *, encrypt_key_file: Path | None = None,
+    history: History | None = None, on_source: Callable[[Path], None] | None = None,
 ) -> Path:
     if not record.available:
         raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")

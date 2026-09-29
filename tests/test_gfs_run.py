@@ -1,9 +1,12 @@
 """GFS runs against temporary stage directories and a real SQLite history database."""
 
 import hashlib
+import io
 import os
 import shutil
 import sqlite3
+import subprocess
+import tarfile
 from contextlib import closing
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -18,6 +21,8 @@ from bdbackup.config import Config
 from bdbackup.gfs import actions, runner
 from bdbackup.history import History
 from bdbackup.ledger import checksum
+from bdbackup.mysql import XtraBackup
+from bdbackup.recovery import backup_restore_info
 from bdbackup.utils import process_lock
 from tests.conftest import write_checkpoints
 
@@ -111,6 +116,40 @@ class Env:
             self._record(incremental, info, series, day, "xtrabackup-incremental")
         return unit
 
+    def archive_unit(self, name, days_ago):
+        """A real gzip tar holding ``hello``, recorded as a file backup."""
+        path = self.root / "BACKUP/files" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = f"recover {name}".encode()
+        with tarfile.open(path, "w:gz") as tar:
+            info = tarfile.TarInfo("hello")
+            info.size = len(text)
+            tar.addfile(info, io.BytesIO(text))
+        self._record(path, {"kind": "file"}, "files", date.today() - timedelta(days=days_ago),
+                     "file")
+        return path
+
+    def backdate(self, record_id, day):
+        completed = datetime.combine(day, time(12)).astimezone().astimezone(UTC).isoformat()
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute("UPDATE backup_runs SET completed_at=? WHERE id=?", (completed, record_id))
+
+    def engine_chain(self, days_ago):
+        """A real engine's full and two incrementals, plus a newer full in the next day's
+        directory; returns the chain's three records. Run under ``prepare_runner``."""
+        xb = XtraBackup((self.root / "BACKUP/mysql/prod").resolve(), retention_days=0)
+        info = backup_restore_info(xb)
+        day = date.today() - timedelta(days=days_ago)
+        for kind, action in (("full", xb.full_backup), ("incremental", xb.incremental_backup),
+                             ("incremental", xb.incremental_backup)):
+            self.history.run("xb", f"xtrabackup-{kind}", action, info)
+            self.backdate(self.history.records()[0].id, day)
+        chain = self.history.records()[:3][::-1]
+        tomorrow = xb._utc_now() + timedelta(days=1)
+        with patch.object(xb, "_utc_now", return_value=tomorrow):
+            self.history.run("xb", "xtrabackup-full", xb.full_backup, info)
+        return chain
+
     def run_cli(self):
         return invoke("run", "--config", self.config_path, "gfs-main")
 
@@ -134,6 +173,27 @@ def _size(path: Path) -> int:
 @pytest.fixture
 def env(tmp_path):
     return Env(tmp_path)
+
+
+@pytest.fixture
+def prepare_runner(physical_runner):
+    """``physical_runner`` plus a ``--prepare`` branch (E-R1); collects every command."""
+    commands = []
+
+    def run(cmd, **kwargs):
+        commands.append(cmd)
+        if "--prepare" not in cmd:
+            return physical_runner(cmd, **kwargs)
+        target = Path(next(a.split("=", 1)[1] for a in cmd if a.startswith("--target-dir=")))
+        incremental = next(
+            (Path(a.split("=", 1)[1]) for a in cmd if a.startswith("--incremental-dir=")), None,
+        )
+        end = XtraBackup._checkpoints(incremental or target)["to_lsn"]
+        write_checkpoints(target, end=end, kind="full-prepared")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    run.commands = commands
+    return run
 
 
 def stage_files(env, name):
@@ -473,3 +533,36 @@ def test_location_without_identities_judged_by_existence(env):
     assert "| success | available |" in history_line(env, a)
     (env.root / "NFS/daily/files/a.tar.gz").unlink()
     assert "| success | unavailable |" in history_line(env, a)
+
+
+def test_restore_moved_file_unit(env):
+    a = env.archive_unit("a.tar.gz", 7)
+    env.archive_unit("b.tar.gz", 0)
+    assert env.run_cli().exit_code == 0
+    record_id = env.query("SELECT id FROM backup_runs WHERE path=?", str(a.resolve()))[0][0]
+    out = env.root / "out"
+    result = invoke("restore", "--config", env.config_path, "--backup-id", record_id, "--yes",
+                    "-d", out)
+    assert result.exit_code == 0, result.output
+    assert (out / "hello").read_text() == "recover a.tar.gz"
+    moved = env.abs("NFS/daily/files/a.tar.gz")
+    assert f"Locations: {moved}" in result.output, result.output
+    assert f"Backup: {moved}" in result.output, result.output
+
+
+def test_restore_moved_xtrabackup_tip_uses_stage_root(env, prepare_runner):
+    with patch("subprocess.run", side_effect=prepare_runner):
+        full, _, tip = env.engine_chain(7)
+        hot = Path(full.unit)
+        assert env.run_cli().exit_code == 0
+        prepare_runner.commands.clear()
+        out = env.root / "out"
+        result = invoke("restore", "--config", env.config_path, "--backup-id", tip.id, "--yes",
+                        "-d", out)
+    assert result.exit_code == 0, result.output
+    moved = env.abs("NFS/daily/mysql/prod") / hot.name
+    assert f"Backup: {moved / Path(tip.path).relative_to(hot)}" in result.output, result.output
+    assert f"Prepared recovery directory: {out}" in result.output, result.output
+    assert sum(any(a.startswith("--incremental-dir=") for a in cmd)
+               for cmd in prepare_runner.commands) == 2
+    assert not hot.exists()

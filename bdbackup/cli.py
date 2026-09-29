@@ -924,12 +924,10 @@ def restore(
         click.echo(f"Recovery destination: {destination}")
         if not yes:
             click.confirm("Restore this backup?", abort=True)
-        if encrypt_key_file is not None:
-            if not record.backup_type.startswith("xtrabackup"):
-                raise click.UsageError("--encrypt-key-file requires a physical backup")
-            restored = restore_record(record, destination, encrypt_key_file=encrypt_key_file)
-        else:
-            restored = restore_record(record, destination)
+        if encrypt_key_file is not None and not record.backup_type.startswith("xtrabackup"):
+            raise click.UsageError("--encrypt-key-file requires a physical backup")
+        restored = restore_record(record, destination, encrypt_key_file=encrypt_key_file,
+                                  history=history, on_source=None)
         if record.backup_type == "mysqldump":
             click.echo(f"SQL recovered to: {restored / 'backup.sql'} (not imported into a server)")
         elif record.backup_type.startswith("xtrabackup"):
