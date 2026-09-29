@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +25,15 @@ _TABLES = {"gfs_units", "gfs_locations", "gfs_steps"}
 class Location:
     stage_path: Path
     path: Path
+
+
+@dataclass(frozen=True)
+class Place:
+    """Where a record's copy is at one location of its unit."""
+
+    unit: Path
+    member: Path
+    identity: str | None
 
 
 @dataclass(frozen=True)
@@ -173,7 +182,8 @@ def record_members(history: History, unit_id: int,
 
 
 def record_move(history: History, unit_id: int, new: Sequence[Location],
-                removed: Sequence[Location]) -> None:
+                removed: Sequence[Location],
+                identities: Mapping[Path, Mapping[int, str]] | None = None) -> None:
     with history._connect(create=True) as db:
         db.executemany(
             "INSERT INTO gfs_locations (unit_id, stage_path, path) VALUES (?, ?, ?)",
@@ -216,3 +226,16 @@ def listing_suffixes(history: History) -> dict[str, str]:
                 + ", ".join(str(loc.path) for loc in places)
             )
     return suffixes
+
+
+def places(history: History) -> dict[int, tuple[Place, ...]]:
+    """``backup_runs.id -> places`` for the members of recorded units."""
+    return {}
+
+
+def place_available(place: Place) -> bool:
+    return False
+
+
+def available(record: BackupRecord, known: Mapping[int, tuple[Place, ...]]) -> bool:
+    return record.available

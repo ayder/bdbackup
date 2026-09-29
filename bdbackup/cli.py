@@ -960,10 +960,11 @@ def history_cmd(
         history = History(config.history)
         records = history.records(job=job, successful=successful)
         suffixes = gfs_store.listing_suffixes(history)
+        known = gfs_store.places(history)
         if not records:
             click.echo("No backup history found.")
         for record in records:
-            available = "available" if record.available else "unavailable"
+            available = "available" if gfs_store.available(record, known) else "unavailable"
             click.echo(
                 f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
                 f"{record.status} | {available} | "

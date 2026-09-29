@@ -439,3 +439,37 @@ def test_record_added_to_managed_unit_is_member(env):
     moved = env.root / "NFS/daily/mysql/prod" / unit.name
     assert (moved / "Incremental" / full.name / "inc2").is_dir(), output
     assert not unit.exists()
+
+
+def history_line(env, path):
+    result = invoke("history", "--config", env.config_path)
+    assert result.exit_code == 0, result.output
+    return next(line for line in result.output.splitlines() if f"| {path.resolve()} |" in line)
+
+
+def test_moved_copy_availability_detects_replacement(env):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    b = env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    moved = env.root / "NFS/daily/files/a.tar.gz"
+    assert "| success | available |" in history_line(env, a)
+    assert "| success | available |" in history_line(env, b)
+    sibling = moved.with_name("sibling")
+    sibling.write_bytes(moved.read_bytes())
+    os.replace(sibling, moved)
+    assert "| success | unavailable |" in history_line(env, a)
+    assert "| success | available |" in history_line(env, b)
+    moved.unlink()
+    assert "| success | unavailable |" in history_line(env, a)
+    assert "| success | available |" in history_line(env, b)
+
+
+def test_location_without_identities_judged_by_existence(env):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    with closing(sqlite3.connect(env.database)) as db, db:
+        db.execute("UPDATE gfs_locations SET identities = NULL")
+    assert "| success | available |" in history_line(env, a)
+    (env.root / "NFS/daily/files/a.tar.gz").unlink()
+    assert "| success | unavailable |" in history_line(env, a)
