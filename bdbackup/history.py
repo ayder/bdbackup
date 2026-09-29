@@ -172,6 +172,9 @@ class History:
             )
         return result
 
+    def record_checksums(self, job: str | None = None) -> list[tuple[int, str]]:
+        return []
+
     def records(self, *, job: str | None = None, successful: bool = False) -> list[BackupRecord]:
         with self._connect() as db:
             rows = db.execute(

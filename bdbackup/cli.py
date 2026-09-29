@@ -938,13 +938,19 @@ def restore(
     return _handle_errors(_run)
 
 
-@main.command(name="history")
+@main.group(name="history", invoke_without_command=True)
 @click.option("--config", "config_path",
               type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--job", help="Show only this job.")
 @click.option("--successful", is_flag=True, help="Show only successful runs.")
-def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> int:
+@click.pass_context
+def history_cmd(
+    ctx: click.Context, config_path: Path | None, job: str | None, successful: bool,
+) -> int:
     """List recorded backup attempts and whether their artifacts are still available."""
+    if ctx.invoked_subcommand is not None:
+        return EXIT_OK
+
     def _run():
         config = _get_config(config_path, required=True)
         if not config.history:
@@ -962,6 +968,15 @@ def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> 
             )
 
     return _handle_errors(_run)
+
+
+@history_cmd.command(name="checksum")
+@click.option("--config", "config_path",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--job", help="Only records of this job.")
+def history_checksum(config_path: Path | None, job: str | None) -> int:
+    """Record unit and checksum for older records that have none."""
+    return EXIT_OK
 
 
 @main.command(name="run")

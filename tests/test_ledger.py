@@ -182,3 +182,63 @@ def test_schema_2_database_upgrades_and_stays_readable(tmp_path):
     assert old.unit is None and old.checksum is None
     assert new.unit == str(new_artifact.resolve())
     assert new.checksum == hashlib.sha256(b"new").hexdigest()
+
+
+def ledger_rows(config):
+    with closing(sqlite3.connect(database(config))) as db:
+        query = "SELECT id, job_name, unit, checksum FROM backup_runs ORDER BY id"
+        return db.execute(query).fetchall()
+
+
+def test_history_checksum_backfills_available_records(ledger_config):
+    assert invoke("run", "--config", ledger_config, "daily").exit_code == 0
+    (ledger_config.parent / "source/hello").write_text("new content")
+    assert invoke("run", "--config", ledger_config, "daily").exit_code == 0
+    with closing(sqlite3.connect(database(ledger_config))) as db, db:
+        db.execute("UPDATE backup_runs SET unit=NULL, checksum=NULL")
+        db.execute(
+            "INSERT INTO backup_runs (job_name, backup_type, started_at, completed_at, status,"
+            " path, restore_info, checksum) VALUES ('sql', 'mysqldump',"
+            " '2020-01-01T00:00:00+00:00', '2020-01-01T00:00:01+00:00', 'success',"
+            " '/gone.sql.gz', '{}', 'deadbeef')"
+        )
+    before = ledger_rows(ledger_config)
+
+    other = invoke("history", "checksum", "--config", ledger_config, "--job", "other")
+    assert other.exit_code == 0, other.output
+    assert ledger_rows(ledger_config) == before
+
+    result = invoke("history", "checksum", "--config", ledger_config)
+    assert result.exit_code == 0, result.output
+    newest, older = [r for r in records(ledger_config) if r.job_name == "daily"]
+    sql_row = next(r for r in records(ledger_config) if r.job_name == "sql")
+    assert newest.checksum == expected_checksum(Path(newest.path))
+    assert newest.unit == newest.path
+    assert older.checksum is None and older.unit is None
+    assert sql_row.checksum == "deadbeef" and sql_row.unit is None
+    assert result.output.splitlines() == [
+        f"{older.id}: skipped: unavailable",
+        f"{newest.id}: recorded",
+    ]
+
+
+def test_history_checksum_unexpected_unit_exits_1(ledger_config):
+    assert invoke("run", "--config", ledger_config, "daily").exit_code == 0
+    member = ledger_config.parent / "elsewhere/2026-09-01/Full_x"
+    member.mkdir(parents=True)
+    (member / "data.ibd").write_bytes(b"pages")
+    root = (ledger_config.parent / "physical/db").resolve()
+    info = {"kind": "xtrabackup", "backup_root": str(root)}
+    with closing(sqlite3.connect(database(ledger_config))) as db, db:
+        cursor = db.execute(
+            "INSERT INTO backup_runs (job_name, backup_type, started_at, completed_at, status,"
+            " path, identity, restore_info) VALUES ('xb', 'xtrabackup-full',"
+            " '2026-09-01T00:00:00+00:00', '2026-09-01T00:00:01+00:00', 'success', ?, ?, ?)",
+            (str(member.resolve()), artifact_identity(member.resolve()), json.dumps(info)),
+        )
+        row_id = cursor.lastrowid
+    result = invoke("history", "checksum", "--config", ledger_config)
+    assert result.exit_code == 1, result.output
+    assert f"{row_id}: skipped: unexpected unit" in result.output.splitlines()
+    row = next(r for r in records(ledger_config) if r.id == row_id)
+    assert row.checksum is None and row.unit is None
