@@ -197,8 +197,10 @@ def prepare_runner(physical_runner):
 
 
 def stage_files(env, name):
+    """Files GFS placed as units: the marker and ledger snapshots are not units."""
     return [p for p in (env.root / name).rglob("*")
-            if p.is_file() and p.name != ".bdbackup-destination"]
+            if p.is_file() and p.name != ".bdbackup-destination"
+            and not p.name.endswith(".ledger.sqlite3")]
 
 
 def test_file_unit_moves_to_mirrored_path(env):
@@ -618,3 +620,86 @@ def test_restore_xtrabackup_verifies_members_used(env, prepare_runner, caplog):
     assert "checksum mismatch" in caplog.text, caplog.text
     assert result.exit_code == 1, result.output
     assert not (env.root / "out2").exists()
+
+
+SNAPSHOT_TABLES = {"backup_runs": "id", "gfs_units": "id", "gfs_locations": "id",
+                   "gfs_members": "record_id", "gfs_steps": "id"}
+
+
+def ledger_rows(database):
+    with closing(sqlite3.connect(database)) as db:
+        return {table: db.execute(f"SELECT * FROM {table} ORDER BY {key}").fetchall()  # noqa: S608
+                for table, key in SNAPSHOT_TABLES.items()}
+
+
+def test_snapshot_written_to_every_later_stage_path(env):
+    env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
+               (["NFS/weekly"], "weekly", "8w")])
+    env.file_unit("a", days_ago=7)
+    env.file_unit("b", days_ago=0)
+    for run in range(2):
+        if run:
+            c = env.file_unit("c", days_ago=7)
+        result = env.run_cli()
+        assert result.exit_code == 0, result.output
+        live = ledger_rows(env.database)
+        for stage in ("NFS/daily", "NFS/daily2", "NFS/weekly"):
+            snapshot = env.abs(stage) / "gfs-main.ledger.sqlite3"
+            assert snapshot.is_file(), result.output
+            assert ledger_rows(snapshot) == live, stage
+            assert snapshot.stat().st_mode & 0o777 == 0o600
+        assert not (env.root / "BACKUP/gfs-main.ledger.sqlite3").exists()
+        assert not [p for p in (env.root / "NFS").rglob("*") if ".gfs-tmp-" in p.name]
+        assert not Path(f"{env.database}.gfs-gfs-main.snapshot").exists()
+        assert f"snapshot {env.abs('NFS/daily')}/gfs-main.ledger.sqlite3" in result.output
+    assert not c.exists()
+    assert str(env.abs("NFS/daily/files/c")) in [row[3] for row in live["gfs_locations"]]
+
+
+def test_snapshot_restores_moved_unit(env):
+    a = env.archive_unit("a.tar.gz", 7)
+    env.archive_unit("b.tar.gz", 0)
+    assert env.run_cli().exit_code == 0
+    snapshot = env.root / "NFS/daily/gfs-main.ledger.sqlite3"
+    assert snapshot.is_file()
+    record_id = env.query("SELECT id FROM backup_runs WHERE path=?", str(a.resolve()))[0][0]
+    (env.root / "elsewhere").mkdir()
+    shutil.copy(snapshot, env.root / "elsewhere/h.sqlite3")
+    other = env.root / "other.toml"
+    other.write_text('[history]\ndatabase = "elsewhere/h.sqlite3"\n')
+    out = env.root / "out"
+    result = invoke("restore", "--config", other, "--backup-id", record_id, "--yes", "-d", out)
+    assert result.exit_code == 0, result.output
+    assert (out / "hello").read_text() == "recover a.tar.gz"
+
+
+def test_snapshot_missing_marker_fails_run(env):
+    (env.root / "NFS/weekly/.bdbackup-destination").unlink()
+    env.file_unit("a", days_ago=7)
+    env.file_unit("b", days_ago=0)
+    result = env.run_cli()
+    assert result.exit_code == 1, result.output
+    assert (env.root / "NFS/daily/gfs-main.ledger.sqlite3").is_file()
+    assert not [p for p in (env.root / "NFS/weekly").rglob("*") if p.is_file()]
+    assert f"failed snapshot {env.abs('NFS/weekly')}: destination not ready" in result.output
+    assert "failed 1" in result.output, result.output
+
+
+def test_report_lists_per_stage_totals(env, tmp_path):
+    a = env.file_unit("a", days_ago=7)
+    b = env.file_unit("b", days_ago=0)
+    sizes = {a.name: a.stat().st_size, b.name: b.stat().st_size}
+    dry = Env(tmp_path / "dry")
+    dry.write(DEFAULT_STAGES, apply=False)
+    dry.file_unit("a", days_ago=7)
+    dry.file_unit("b", days_ago=0)
+    for run in (env, dry):
+        result = run.run_cli()
+        assert result.exit_code == 0, result.output
+        after = result.output.split("Summary:", 1)[1].splitlines()[1:]
+        stages = [line for line in after if line.startswith("Stage ")]
+        assert stages == [
+            f"Stage {run.abs('BACKUP')}: 1 unit ({sizes['b']} bytes)",
+            f"Stage {run.abs('NFS/daily')}: 1 unit ({sizes['a']} bytes)",
+            f"Stage {run.abs('NFS/weekly')}: 0 units (0 bytes)",
+        ], result.output

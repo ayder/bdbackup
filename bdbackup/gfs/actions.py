@@ -31,6 +31,7 @@ class Refusal(Exception):
 class Transport(Protocol):
     def copy(self, source: Path, temp: Path, on_file: Callable[[str, str], None]) -> None: ...
     def rename(self, temp: Path, final: Path) -> None: ...
+    def replace(self, temp: Path, final: Path) -> None: ...
     def remove(self, path: Path) -> None: ...
     def exists(self, path: Path) -> bool: ...
 
@@ -84,6 +85,11 @@ class LocalTransport:
         if os.path.lexists(final):
             raise Refusal(f"final name exists: {final}")
         os.rename(temp, final)
+        _fsync_dir(final.parent)
+
+    def replace(self, temp: Path, final: Path) -> None:
+        """Rename over an existing final name; only ledger snapshots are replaced."""
+        os.replace(temp, final)
         _fsync_dir(final.parent)
 
     def remove(self, path: Path) -> None:

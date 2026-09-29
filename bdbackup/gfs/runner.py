@@ -26,6 +26,11 @@ def job_lock_path(config: Config, name: str) -> Path:
     return Path(f"{config.history.database}.gfs-{name}.lock")
 
 
+def snapshot_name(job: Job) -> str:
+    """The ledger snapshot written to every later stage path (spec 2 §4.3, D18)."""
+    return f"{job.name}.ledger.sqlite3"
+
+
 @dataclass
 class _Tally:
     moved: int = 0
