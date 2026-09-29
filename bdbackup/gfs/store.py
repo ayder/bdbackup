@@ -37,6 +37,8 @@ class ManagedUnit:
     members: tuple[BackupRecord, ...]
     locations: tuple[Location, ...]
     size: int
+    # Records of this unit GFS has not judged yet, with whether each is available now (S2).
+    seen: tuple[tuple[int, bool], ...] = ()
 
 
 def _has_tables(db) -> bool:
@@ -126,6 +128,11 @@ def record_unit(history: History, unit: ManagedUnit) -> int:
             [(unit_id, str(loc.stage_path), str(loc.path)) for loc in unit.locations],
         )
     return unit_id
+
+
+def record_members(history: History, unit_id: int,
+                   seen: Sequence[tuple[int, bool]]) -> None:
+    """Store each record's first judgment; a stored judgment is never changed."""
 
 
 def record_move(history: History, unit_id: int, new: Sequence[Location],

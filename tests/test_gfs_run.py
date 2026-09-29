@@ -398,3 +398,44 @@ def test_history_shows_stage_locations_and_deleted(env):
     assert by_path["b.tar.gz"].endswith(
         f"| stage {env.abs('BACKUP')} | locations {env.abs('BACKUP/files/b.tar.gz')}"
     )
+
+
+def test_replaced_record_stays_unmanaged_after_first_run(env):
+    # Spec 2 r7 S2: a record unavailable when GFS first sees it is never managed.
+    day = date.today() - timedelta(days=3)
+    fixed = env.file_unit("fixed.tar.gz", day=day)
+    fixed.write_bytes(b"second content")
+    env._record(fixed, {"kind": "file"}, "files", day, "file")
+    env.file_unit("new.tar.gz", days_ago=0)
+    now = datetime.now()
+    code, first = env.run_api(now)
+    assert code == 0, first
+    code, second = env.run_api(now + timedelta(days=5))
+    assert code == 0, second
+    assert "unmanaged 1" in first and "unmanaged 1" in second, (first, second)
+    assert "move files files/fixed.tar.gz" in second, second
+    assert (env.root / "NFS/daily/files/fixed.tar.gz").read_bytes() == b"second content"
+    ids = [row[0] for row in env.query(
+        "SELECT id FROM backup_runs WHERE path=? ORDER BY id", str(fixed.resolve()))]
+    assert env.query("SELECT record_id, managed FROM gfs_members WHERE record_id IN (?, ?)"
+                     " ORDER BY record_id", *ids) == [(ids[0], 0), (ids[1], 1)]
+
+
+def test_record_added_to_managed_unit_is_member(env):
+    # S2 is judged per record: a later incremental of the newest unit joins its unit.
+    unit = env.xtrabackup_unit(3, incrementals=1)
+    now = datetime.now()
+    code, output = env.run_api(now)
+    assert code == 0 and unit.is_dir(), output
+    full = next(p for p in unit.iterdir() if p.name.startswith("Full_2"))
+    inc2 = unit / "Incremental" / full.name / "inc2"
+    write_checkpoints(inc2, 200, 300)
+    (inc2 / "data.delta").write_bytes(b"delta 2")
+    info = {"kind": "xtrabackup", "backup_root": str((env.root / "BACKUP/mysql/prod").resolve())}
+    env._record(inc2, info, "xb", date.today() - timedelta(days=3), "xtrabackup-incremental")
+    env.xtrabackup_unit(0)
+    code, output = env.run_api(now + timedelta(days=5))
+    assert code == 0, output
+    moved = env.root / "NFS/daily/mysql/prod" / unit.name
+    assert (moved / "Incremental" / full.name / "inc2").is_dir(), output
+    assert not unit.exists()
