@@ -17,7 +17,7 @@ from bdbackup.gfs import store
 from bdbackup.gfs.actions import LocalTransport, Refusal, Transport, copy_verified, verify
 from bdbackup.gfs.policy import Decision, Unit, decide
 from bdbackup.gfs.stages import MARKER, Stage
-from bdbackup.history import History
+from bdbackup.history import History, artifact_identity
 from bdbackup.utils import process_lock
 
 
@@ -58,6 +58,15 @@ def _engine_locks(stack: ExitStack, unit: store.ManagedUnit, paths: list[Path]) 
             stack.enter_context(process_lock(parent / ".bdbackup.lock"))
         except BlockingIOError:
             raise _Deferred() from None
+
+
+def _identities(unit: store.ManagedUnit, at: Path) -> dict[int, str]:
+    """Each member's artifact identity at a new location, so ``history`` detects replacement."""
+    identities = {}
+    for member in unit.members:
+        relative = Path(member.path).relative_to(unit.unit)
+        identities[member.id] = artifact_identity(at / relative if relative != Path(".") else at)
+    return identities
 
 
 class _Run:
@@ -148,7 +157,8 @@ class _Run:
                 unit = self.ensure_row(unit)
                 new = [store.Location(path, final)
                        for path, final in zip(self.stages[target].paths, finals, strict=True)]
-                store.record_move(self.history, unit.id, new, unit.locations)
+                store.record_move(self.history, unit.id, new, unit.locations,
+                                  {final: _identities(unit, final) for final in finals})
                 self.remove_locations(unit, unit.locations, verified=True)
         finally:
             for temp in temps:

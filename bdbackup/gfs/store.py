@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from bdbackup.history import BackupRecord, History
+from bdbackup.history import BackupRecord, History, artifact_identity
 
 _TABLES = {"gfs_units", "gfs_locations", "gfs_steps"}
 
@@ -186,13 +186,22 @@ def record_move(history: History, unit_id: int, new: Sequence[Location],
                 identities: Mapping[Path, Mapping[int, str]] | None = None) -> None:
     with history._connect(create=True) as db:
         db.executemany(
-            "INSERT INTO gfs_locations (unit_id, stage_path, path) VALUES (?, ?, ?)",
-            [(unit_id, str(loc.stage_path), str(loc.path)) for loc in new],
+            "INSERT INTO gfs_locations (unit_id, stage_path, path, identities)"
+            " VALUES (?, ?, ?, ?)",
+            [(unit_id, str(loc.stage_path), str(loc.path), _identities_text(identities, loc))
+             for loc in new],
         )
         db.executemany(
             "DELETE FROM gfs_locations WHERE unit_id=? AND path=?",
             [(unit_id, str(loc.path)) for loc in removed],
         )
+
+
+def _identities_text(identities, location: Location) -> str | None:
+    if not identities or location.path not in identities:
+        return None
+    return json.dumps({str(record_id): identity
+                       for record_id, identity in identities[location.path].items()})
 
 
 def record_delete(history: History, unit_id: int) -> None:
@@ -229,13 +238,64 @@ def listing_suffixes(history: History) -> dict[str, str]:
 
 
 def places(history: History) -> dict[int, tuple[Place, ...]]:
-    """``backup_runs.id -> places`` for the members of recorded units."""
-    return {}
+    """``backup_runs.id -> places`` for the members of recorded units, in location order.
+
+    A deleted unit's members map to ``()``. A record GFS does not manage is absent, and its own
+    ``available`` still applies. Reading never migrates or writes.
+    """
+    if not history.settings.database.exists():
+        return {}
+    with history._connect() as db:
+        if not _has_tables(db):
+            return {}
+        columns = {row[1] for row in db.execute("PRAGMA table_info(gfs_locations)")}
+        query = (
+            "SELECT unit_id, path, identities FROM gfs_locations ORDER BY id"
+            if "identities" in columns  # schema 4, read without migrating, has none
+            else "SELECT unit_id, path, NULL FROM gfs_locations ORDER BY id"
+        )
+        locations: dict[int, list[tuple[Path, dict]]] = defaultdict(list)
+        for unit_id, path, identities in db.execute(query):
+            locations[unit_id].append((Path(path), json.loads(identities or "{}")))
+        units = {row["unit"]: row for row in db.execute("SELECT * FROM gfs_units")}
+        judged = (
+            {row[0]: bool(row[1])
+             for row in db.execute("SELECT record_id, managed FROM gfs_members")}
+            if _has_members(db) else None
+        )
+        records = [
+            BackupRecord(**dict(row))
+            for row in db.execute(
+                "SELECT * FROM backup_runs WHERE status='success' AND unit IS NOT NULL"
+                " ORDER BY id"
+            )
+        ]
+    found: dict[int, list[Place]] = {}
+    for record in records:
+        row = units.get(record.unit)
+        if row is None or (judged is not None and not judged.get(record.id, False)):
+            continue
+        unit = Path(record.unit)
+        relative = Path(record.path).relative_to(unit)
+        found[record.id] = [] if row["deleted_at"] is not None else [
+            Place(path, path / relative if relative != Path(".") else path,
+                  record.identity if path == unit else identities.get(str(record.id)))
+            for path, identities in locations[row["id"]]
+        ]
+    return {record_id: tuple(found_places) for record_id, found_places in found.items()}
 
 
 def place_available(place: Place) -> bool:
-    return False
+    """Removal and replacement are detected as ``artifact_identity`` does, without hashing."""
+    try:
+        if place.identity is None:
+            return place.member.exists()
+        return artifact_identity(place.member) == place.identity
+    except OSError:
+        return False
 
 
 def available(record: BackupRecord, known: Mapping[int, tuple[Place, ...]]) -> bool:
+    if record.id in known:
+        return any(place_available(place) for place in known[record.id])
     return record.available
