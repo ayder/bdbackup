@@ -184,6 +184,8 @@ encrypt = false
 # GFS retention policy for a backup tree (dry-run by default; set apply=true
 # to actually delete files). Incrementals are chain-safe: they never outlive
 # their parent full, and a full that still anchors a live incremental is kept.
+# This handles flat files written by other tools; bdbackup's own backups are
+# rotated by type = "gfs" below.
 # ---------------------------------------------------------------------------
 [mysql-prod-retention]
 type = "retention"
@@ -213,3 +215,42 @@ min_keep_fulls = 2
 
 # CRITICAL: default is false (dry run). Inspect the output, then set true.
 apply = false
+
+# ---------------------------------------------------------------------------
+# GFS: move bdbackup's own backups through a chain of stage directories, using
+# only the [history] ledger. Requires [history]. Jobs writing into the first
+# stage must set retention_days = 0 (xtrabackup) or timestamp = true (file).
+# Every later stage path must contain an empty .bdbackup-destination file.
+# ---------------------------------------------------------------------------
+[gfs-main]
+type = "gfs"
+apply = false                    # dry run unless true: prints what would change
+# schedule = "0 4 * * *"         # optional override for --cron
+
+# Stages in chain order. keep is an age from the backup day (Nd, Nw, Nm, Ny)
+# and grows along the chain; period thins a stage to the newest backup of each
+# week, month or year. The first stage has one path: where backups are written.
+[[gfs-main.stage]]
+paths = ["/BACKUP"]
+period = "daily"
+keep = "5d"
+
+[[gfs-main.stage]]
+paths = ["/NFS/daily"]           # everything for 15 more days
+period = "daily"
+keep = "20d"
+
+[[gfs-main.stage]]
+paths = ["/NFS/weekly"]          # newest backup of each ISO week
+period = "weekly"
+keep = "8w"
+
+[[gfs-main.stage]]
+paths = ["/NFS/monthly"]         # newest weekly backup of each month
+period = "monthly"
+keep = "12m"
+
+[[gfs-main.stage]]
+paths = ["/NFS/yearly", "/DD/yearly"]   # every path gets a copy
+period = "yearly"
+keep = "7y"

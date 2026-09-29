@@ -14,6 +14,8 @@ from bdbackup import __version__, retention
 from bdbackup.backends import BackupError, BackupResult, setup_logging
 from bdbackup.config import Config, ConfigError, build_backend
 from bdbackup.filebackup import FileBackup
+from bdbackup.gfs import runner as gfs_runner
+from bdbackup.gfs import store as gfs_store
 from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
@@ -955,7 +957,9 @@ def history_cmd(
         config = _get_config(config_path, required=True)
         if not config.history:
             raise click.UsageError("Configure [history] database in the TOML file first")
-        records = History(config.history).records(job=job, successful=successful)
+        history = History(config.history)
+        records = history.records(job=job, successful=successful)
+        suffixes = gfs_store.listing_suffixes(history)
         if not records:
             click.echo("No backup history found.")
         for record in records:
@@ -965,6 +969,7 @@ def history_cmd(
                 f"{record.status} | {available} | "
                 f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path or '-'}"
                 f" | unit {record.unit or '-'}"
+                f"{suffixes.get(record.unit, '') if record.unit else ''}"
             )
 
     return _handle_errors(_run)
@@ -1059,6 +1064,13 @@ def run(
     for job in selected:
         logger.info("Running job %r (%s)", job.name, job.type)
         try:
+            if job.type == "gfs":
+                code = gfs_runner.run_job(config, job, out=click.echo)
+                if code == EXIT_LOCKED:
+                    failures.append(EXIT_LOCKED)
+                elif code:
+                    failures.append(EXIT_BACKUP_FAILED)
+                continue
             if job.type == "retention":
                 params = dict(job.params)
                 if "apply" in params:

@@ -41,7 +41,7 @@ def test_builtin_engines_registered():
 
 
 def test_supported_types_includes_engines_and_retention():
-    assert supported_types() == {"file", "retention", "mysqldump", "xtrabackup"}
+    assert supported_types() == {"file", "retention", "gfs", "mysqldump", "xtrabackup"}
 
 
 def test_unknown_engine_error_lists_available():
