@@ -958,6 +958,7 @@ def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> 
                 f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
                 f"{record.status} | {available} | "
                 f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path or '-'}"
+                f" | unit {record.unit or '-'}"
             )
 
     return _handle_errors(_run)

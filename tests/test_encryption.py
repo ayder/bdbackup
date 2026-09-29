@@ -252,7 +252,8 @@ def test_old_history_reads_without_mutation_and_migrates_on_write(tmp_path):
     history.run("old", "file", lambda: BackupResult(artifact, success=True))
     # Reconstruct the previous schema, retaining an actual previous run.
     with closing(sqlite3.connect(path)) as db:
-        db.execute("ALTER TABLE backup_runs DROP COLUMN encrypted")
+        for column in ("encrypted", "unit", "checksum"):
+            db.execute(f"ALTER TABLE backup_runs DROP COLUMN {column}")
         db.execute("PRAGMA user_version=1")
         db.commit()
     before = path.read_bytes()
@@ -261,6 +262,6 @@ def test_old_history_reads_without_mutation_and_migrates_on_write(tmp_path):
     assert path.read_bytes() == before
     history.run("new", "file", lambda: BackupResult(artifact, success=True), encrypted=True)
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         rows = db.execute("SELECT encrypted FROM backup_runs ORDER BY id").fetchall()
         assert rows == [(0,), (1,)]

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bdbackup.backends import BackupError, BackupResult
+from bdbackup.ledger import checksum, unit_path
 
 
 class HistoryError(BackupError):
@@ -88,7 +89,7 @@ class History:
                 if create:
                     connection.execute("BEGIN IMMEDIATE")
                 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-                if schema not in (0, 1, 2) or (not create and schema == 0):
+                if schema not in (0, 1, 2, 3) or (not create and schema == 0):
                     raise HistoryError(f"Unsupported history schema version: {schema}")
                 if create and schema == 0:
                     connection.execute(
@@ -116,6 +117,11 @@ class History:
                         "DEFAULT 0 CHECK(encrypted IN (0, 1))"
                     )
                     connection.execute("PRAGMA user_version = 2")
+                if create and schema in (0, 1, 2):
+                    # Ledger facts (spec 2): the unit GFS moves and its plain-hex checksum.
+                    connection.execute("ALTER TABLE backup_runs ADD COLUMN unit TEXT")
+                    connection.execute("ALTER TABLE backup_runs ADD COLUMN checksum TEXT")
+                    connection.execute("PRAGMA user_version = 3")
                 yield connection
         except (OSError, sqlite3.Error) as exc:
             raise HistoryError(f"Cannot access history database {path}: {exc}") from exc
@@ -147,6 +153,8 @@ class History:
                 raise BackupError("Backend reported an unsuccessful backup")
             path = result.path.resolve(strict=True)
             identity = artifact_identity(path)
+            unit = unit_path(path, restore_info or {})
+            digest = checksum(path)
         except BaseException as exc:
             # Store the exception class only: external diagnostics may contain credentials.
             with self._connect(create=True) as db:
@@ -158,9 +166,9 @@ class History:
         with self._connect(create=True) as db:
             db.execute(
                 """UPDATE backup_runs SET status='success', completed_at=?, path=?,
-                   size_bytes=?, identity=?, restore_info=? WHERE id=?""",
+                   size_bytes=?, identity=?, restore_info=?, unit=?, checksum=? WHERE id=?""",
                 (datetime.now(UTC).isoformat(), str(path), result.size_bytes, identity,
-                 json.dumps(restore_info or {}), run_id),
+                 json.dumps(restore_info or {}), str(unit), digest, run_id),
             )
         return result
 
