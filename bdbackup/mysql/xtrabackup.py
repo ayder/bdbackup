@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -335,6 +336,8 @@ class XtraBackup:
         self,
         target: str | Path,
         destination: str | Path,
+        *,
+        check: Callable[[Sequence[Path]], None] | None = None,
     ) -> Path:
         """Prepare a separate full recovery copy, following an incremental's parent chain."""
         source = Path(target).expanduser().resolve()

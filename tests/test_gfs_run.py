@@ -566,3 +566,55 @@ def test_restore_moved_xtrabackup_tip_uses_stage_root(env, prepare_runner):
     assert sum(any(a.startswith("--incremental-dir=") for a in cmd)
                for cmd in prepare_runner.commands) == 2
     assert not hot.exists()
+
+
+def corrupt_in_place(path):
+    """Different bytes of the same length and mtime: the identity still matches."""
+    stat = path.stat()
+    path.write_bytes(bytes(b ^ 0xFF for b in path.read_bytes()))
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+
+def test_restore_verifies_and_uses_first_path_that_verifies(env, caplog):
+    env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
+               (["NFS/weekly"], "weekly", "8w")])
+    a = env.archive_unit("a.tar.gz", 7)
+    env.archive_unit("b.tar.gz", 0)
+    assert env.run_cli().exit_code == 0
+    record_id = env.query("SELECT id FROM backup_runs WHERE path=?", str(a.resolve()))[0][0]
+    first, second = env.abs("NFS/daily/files/a.tar.gz"), env.abs("NFS/daily2/files/a.tar.gz")
+    corrupt_in_place(first)
+    out = env.root / "out"
+    result = invoke("restore", "--config", env.config_path, "--backup-id", record_id, "--yes",
+                    "-d", out)
+    assert f"Backup: {second}" in result.output, result.output
+    assert f"Backup: {first}" not in result.output, result.output
+    assert result.exit_code == 0, result.output
+    assert (out / "hello").read_text() == "recover a.tar.gz"
+    corrupt_in_place(second)
+    out2 = env.root / "out2"
+    caplog.clear()
+    result = invoke("restore", "--config", env.config_path, "--backup-id", record_id, "--yes",
+                    "-d", out2)
+    assert "checksum mismatch" in caplog.text, caplog.text
+    assert result.exit_code == 1, result.output
+    assert not out2.exists()
+
+
+def test_restore_xtrabackup_verifies_members_used(env, prepare_runner, caplog):
+    with patch("subprocess.run", side_effect=prepare_runner):
+        full, first, tip = env.engine_chain(7)
+        hot = Path(full.unit)
+        assert env.run_cli().exit_code == 0
+        moved = env.abs("NFS/daily/mysql/prod") / hot.name
+        corrupt_in_place(moved / Path(tip.path).relative_to(hot) / "data.ibd")
+        result = invoke("restore", "--config", env.config_path, "--backup-id", first.id,
+                        "--yes", "-d", env.root / "out1")
+        assert result.exit_code == 0, result.output
+        corrupt_in_place(moved / Path(full.path).relative_to(hot) / "data.ibd")
+        caplog.clear()
+        result = invoke("restore", "--config", env.config_path, "--backup-id", first.id,
+                        "--yes", "-d", env.root / "out2")
+    assert "checksum mismatch" in caplog.text, caplog.text
+    assert result.exit_code == 1, result.output
+    assert not (env.root / "out2").exists()
