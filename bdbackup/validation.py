@@ -87,11 +87,15 @@ def _binary(report: Report, name: str) -> None:
 
 def _settings(job: Job) -> None:
     integer_options = {"parallel", "compress_threads", "retention_days", "throttle", "jobs", "port"}
-    boolean_options = {"encrypt", "follow_symlinks"}
+    boolean_options = {"encrypt", "follow_symlinks", "timestamp"}
     string_options = {"user", "password", "host", "binary", "compress", "database", "format"}
     list_options = {"options", "exclude", "exclude_pattern", "exclude_templates"}
     for name, value in job.params.items():
-        if name in integer_options and (type(value) is not int or value < 1):
+        if name == "retention_days" and (type(value) is not int or value < 0):
+            raise ValueError("retention_days must be an integer >= 0")
+        if name in integer_options - {"retention_days"} and (
+            type(value) is not int or value < 1
+        ):
             raise ValueError(f"{name} must be an integer >= 1")
         if name == "port" and value > 65535:
             raise ValueError("port must be <= 65535")

@@ -60,8 +60,10 @@ class XtraBackup:
         self.parallel = parallel
         self.throttle = throttle
         self.retention_days = retention_days
-        if retention_days < 1 or parallel < 1 or compress_threads < 1:
-            raise ValueError("retention_days, parallel and compress_threads must be >= 1")
+        if retention_days < 0:
+            raise ValueError("retention_days must be >= 0")
+        if parallel < 1 or compress_threads < 1:
+            raise ValueError("parallel and compress_threads must be >= 1")
         if throttle is not None and throttle < 1:
             raise ValueError("throttle must be >= 1")
         self.logger = logging.getLogger("bdbackup.mysql.xtrabackup")
@@ -435,7 +437,12 @@ class XtraBackup:
         return BackupResult(target, size_bytes=self._size(target), success=True)
 
     def prune(self, *, acquire_lock: bool = True) -> list[Path]:
-        """Expire whole daily chains under the same lock as writers, keeping the latest full."""
+        """Expire whole daily chains under the same lock as writers, keeping the latest full.
+
+        ``retention_days = 0`` disables engine deletion entirely.
+        """
+        if self.retention_days == 0:
+            return []
         if not self.backup_root.exists():
             return []
         with process_lock(self.lock_path) if acquire_lock else nullcontext():

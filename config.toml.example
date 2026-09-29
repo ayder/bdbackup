@@ -42,6 +42,7 @@ restore_root = "/restore/bdbackup"  # default: ./restores beside this config; jo
 #   bdbackup --config config.toml mysqldump ...
 # Browse and recover successful backups:
 #   bdbackup history --config config.toml
+#   bdbackup history checksum --config config.toml   # checksum older records
 #   bdbackup restore --config config.toml
 #   bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
 
@@ -59,6 +60,10 @@ template_filename = "~/.config/bdbackup/files.template"
 # Destination archive path WITHOUT extension; the format's extension
 # (.tar / .tar.gz / .tar.zst) is appended automatically.
 backup_dst = "/backup/files/daily"
+
+# Write daily-<UTC YYYY-MM-DD-HHMMSS>.tar.gz per run instead of replacing
+# daily.tar.gz; an existing name is never overwritten (default: false).
+# timestamp = true
 
 # Source for file jobs: the source path being backed up. Relative entries
 # in the template file, relative `exclude` entries, and relative
@@ -160,6 +165,7 @@ compress = ""                    # off; zstd for compatible XtraBackup, quicklz 
 compress_threads = 4
 parallel = 2                     # copy threads
 # throttle = 200                 # optional IOPS limit
+# retention_days = 0             # days kept by engine pruning (default 5); 0 disables engine deletion
 
 # Optional AES256 backup encryption (Percona XtraBackup only).
 # TOML booleans are true/false, not yes/no. Enabling encryption requires an

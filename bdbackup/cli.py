@@ -185,6 +185,12 @@ def _handle_errors(func, *args, **kwargs) -> int:
     help="Follow symbolic links when archiving directories.",
 )
 @click.option(
+    "--timestamp/--no-timestamp",
+    default=False,
+    show_default=True,
+    help="Write <dst>-<UTC stamp><ext> instead of replacing one archive.",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="List what would be archived without writing anything.",
@@ -205,6 +211,7 @@ def file(
     exclude_pattern: tuple[str, ...],
     exclude_templates: tuple[str, ...],
     follow_symlinks: bool,
+    timestamp: bool,
     dry_run: bool,
     verify: bool,
 ) -> int:
@@ -227,6 +234,7 @@ def file(
                 exclude_pattern=exclude_pattern,
                 exclude_templates=template_names,
                 follow_symlinks=follow_symlinks,
+                timestamp=timestamp,
             )
         except TemplateError as exc:
             raise click.UsageError(str(exc)) from exc
@@ -427,8 +435,8 @@ def xtrabackup() -> None:
     "--retention",
     default=5,
     show_default=True,
-    type=click.IntRange(min=1),
-    help="Retention in days.",
+    type=click.IntRange(min=0),
+    help="Retention in days; 0 disables engine deletion.",
 )
 @click.option(
     "--verify/--no-verify",
@@ -603,8 +611,8 @@ def xtrabackup_incremental(
     "--retention",
     default=5,
     show_default=True,
-    type=click.IntRange(min=1),
-    help="Retention in days.",
+    type=click.IntRange(min=0),
+    help="Retention in days; 0 disables engine deletion.",
 )
 def xtrabackup_prune(
     database: str,
@@ -616,6 +624,9 @@ def xtrabackup_prune(
         backup_root=backup_root / database,
         retention_days=retention,
     )
+    if retention == 0:
+        click.echo("Engine deletion is disabled (retention 0); nothing pruned")
+        return EXIT_OK
     return _handle_errors(lambda: click.echo(f"Pruned {len(xb.prune())} backup directories"))
 
 
@@ -927,13 +938,19 @@ def restore(
     return _handle_errors(_run)
 
 
-@main.command(name="history")
+@main.group(name="history", invoke_without_command=True)
 @click.option("--config", "config_path",
               type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--job", help="Show only this job.")
 @click.option("--successful", is_flag=True, help="Show only successful runs.")
-def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> int:
+@click.pass_context
+def history_cmd(
+    ctx: click.Context, config_path: Path | None, job: str | None, successful: bool,
+) -> int:
     """List recorded backup attempts and whether their artifacts are still available."""
+    if ctx.invoked_subcommand is not None:
+        return EXIT_OK
+
     def _run():
         config = _get_config(config_path, required=True)
         if not config.history:
@@ -947,9 +964,33 @@ def history_cmd(config_path: Path | None, job: str | None, successful: bool) -> 
                 f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
                 f"{record.status} | {available} | "
                 f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path or '-'}"
+                f" | unit {record.unit or '-'}"
             )
 
     return _handle_errors(_run)
+
+
+@history_cmd.command(name="checksum")
+@click.option("--config", "config_path",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--job", help="Only records of this job.")
+def history_checksum(config_path: Path | None, job: str | None) -> int:
+    """Record unit and checksum for older records that have none."""
+    unexpected = []
+
+    def _run():
+        config = _get_config(config_path, required=True)
+        if not config.history:
+            raise click.UsageError("Configure [history] database in the TOML file first")
+        for record_id, outcome in History(config.history).record_checksums(job):
+            click.echo(f"{record_id}: {outcome}")
+            if outcome == "skipped: unexpected unit":
+                unexpected.append(record_id)
+
+    _handle_errors(_run)
+    if unexpected:
+        click.get_current_context().exit(EXIT_BACKUP_FAILED)
+    return EXIT_OK
 
 
 @main.command(name="run")

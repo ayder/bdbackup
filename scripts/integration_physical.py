@@ -6,6 +6,7 @@ or `mariadb` for MariaDB 11.4 with no compression. Requires Docker and images.
 Only task-created containers and volumes are accessed or removed.
 """
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -16,7 +17,35 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from bdbackup.history import History, HistorySettings
 from bdbackup.mysql import XtraBackup
+from bdbackup.recovery import backup_restore_info
+
+
+def manifest_checksum(path):
+    """Spec 2 §2 directory checksum, computed independently of bdbackup.ledger."""
+    lines = sorted(
+        (p.relative_to(path).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
+        for p in path.rglob("*")
+        if p.is_file() and not p.is_symlink()
+    )
+    lines.sort(key=lambda item: item[0].encode())
+    manifest = "".join(f"{digest}  {name}\n" for name, digest in lines)
+    return hashlib.sha256(manifest.encode()).hexdigest()
+
+
+def check_ledger(records, root):
+    if len(records) != 3:
+        raise RuntimeError(f"expected 3 ledger records, found {len(records)}")
+    for record in records:
+        path = Path(record.path)
+        if not record.checksum:
+            raise RuntimeError(f"ledger checksum missing for {path}")
+        if record.checksum != manifest_checksum(path):
+            raise RuntimeError(f"ledger checksum mismatch for {path}")
+        unit = root.resolve() / path.relative_to(root.resolve()).parts[0]
+        if record.unit != str(unit):
+            raise RuntimeError(f"ledger unit {record.unit} is not the date directory {unit}")
 
 
 def main(engine="percona"):
@@ -168,13 +197,20 @@ def main(engine="percona"):
                 patch.object(xb, "_run", side_effect=backup_command),
                 patch.object(tempfile, "tempdir", str(work)),
             ):
-                full = xb.full_backup()
+                history = History(HistorySettings(work / "history.sqlite3", work / "restores"))
+                info = backup_restore_info(xb)
+                full = history.run("physical", "xtrabackup-full", xb.full_backup, info)
                 print("Full backup verified", flush=True)
                 sql(source, "INSERT INTO audit.data VALUES(2)")
-                xb.incremental_backup()
+                history.run("physical", "xtrabackup-incremental", xb.incremental_backup, info)
                 sql(source, "INSERT INTO audit.data VALUES(3)")
-                tip = xb.incremental_backup()
+                tip = history.run(
+                    "physical", "xtrabackup-incremental", xb.incremental_backup, info
+                )
                 print("Two chained incrementals verified", flush=True)
+                check_ledger(history.records(), work / "backups")
+                print("Ledger unit and checksum verified for full and two incrementals",
+                      flush=True)
                 full_copy = xb.prepare(full.path, work / "full-recovery")
                 chain_copy = xb.prepare(tip.path, work / "chain-recovery")
                 print("Full and incremental recovery copies prepared", flush=True)
