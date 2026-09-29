@@ -888,10 +888,19 @@ def restore(
         if not config.history:
             raise click.UsageError("Configure [history] database in the TOML file first")
         history = History(config.history)
+        known = gfs_store.places(history)
+
+        def shown(record):
+            """A unit GFS manages is shown at its first available location."""
+            available = [p.member for p in known.get(record.id, ())
+                         if gfs_store.place_available(p)]
+            return available[0] if available else record.path
+
         if backup_id is None:
             if yes:
                 raise click.UsageError("--yes requires an explicit --backup-id")
-            records = [r for r in history.records(job=job, successful=True) if r.available]
+            records = [r for r in history.records(job=job, successful=True)
+                       if gfs_store.available(r, known)]
             if not records:
                 raise BackupError("No successful, available backups found")
             click.echo("Successful backups (newest first):")
@@ -899,7 +908,7 @@ def restore(
                 click.echo(
                     f"{record.id}: {record.job_name} | {record.backup_type} | "
                     f"{record.started_at} | "
-                    f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path}"
+                    f"{'encrypted' if record.encrypted else 'unencrypted'} | {shown(record)}"
                 )
             selected_id = click.prompt("Backup ID", type=int, default=records[0].id)
             choices = {r.id: r for r in records}
@@ -910,15 +919,21 @@ def restore(
             record = history.get(backup_id)
             if job is not None and record.job_name != job:
                 raise click.UsageError("The selected backup does not belong to --job")
-        if not record.available:
+        if not gfs_store.available(record, known):
             raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")
+        managed = record.id in known
         current_job = config.jobs.get(record.job_name)
         restore_root = (
             current_job.restore_root if current_job and current_job.restore_root
             else config.history.restore_root
         )
         destination = dst or suggested_destination(record, restore_root)
-        click.echo(f"Backup: {record.path}")
+        if managed:
+            # `Backup:` follows once restore has chosen the copy it restores from.
+            click.echo("Locations: " + ", ".join(
+                str(p.member) for p in known[record.id] if gfs_store.place_available(p)))
+        else:
+            click.echo(f"Backup: {record.path}")
         if dst is None and not yes:
             destination = Path(click.prompt("Restore destination", default=str(destination)))
         click.echo(f"Recovery destination: {destination}")
@@ -927,7 +942,9 @@ def restore(
         if encrypt_key_file is not None and not record.backup_type.startswith("xtrabackup"):
             raise click.UsageError("--encrypt-key-file requires a physical backup")
         restored = restore_record(record, destination, encrypt_key_file=encrypt_key_file,
-                                  history=history, on_source=None)
+                                  history=history,
+                                  on_source=(lambda path: click.echo(f"Backup: {path}"))
+                                  if managed else None)
         if record.backup_type == "mysqldump":
             click.echo(f"SQL recovered to: {restored / 'backup.sql'} (not imported into a server)")
         elif record.backup_type.startswith("xtrabackup"):
