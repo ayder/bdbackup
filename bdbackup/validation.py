@@ -87,7 +87,7 @@ def _binary(report: Report, name: str) -> None:
 
 def _settings(job: Job) -> None:
     integer_options = {"parallel", "compress_threads", "retention_days", "throttle", "jobs", "port"}
-    boolean_options = {"encrypt", "follow_symlinks"}
+    boolean_options = {"encrypt", "follow_symlinks", "timestamp"}
     string_options = {"user", "password", "host", "binary", "compress", "database", "format"}
     list_options = {"options", "exclude", "exclude_pattern", "exclude_templates"}
     for name, value in job.params.items():

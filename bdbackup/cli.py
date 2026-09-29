@@ -234,6 +234,7 @@ def file(
                 exclude_pattern=exclude_pattern,
                 exclude_templates=template_names,
                 follow_symlinks=follow_symlinks,
+                timestamp=timestamp,
             )
         except TemplateError as exc:
             raise click.UsageError(str(exc)) from exc

@@ -63,8 +63,11 @@ class FileBackup:
         if format == "tar.zst" and sys.version_info < (3, 14):
             raise ValueError("tar.zst requires Python 3.14 or newer; use tar or tar.gz")
         self.tar_opt, self.tar_ext, self.tar_read_opt = self.FORMATS[format]
-        self.tar_filename = Path(str(self.backup_dst) + self.tar_ext)
-        self.lock_filename = Path(str(self.tar_filename) + ".lock")
+        self.timestamp = timestamp
+        # One lock per destination, whether or not each run gets its own stamped name.
+        self.lock_filename = Path(str(self.backup_dst) + self.tar_ext + ".lock")
+        stamp = f"-{self._stamp()}" if timestamp else ""
+        self.tar_filename = Path(str(self.backup_dst) + stamp + self.tar_ext)
         if self.backup_dst.is_dir():
             raise IsADirectoryError(f"backup_dst must be a file path: {self.backup_dst}")
         if self.template_filename:
@@ -122,6 +125,10 @@ class FileBackup:
                         raise BackupError("Archive members do not match the selected inputs")
                 with self._pending.open("rb") as stream:
                     os.fsync(stream.fileno())
+                # A stamped archive is never replaced. The destination lock is held here,
+                # so no other run of this destination can publish between check and rename.
+                if self.timestamp and self.tar_filename.exists():
+                    raise BackupError(f"Archive already exists: {self.tar_filename}")
                 os.replace(self._pending, self.tar_filename)
         finally:
             self.tar = None
