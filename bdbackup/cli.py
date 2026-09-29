@@ -427,8 +427,8 @@ def xtrabackup() -> None:
     "--retention",
     default=5,
     show_default=True,
-    type=click.IntRange(min=1),
-    help="Retention in days.",
+    type=click.IntRange(min=0),
+    help="Retention in days; 0 disables engine deletion.",
 )
 @click.option(
     "--verify/--no-verify",
@@ -603,8 +603,8 @@ def xtrabackup_incremental(
     "--retention",
     default=5,
     show_default=True,
-    type=click.IntRange(min=1),
-    help="Retention in days.",
+    type=click.IntRange(min=0),
+    help="Retention in days; 0 disables engine deletion.",
 )
 def xtrabackup_prune(
     database: str,
@@ -616,6 +616,9 @@ def xtrabackup_prune(
         backup_root=backup_root / database,
         retention_days=retention,
     )
+    if retention == 0:
+        click.echo("Engine deletion is disabled (retention 0); nothing pruned")
+        return EXIT_OK
     return _handle_errors(lambda: click.echo(f"Pruned {len(xb.prune())} backup directories"))
 
 
