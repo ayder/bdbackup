@@ -104,10 +104,11 @@ def case_no_backward():
 
 
 def case_month_end_clamp():
-    by_day = run([date(2026, 2, 28), date(2026, 3, 1), date(2026, 3, 31)],
-                 stages(("1m", "daily"), ("12m", "monthly")), date(2026, 3, 31))
-    check(by_day, "2026-03-01", "stay", 0, "in place")
-    check(by_day, "2026-02-28", "move", 1, "monthly 2026-02")
+    # 2027-02-28 is a Sunday, so it is also the newest unit of its ISO week.
+    by_day = run([date(2027, 2, 28), date(2027, 3, 1), date(2027, 3, 31)],
+                 stages(("1m", "daily"), ("12m", "monthly")), date(2027, 3, 31))
+    check(by_day, "2027-03-01", "stay", 0, "in place")
+    check(by_day, "2027-02-28", "move", 1, "monthly 2027-02")
 
 
 def case_iso_week_53():
