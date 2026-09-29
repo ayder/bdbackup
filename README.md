@@ -114,9 +114,15 @@ Options:
 | `--exclude-pattern` | Glob pattern to exclude (repeatable) |
 | `--exclude-template` | Named exclusion template, e.g. `python-dev` (repeatable, comma-separated allowed) |
 | `--follow-symlinks` | Follow symbolic links when archiving |
+| `--timestamp / --no-timestamp` | Write `<dst>-<UTC YYYY-MM-DD-HHMMSS><ext>` instead of replacing one archive; an existing name is never overwritten (default: off) |
 | `--dry-run` | List what would be archived without writing anything |
 | `--verify / --no-verify` | Verify the archive after creation (default: on) |
 | `--logging` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+Without `--timestamp`, every run replaces the same archive, so only the newest
+run stays restorable. With it, each run writes a new archive such as
+`daily-2026-09-29-020000.tar.gz`, and a run that would reuse an existing name
+fails instead. Config jobs set `timestamp = true`.
 
 Restore a file archive:
 
@@ -318,7 +324,7 @@ Options:
 | `--encrypt-key-file` | Required 32-byte key file when encrypting; also used by `prepare` |
 | `--parallel` | Number of copy threads (default: 1) |
 | `--throttle` | Limit I/O to this many IOPS |
-| `--retention` | Days of backups to keep (default: 5) |
+| `--retention` | Days of backups to keep (default: 5); `0` disables engine deletion |
 | `--verify / --no-verify` | Verify the backup after creation (default: on) |
 
 A process lock prevents two backup runs from corrupting the same backup root.
@@ -525,7 +531,9 @@ For example, schedule a weekly full on Sunday and incrementals on the other days
 
 Pruning after each full deletes whole dated chains older than `retention_days`.
 Set `retention_days` longer than the interval between fulls to preserve the previous
-full's incrementals. History now records configured physical backups as
+full's incrementals. `retention_days = 0` disables engine deletion for the job,
+both the automatic pruning after a full and `bdbackup xtrabackup prune`; use it
+when another tool rotates the backups. History now records configured physical backups as
 `xtrabackup-full` / `xtrabackup-incremental` (previously `xtrabackup`); update filters
 that use the old type. Existing history rows are unchanged.
 
@@ -665,6 +673,36 @@ exception class. Retention, restore operations, and file dry runs are not backup
 attempts and do not create rows. Direct Python backend calls are not automatically
 recorded; applications can wrap them with `History.run`.
 
+Every successful backup also records its unit and a SHA-256 checksum taken right
+after the backup, which costs one extra read of the backup. A file's checksum is
+the SHA-256 of its content. A directory's checksum is the SHA-256 of a manifest
+with one line per regular file, `<sha256>  <relative path>`, sorted by path; a
+symlink or special file inside a physical backup fails the backup. The unit is
+what a rotation tool moves as one piece: the archive or dump file itself, or for
+xtrabackup the dated directory that holds the full and all of its incrementals.
+`bdbackup history` shows it as `unit <path>`, or `unit -` for records without one.
+Reproduce a directory checksum on Linux (use `shasum -a 256` on macOS):
+
+```bash
+cd /backup/mysql/production/2026-09-29/Full_<id> && find . -type f -print0 \
+  | LC_ALL=C sort -z | xargs -0 sha256sum | sed 's|  \./|  |' | sha256sum
+```
+
+Records taken before this release have no checksum. Record them explicitly:
+
+```bash
+bdbackup history checksum --config config.toml
+bdbackup history checksum --config config.toml --job mysql-prod
+```
+
+It prints `<id>: recorded`, `<id>: skipped: unavailable` for an artifact that is
+missing or was replaced, or `<id>: skipped: unexpected unit` for a physical backup
+outside its dated layout, and then exits 1. A checksum already recorded is never
+changed. The checksum lives in the `checksum` column of the `backup_runs` table.
+
+History uses schema version 3. An existing database upgrades on the next write;
+older bdbackup versions refuse a version-3 database.
+
 History is written before work starts, and success only after the backup and its
 requested verification finish. If history cannot be written, the command fails;
 an artifact already created is preserved. A forcibly killed process may leave a
@@ -712,9 +750,9 @@ bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
 
 Deleted artifacts remain in history as unavailable. File identity, size, and
 modification time detect replaced archives, so older rows for a reused filename
-are not offered as older recovery points. These checks are not cryptographic
-integrity checks; restoration still validates the actual archive or physical
-dependency chain. History stores references to artifacts and does not preserve
+are not offered as older recovery points. Availability uses these file checks;
+the recorded checksum is not yet checked by restore, which still validates the
+actual archive or physical dependency chain. History stores references to artifacts and does not preserve
 an archive that a later backup replaces.
 
 ## Development
