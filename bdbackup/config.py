@@ -30,7 +30,7 @@ class ConfigError(Exception):
 
 def supported_types() -> set[str]:
     """Return all valid job types: builtins plus every registered engine name."""
-    return {"file", "retention"} | set(list_engines())
+    return {"file", "retention", "gfs"} | set(list_engines())
 
 
 class Config:
