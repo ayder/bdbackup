@@ -168,7 +168,7 @@ def recommend_cron(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
     # Use all config jobs to keep defaults stable when checking only one job.
     defaults = {}
     for job in config.jobs.values():
-        retention = job.type == "retention"
+        retention = job.type in {"retention", "gfs"}
         minute = (240 if retention else 120) + counters[retention] * 15
         counters[retention] += 1
         defaults[job.name] = f"{minute % 60} {(minute // 60) % 24} * * *"
@@ -183,6 +183,8 @@ def recommend_cron(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
             continue
         if job.type == "retention" and not job.params.get("apply", False):
             lines.append(f"# {label}: dry-run retention (apply = false); no files deleted.")
+        if job.type == "gfs" and not job.params.get("apply", False):
+            lines.append(f"# {label}: dry-run GFS (apply = false); nothing moved or deleted.")
         if job.type == "xtrabackup":
             lines.append(f"# {label}: full backup; includes automatic XtraBackup pruning.")
         try:

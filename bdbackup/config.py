@@ -9,6 +9,7 @@ from typing import Any
 
 from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
+from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job
 from bdbackup.history import HistorySettings
 from bdbackup.scheduling import validate_schedule
 
@@ -78,6 +79,13 @@ class Config:
                     schedule = validate_schedule(schedule)
                 except ValueError as exc:
                     raise ConfigError(f"Job {name!r}: {exc}") from exc
+            if job_type == "gfs":
+                try:
+                    params = parse_gfs_job(section, self.path.parent)
+                except ValueError as exc:
+                    raise ConfigError(f"Job {name!r}: {exc}") from exc
+                self.jobs[name] = Job(name=name, type=job_type, params=params, schedule=schedule)
+                continue
             restore_root = None
             if "restore_root" in section:
                 value = section["restore_root"]
@@ -115,6 +123,12 @@ class Config:
                 name=name, type=job_type, params=params, schedule=schedule,
                 restore_root=restore_root,
             )
+
+        if any(job.type == "gfs" for job in self.jobs.values()):
+            try:
+                check_gfs_config(self.jobs, self.history)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:

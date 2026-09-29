@@ -14,6 +14,7 @@ from pathlib import Path
 from bdbackup import retention
 from bdbackup.config import Config, Job, build_backend
 from bdbackup.filebackup import FileBackup
+from bdbackup.gfs.stages import MARKER
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.mysql.helpers import mysql_cnf_file
 from bdbackup.scheduling import os_user
@@ -310,6 +311,20 @@ def _retention(report: Report, job: Job) -> None:
     report.add("INFO", "Retention settings/access checked; no deletion scan or deletion performed.")
 
 
+def _gfs(report: Report, job: Job) -> None:
+    for stage in job.params["stage"][1:]:
+        for path in stage.paths:
+            if not path.is_dir():
+                report.add("FAIL", f"Stage path {path}: does not exist")
+            elif not _access(path, os.W_OK | os.X_OK):
+                report.add("FAIL", f"Stage path {path}: not writable by OS user {os_user()}")
+            elif not (path / MARKER).is_file():
+                report.add("FAIL", f"Stage path {path}: {MARKER} missing")
+            else:
+                report.add("OK", f"Stage path {path}: writable, marker present")
+    report.add("INFO", "GFS mode: " + ("APPLY" if job.params["apply"] else "DRY RUN"))
+
+
 def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
     report = Report()
     report.lines.append(
@@ -328,6 +343,9 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
                 _directory(report, job.restore_root, "Recovery root", write=True, create=True)
             if job.type == "retention":
                 _retention(report, job)
+                continue
+            if job.type == "gfs":
+                _gfs(report, job)
                 continue
             if job.type not in {"file", "xtrabackup", "mysqldump"}:
                 report.add("FAIL", f"Preflight checks are not implemented for engine {job.type!r}.")
