@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -89,11 +89,14 @@ class _Run:
                               outcome, reason)
 
     def ensure_row(self, unit: store.ManagedUnit) -> store.ManagedUnit:
-        if unit.id is not None or not self.apply:
+        """Record the unit, and the S2 judgment of records first seen in this run."""
+        if not self.apply:
             return unit
-        unit_id = store.record_unit(self.history, unit)
-        return store.ManagedUnit(unit_id, unit.unit, unit.series, unit.relative, unit.kind,
-                                 unit.time, unit.members, unit.locations, unit.size)
+        if unit.id is None:
+            return replace(unit, id=store.record_unit(self.history, unit), seen=())
+        if unit.seen:
+            store.record_members(self.history, unit.id, unit.seen)
+        return replace(unit, seen=())
 
     def refuse(self, unit, current, reason) -> None:
         self.tally.refused += 1
@@ -117,9 +120,8 @@ class _Run:
         self.line("move", unit, _stage_index(self.stages, leftovers[0]), current,
                   "completes an interrupted move")
         self.step(unit, "move", leftovers[0].path, None, "ok", "completes an interrupted move")
-        kept = tuple(loc for loc in unit.locations if loc not in leftovers)
-        return store.ManagedUnit(unit.id, unit.unit, unit.series, unit.relative, unit.kind,
-                                 unit.time, unit.members, kept, unit.size)
+        return replace(unit, locations=tuple(loc for loc in unit.locations
+                                             if loc not in leftovers))
 
     def move(self, unit, current: int, decision: Decision) -> None:
         target = decision.target

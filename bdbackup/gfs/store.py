@@ -3,7 +3,8 @@
 A unit's members are the successful ``backup_runs`` rows that share its ``unit`` path; their
 checksums live only there. ``gfs_units`` names the units GFS manages, ``gfs_locations`` says
 where each copy is and under which configured stage path it was written, and ``gfs_steps``
-records every action, refusal, deferral and hold.
+records every action, refusal, deferral and hold. ``gfs_members`` keeps each record's S2
+judgment: whether it was available when GFS first saw it (spec 2 r7 §4.1).
 """
 
 from __future__ import annotations
@@ -46,16 +47,26 @@ def _has_tables(db) -> bool:
     return _TABLES <= names
 
 
+def _has_members(db) -> bool:
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gfs_members'"
+    ).fetchone() is not None
+
+
 def _read(history: History):
-    """Successful records, unit rows and locations; reading never migrates or writes."""
+    """Successful records, unit rows, locations and S2 judgments.
+
+    Reading never migrates or writes. ``members`` is None on a schema-4 database, where every
+    record of a recorded unit is a member, as the schema 5 backfill makes it.
+    """
     if not history.settings.database.exists():
-        return [], {}, defaultdict(list)
+        return [], {}, defaultdict(list), {}
     with history._connect() as db:
         records = [
             BackupRecord(**dict(row))
             for row in db.execute("SELECT * FROM backup_runs WHERE status='success' ORDER BY id")
         ]
-        units, locations = {}, defaultdict(list)
+        units, locations, members = {}, defaultdict(list), {}
         if _has_tables(db):
             for row in db.execute("SELECT * FROM gfs_units"):
                 units[row["unit"]] = row
@@ -63,29 +74,36 @@ def _read(history: History):
                 locations[row["unit_id"]].append(
                     Location(Path(row["stage_path"]), Path(row["path"]))
                 )
-    return records, units, locations
+            if _has_members(db):
+                members = {row[0]: bool(row[1])
+                           for row in db.execute("SELECT record_id, managed FROM gfs_members")}
+            else:
+                members = None
+    return records, units, locations, members
 
 
 def _local(timestamp: str) -> datetime:
     return datetime.fromisoformat(timestamp).astimezone()
 
 
-def _unit(unit_id, path, series, relative, members, locations) -> ManagedUnit:
+def _unit(unit_id, path, series, relative, members, locations, seen) -> ManagedUnit:
     kind = json.loads(members[0].restore_info).get("kind", "")
     return ManagedUnit(
         id=unit_id, unit=path, series=series, relative=relative, kind=kind,
         time=min(_local(m.completed_at) for m in members),
         members=tuple(members), locations=tuple(locations),
-        size=sum(m.size_bytes or 0 for m in members),
+        size=sum(m.size_bytes or 0 for m in members), seen=tuple(seen),
     )
 
 
 def load(history: History, first_stage: Path) -> tuple[list[ManagedUnit], int]:
     """Return the units this chain manages and the count of unmanaged records.
 
-    A record is seen only if it is available when GFS first sees it (spec 2 r7, S2).
+    A record is managed only if it was available when GFS first saw it (spec 2 r7, S2). The
+    judgment is made once per record and kept in ``gfs_members``; records not judged yet are
+    judged now and returned in ``ManagedUnit.seen`` for the run to store.
     """
-    records, rows, locations = _read(history)
+    records, rows, locations, judged = _read(history)
     by_unit: dict[str, list[BackupRecord]] = defaultdict(list)
     unmanaged = 0
     for record in records:
@@ -94,21 +112,30 @@ def load(history: History, first_stage: Path) -> tuple[list[ManagedUnit], int]:
         elif record.path and Path(record.path).is_relative_to(first_stage):
             unmanaged += 1
     units = []
-    for unit_text, members in by_unit.items():
+    for unit_text, records_of_unit in by_unit.items():
         path = Path(unit_text)
         row = rows.get(unit_text)
-        if row is not None:
-            if row["deleted_at"] is None and path.is_relative_to(first_stage):
-                units.append(_unit(row["id"], path, row["series"], Path(row["relative"]),
-                                   members, locations[row["id"]]))
+        if row is not None and row["deleted_at"] is not None:
             continue
         if not path.is_relative_to(first_stage):
             continue
-        seen = [m for m in members if m.available]
-        unmanaged += len(members) - len(seen)
-        if seen:
-            units.append(_unit(None, path, seen[0].job_name, path.relative_to(first_stage),
-                               seen, [Location(first_stage, path)]))
+        if row is not None and judged is None:
+            seen, members = [], records_of_unit
+        else:
+            known = judged or {}
+            seen = [(m.id, m.available) for m in records_of_unit if m.id not in known]
+            fresh = dict(seen)
+            members = [m for m in records_of_unit
+                       if known.get(m.id, False) or fresh.get(m.id, False)]
+            unmanaged += len(records_of_unit) - len(members)
+        if not members:
+            continue
+        if row is not None:
+            units.append(_unit(row["id"], path, row["series"], Path(row["relative"]),
+                               members, locations[row["id"]], seen))
+        else:
+            units.append(_unit(None, path, members[0].job_name, path.relative_to(first_stage),
+                               members, [Location(first_stage, path)], seen))
     units.sort(key=lambda u: (u.time, str(u.unit)))
     return units, unmanaged
 
@@ -127,12 +154,22 @@ def record_unit(history: History, unit: ManagedUnit) -> int:
             "INSERT INTO gfs_locations (unit_id, stage_path, path) VALUES (?, ?, ?)",
             [(unit_id, str(loc.stage_path), str(loc.path)) for loc in unit.locations],
         )
+        _insert_members(db, unit_id, unit.seen)
     return unit_id
+
+
+def _insert_members(db, unit_id: int, seen: Sequence[tuple[int, bool]]) -> None:
+    db.executemany(
+        "INSERT OR IGNORE INTO gfs_members (record_id, unit_id, managed) VALUES (?, ?, ?)",
+        [(record_id, unit_id, int(available)) for record_id, available in seen],
+    )
 
 
 def record_members(history: History, unit_id: int,
                    seen: Sequence[tuple[int, bool]]) -> None:
     """Store each record's first judgment; a stored judgment is never changed."""
+    with history._connect(create=True) as db:
+        _insert_members(db, unit_id, seen)
 
 
 def record_move(history: History, unit_id: int, new: Sequence[Location],
@@ -167,7 +204,7 @@ def record_step(history: History, gfs_job: str, unit_id: int | None, action: str
 
 def listing_suffixes(history: History) -> dict[str, str]:
     """``unit path -> " | stage … | locations …"`` or ``" | deleted …"`` for the history list."""
-    _, rows, locations = _read(history)
+    _, rows, locations, _ = _read(history)
     suffixes = {}
     for unit_text, row in rows.items():
         if row["deleted_at"] is not None:
