@@ -232,19 +232,22 @@ def test_failed_path_leaves_no_copy(env):
 
 
 def test_checksum_mismatch_refused_until_accepted(env):
-    a = env.file_unit("a.tar.gz", days_ago=7)
-    env.file_unit("b.tar.gz", days_ago=0)
+    # AC9 is about a managed unit: GFS records it first, then the file changes on disk.
+    a = env.file_unit("a.tar.gz", day=date(2026, 9, 25))
+    env.file_unit("b.tar.gz", day=date(2026, 9, 29))
+    code, output = env.run_api(datetime(2026, 9, 29, 12))
+    assert code == 0 and a.exists(), output
     a.write_bytes(b"changed on disk")
-    first = env.run_cli()
-    assert first.exit_code == 1, first.output
-    assert "refused: checksum mismatch" in first.output
+    code, output = env.run_api(datetime(2026, 10, 2, 12))
+    assert code == 1, output
+    assert "refused: checksum mismatch" in output
     assert a.read_bytes() == b"changed on disk"
     assert not stage_files(env, "NFS")
     with closing(sqlite3.connect(env.database)) as db, db:
         db.execute("UPDATE backup_runs SET checksum=? WHERE path=?",
                    (hashlib.sha256(b"changed on disk").hexdigest(), str(a.resolve())))
-    second = env.run_cli()
-    assert second.exit_code == 0, second.output
+    code, output = env.run_api(datetime(2026, 10, 2, 12))
+    assert code == 0, output
     assert (env.root / "NFS/daily/files/a.tar.gz").read_bytes() == b"changed on disk"
 
 
