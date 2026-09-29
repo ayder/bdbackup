@@ -14,6 +14,7 @@ from bdbackup.backends import BackupError
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs import store
 from bdbackup.history import BackupRecord, History
+from bdbackup.ledger import LedgerError, checksum
 from bdbackup.mysql import MySQLBackup, XtraBackup
 
 
@@ -43,36 +44,67 @@ def suggested_destination(record: BackupRecord, root: Path) -> Path:
     return target
 
 
+class _Unverified(BackupError):
+    """This location does not hold the recorded backup; the next one is tried."""
+
+
 def restore_record(
     record: BackupRecord, destination: Path, *, encrypt_key_file: Path | None = None,
     history: History | None = None, on_source: Callable[[Path], None] | None = None,
 ) -> Path:
     """Restore a record; a unit GFS manages is restored from its current location.
 
-    ``on_source`` receives the path restored from, once, before anything is written.
+    Every member used is verified against its ledger checksum first, and the first location
+    that verifies is used (spec 2 §3.3, D7). ``on_source`` receives the path restored from,
+    once, before anything is written.
     """
     known = store.places(history) if history is not None else {}
     if record.id not in known:
         if not record.available:
             raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")
         return _restore(record, Path(record.path), None, destination, encrypt_key_file,
-                        on_source, lambda: record.available)
+                        on_source, lambda: record.available, None)
     if not known[record.id]:
         raise BackupError("Backup is unsuccessful, missing, or has been replaced/modified")
+    unit = Path(record.unit)
+    members = {
+        Path(r.path).relative_to(unit): r.checksum
+        for r in history.records(successful=True) if r.unit == record.unit and r.id in known
+    }
     reasons = []
     for place in known[record.id]:
         if not store.place_available(place):
             reasons.append(f"{place.member}: missing or replaced")
             continue
-        return _restore(record, place.member, place.unit.parent, destination,
-                        encrypt_key_file, on_source, partial(store.place_available, place))
+        try:
+            return _restore(record, place.member, place.unit.parent, destination,
+                            encrypt_key_file, on_source, partial(store.place_available, place),
+                            partial(_verify, place.unit, members))
+        except _Unverified as exc:
+            reasons.append(f"{place.member}: {exc}")
     raise BackupError("No location of this backup verifies: " + "; ".join(reasons))
+
+
+def _verify(at: Path, members: dict[Path, str], sources) -> None:
+    """Each source is a member of the unit at ``at`` whose content matches the ledger."""
+    root = at.resolve()
+    for source in sources:
+        source = Path(source).resolve()
+        relative = source.relative_to(root) if source.is_relative_to(root) else None
+        if relative not in members:
+            raise _Unverified(f"{source} is not a recorded member")
+        try:
+            actual = checksum(source)
+        except (LedgerError, OSError) as exc:
+            raise _Unverified(f"cannot checksum {source}: {exc}") from None
+        if actual != members[relative]:
+            raise _Unverified("checksum mismatch")
 
 
 def _restore(
     record: BackupRecord, source: Path, backup_root: Path | None, destination: Path,
     encrypt_key_file: Path | None, on_source: Callable[[Path], None] | None,
-    still_available: Callable[[], bool],
+    still_available: Callable[[], bool], verify: Callable[[list[Path]], None] | None,
 ) -> Path:
     # Do not resolve the final component: a dangling destination symlink must be rejected.
     destination = destination.expanduser().absolute()
@@ -82,8 +114,6 @@ def _restore(
     kind = info.get("kind")
     if kind not in {"xtrabackup", "file", "mysqldump"}:
         raise BackupError(f"History restore is not supported for engine {record.backup_type!r}")
-    if on_source is not None:
-        on_source(source)
     if kind == "xtrabackup":
         backend = XtraBackup(
             # A moved date directory keeps its siblings' layout, so its parent is the root.
@@ -91,7 +121,21 @@ def _restore(
             encrypt=bool(record.encrypted),
             encrypt_key_file=encrypt_key_file or info.get("encrypt_key_file"),
         )
-        return backend.prepare(source, destination)
+
+        if verify is None and on_source is None:
+            return backend.prepare(source, destination)
+
+        def check(sources):
+            if verify is not None:
+                verify(sources)
+            if on_source is not None:
+                on_source(source)
+
+        return backend.prepare(source, destination, check=check)
+    if verify is not None:
+        verify([source])
+    if on_source is not None:
+        on_source(source)
     destination.mkdir(parents=True, mode=0o700)
     try:
         if kind == "file":
