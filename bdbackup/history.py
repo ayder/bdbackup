@@ -47,6 +47,8 @@ class BackupRecord:
     restore_info: str
     error: str | None
     encrypted: bool = False
+    unit: str | None = None
+    checksum: str | None = None
 
     @property
     def available(self) -> bool:
