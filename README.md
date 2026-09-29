@@ -390,7 +390,11 @@ it. Original backups remain encrypted; the recovery directory contains plaintext
 For manual `xtrabackup prepare`, supply `--encrypt-key-file` as well.
 See [Percona's encryption documentation](https://docs.percona.com/percona-xtrabackup/8.4/encrypt-backups.html).
 
-## Retention policy (GFS)
+## Retention of flat files (`type = "retention"`)
+
+This section handles flat backup files written by other tools. For bdbackup's
+own backups, use `type = "gfs"` (see [Ledger and GFS](#ledger-and-gfs)), which
+moves backups between storage tiers using the history ledger.
 
 The `bdbackup retention` command applies a grandfather-father-son policy to
 a backup tree: keep **every** backup for the last N days, then **one per ISO
@@ -681,6 +685,8 @@ symlink or special file inside a physical backup fails the backup. The unit is
 what a rotation tool moves as one piece: the archive or dump file itself, or for
 xtrabackup the dated directory that holds the full and all of its incrementals.
 `bdbackup history` shows it as `unit <path>`, or `unit -` for records without one.
+For units that GFS manages, the line continues with `| stage <stage path> |
+locations <path>, …`, or `| deleted <time>` once GFS has removed the unit.
 Reproduce a directory checksum on Linux (use `shasum -a 256` on macOS):
 
 ```bash
@@ -754,6 +760,119 @@ are not offered as older recovery points. Availability uses these file checks;
 the recorded checksum is not yet checked by restore, which still validates the
 actual archive or physical dependency chain. History stores references to artifacts and does not preserve
 an archive that a later backup replaces.
+
+## Ledger and GFS
+
+GFS moves bdbackup's own backups through a chain of storage tiers, called stages,
+using only the history ledger: it never guesses from what lies on disk. A typical
+chain keeps everything for 5 days on a fast local disk, everything for 15 more
+days on cheap NFS storage (point-in-time recovery from incrementals), then one
+backup per week, per month and per year.
+
+```toml
+[gfs-main]
+type = "gfs"
+apply = false               # dry run unless true
+# schedule = "0 4 * * *"
+
+[[gfs-main.stage]]
+paths = ["/BACKUP"]         # engines write here
+period = "daily"
+keep = "5d"
+
+[[gfs-main.stage]]
+paths = ["/NFS/daily"]
+period = "daily"
+keep = "20d"                # 5 days hot + 15 days on NFS
+
+[[gfs-main.stage]]
+paths = ["/NFS/weekly"]
+period = "weekly"
+keep = "8w"
+
+[[gfs-main.stage]]
+paths = ["/NFS/monthly"]
+period = "monthly"
+keep = "12m"
+
+[[gfs-main.stage]]
+paths = ["/NFS/yearly", "/DD/yearly"]   # every path receives a copy
+period = "yearly"
+keep = "7y"
+```
+
+Run it with `bdbackup run --config config.toml gfs-main`. `--cron` schedules GFS
+jobs with retention at 04:00, after backups.
+
+**Stages and ages.** `keep` is an age counted from the backup day: `Nd` days,
+`Nw` weeks, `Nm` calendar months, `Ny` years. A backup belongs to the first stage
+whose `keep` it is still within; past the last stage it is deleted. Each `keep`
+must be longer than the previous one on every calendar (a month counts as 28–31
+days), and periods never go backwards along the chain. The first stage has
+exactly one path and is where backup jobs write.
+
+**Periods.** A daily stage keeps every backup. A weekly stage keeps the newest
+backup of each ISO week; a monthly stage, of those, the newest dated in each
+month; a yearly stage, of those, the newest dated in each year. Selection is per
+job, so a tar job and a MySQL job never compete for one slot. A week is decided
+only once it has ended, and a month or year only once the ISO week holding its
+last day has ended, so a choice never changes later; until then the backup is
+reported `held: <bucket> not complete` and stays where it is.
+
+With the configuration above on Tuesday 2026-09-29 and one backup per day:
+
+| Backup | Result | Why |
+|---|---|---|
+| 2026-09-24 | `/NFS/daily` | within 20d |
+| 2026-09-09 | deleted | its week's newest backup is 09-13 |
+| 2026-09-06 (Sun) | `/NFS/weekly` | newest of ISO week 36 |
+| 2026-08-30 (Sun) | `/NFS/weekly` | newest of week 35; also August's monthly backup |
+| 2026-08-02 (Sun) | deleted | newest of its week, not of August |
+| 2026-07-26 (Sun) | `/NFS/monthly` | July's newest weekly backup |
+| 2025-12-28 (Sun) | `/NFS/monthly` | also 2025's yearly backup |
+| 2024-12-29 (Sun) | `/NFS/yearly` | 2024's yearly backup |
+
+**Units and paths.** GFS moves a unit as one piece: an archive or dump file, or
+an xtrabackup dated directory with its full and every incremental (and its
+`Full_Latest` and `.full_success` markers). A unit keeps its path relative to
+the first stage, so `/BACKUP/mysql/prod/2026-09-29` becomes
+`/NFS/daily/mysql/prod/2026-09-29`. The newest unit of each job always stays in
+the first stage, so the next incremental finds its full.
+
+**Safety.** Each later stage path must contain an empty file named
+`.bdbackup-destination`; an unmounted mount point is an empty local directory
+without it, and GFS writes nothing there (`--validate` reports it). GFS copies to
+a temporary name, checks every checksum while reading the source, and removes
+the original only after every copy is in place and recorded; a failed attempt
+removes all of its copies and the next run retries. Copies hold no backup lock,
+so a slow NFS copy never blocks a backup; if an xtrabackup root is locked when
+GFS commits, the unit is reported `deferred: locked` and retried next run. GFS
+only touches backups recorded in the ledger. It refuses, and reports:
+
+- `refused: checksum mismatch`: the backup changed since it was recorded. To
+  accept the change, set the `checksum` column of its `backup_runs` rows to the
+  new value with `sqlite3`; the next run acts on it. A backup that changed
+  before GFS first saw it is never managed.
+- `refused: unexpected entry …`: a unit holds something that is not one of its
+  recorded backups or engine markers, such as a leftover `.tmp` directory.
+- `refused: stage not configured`: the unit lives under a stage no longer in the
+  configuration. Removing a stage never deletes its backups; restore the stage
+  or remove them yourself.
+- `refused: destination not ready …`: a stage path lacks its marker.
+
+Backup jobs writing into the first stage must not delete or overwrite on their
+own: xtrabackup jobs set `retention_days = 0` and file jobs set
+`timestamp = true`. Configuration validation enforces both, rejects stage paths
+that overlap, and keeps the live history database out of stage paths.
+
+`apply = false` (the default) prints what would move or be deleted and changes
+nothing. Exit codes: 0 done, 1 a refusal or failure, 2 configuration error, 3
+another run of the same job is in progress, or the only unfinished units were
+deferred.
+
+Restoring a unit GFS has moved, and copies of the ledger in every stage, arrive
+with the next change of this release; until then restore works for units still
+in the first stage.
 
 ## Development
 
