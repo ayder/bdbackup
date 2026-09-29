@@ -89,7 +89,7 @@ class History:
                 if create:
                     connection.execute("BEGIN IMMEDIATE")
                 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-                if schema not in (0, 1, 2, 3) or (not create and schema == 0):
+                if schema not in (0, 1, 2, 3, 4) or (not create and schema == 0):
                     raise HistoryError(f"Unsupported history schema version: {schema}")
                 if create and schema == 0:
                     connection.execute(
@@ -122,6 +122,39 @@ class History:
                     connection.execute("ALTER TABLE backup_runs ADD COLUMN unit TEXT")
                     connection.execute("ALTER TABLE backup_runs ADD COLUMN checksum TEXT")
                     connection.execute("PRAGMA user_version = 3")
+                if create and schema in (0, 1, 2, 3):
+                    # GFS (spec 2): managed units, where their copies are, and every step.
+                    connection.execute(
+                        """CREATE TABLE gfs_units (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            unit TEXT NOT NULL UNIQUE,
+                            series TEXT NOT NULL,
+                            relative TEXT NOT NULL,
+                            deleted_at TEXT
+                        )"""
+                    )
+                    connection.execute(
+                        """CREATE TABLE gfs_locations (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            unit_id INTEGER NOT NULL REFERENCES gfs_units(id),
+                            stage_path TEXT NOT NULL,
+                            path TEXT NOT NULL UNIQUE
+                        )"""
+                    )
+                    connection.execute(
+                        """CREATE TABLE gfs_steps (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            run_at TEXT NOT NULL,
+                            gfs_job TEXT NOT NULL,
+                            unit_id INTEGER REFERENCES gfs_units(id),
+                            action TEXT NOT NULL,
+                            source TEXT,
+                            destination TEXT,
+                            outcome TEXT NOT NULL,
+                            reason TEXT
+                        )"""
+                    )
+                    connection.execute("PRAGMA user_version = 4")
                 yield connection
         except (OSError, sqlite3.Error) as exc:
             raise HistoryError(f"Cannot access history database {path}: {exc}") from exc
