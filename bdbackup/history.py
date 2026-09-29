@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from bdbackup.backends import BackupError, BackupResult
-from bdbackup.ledger import checksum, unit_path
+from bdbackup.ledger import LedgerError, checksum, unit_path
 
 
 class HistoryError(BackupError):
@@ -173,7 +173,36 @@ class History:
         return result
 
     def record_checksums(self, job: str | None = None) -> list[tuple[int, str]]:
-        return []
+        """Record unit and checksum for successful records that have none, oldest first.
+
+        A checksum already recorded is never changed, even if one is written meanwhile.
+        """
+        with self._connect(create=True) as db:
+            rows = db.execute(
+                """SELECT * FROM backup_runs
+                   WHERE status='success' AND checksum IS NULL AND (? IS NULL OR job_name=?)
+                   ORDER BY id""",
+                (job, job),
+            ).fetchall()
+        outcomes = []
+        for record in (BackupRecord(**dict(row)) for row in rows):
+            if not record.available:
+                outcomes.append((record.id, "skipped: unavailable"))
+                continue
+            path = Path(record.path)
+            try:
+                unit = unit_path(path, json.loads(record.restore_info))
+                digest = checksum(path)
+            except (LedgerError, OSError):
+                outcomes.append((record.id, "skipped: unexpected unit"))
+                continue
+            with self._connect(create=True) as db:
+                db.execute(
+                    "UPDATE backup_runs SET unit=?, checksum=? WHERE id=? AND checksum IS NULL",
+                    (str(unit), digest, record.id),
+                )
+            outcomes.append((record.id, "recorded"))
+        return outcomes
 
     def records(self, *, job: str | None = None, successful: bool = False) -> list[BackupRecord]:
         with self._connect() as db:

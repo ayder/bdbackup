@@ -976,6 +976,20 @@ def history_cmd(
 @click.option("--job", help="Only records of this job.")
 def history_checksum(config_path: Path | None, job: str | None) -> int:
     """Record unit and checksum for older records that have none."""
+    unexpected = []
+
+    def _run():
+        config = _get_config(config_path, required=True)
+        if not config.history:
+            raise click.UsageError("Configure [history] database in the TOML file first")
+        for record_id, outcome in History(config.history).record_checksums(job):
+            click.echo(f"{record_id}: {outcome}")
+            if outcome == "skipped: unexpected unit":
+                unexpected.append(record_id)
+
+    _handle_errors(_run)
+    if unexpected:
+        click.get_current_context().exit(EXIT_BACKUP_FAILED)
     return EXIT_OK
 
 
