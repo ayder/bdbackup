@@ -706,8 +706,8 @@ missing or was replaced, or `<id>: skipped: unexpected unit` for a physical back
 outside its dated layout, and then exits 1. A checksum already recorded is never
 changed. The checksum lives in the `checksum` column of the `backup_runs` table.
 
-History uses schema version 3. An existing database upgrades on the next write;
-older bdbackup versions refuse a version-3 database.
+History uses schema version 5. An existing database upgrades on the next write;
+older bdbackup versions refuse a version-5 database.
 
 History is written before work starts, and success only after the backup and its
 requested verification finish. If history cannot be written, the command fails;
@@ -756,10 +756,12 @@ bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
 
 Deleted artifacts remain in history as unavailable. File identity, size, and
 modification time detect replaced archives, so older rows for a reused filename
-are not offered as older recovery points. Availability uses these file checks;
-the recorded checksum is not yet checked by restore, which still validates the
-actual archive or physical dependency chain. History stores references to artifacts and does not preserve
-an archive that a later backup replaces.
+are not offered as older recovery points. Availability uses these file checks.
+Restore checks the recorded checksum of every file it uses for backups that GFS
+manages (see [Ledger and GFS](#ledger-and-gfs)); for other backups it
+validates the actual archive or physical dependency chain. History stores
+references to artifacts and does not preserve an archive that a later backup
+replaces.
 
 ## Ledger and GFS
 
@@ -870,9 +872,31 @@ nothing. Exit codes: 0 done, 1 a refusal or failure, 2 configuration error, 3
 another run of the same job is in progress, or the only unfinished units were
 deferred.
 
-Restoring a unit GFS has moved, and copies of the ledger in every stage, arrive
-with the next change of this release; until then restore works for units still
-in the first stage.
+**Unmanaged backups.** A backup that was unavailable when GFS first saw it (for
+example an older run of a file job without `timestamp`, whose archive a later
+run replaced) stays unmanaged on every later run: GFS never moves or deletes it,
+and the report counts it in `unmanaged`.
+
+**Report.** Each run lists every unit it acted on, held, deferred or refused,
+then a `Summary:` line with counts and bytes per action. One line per stage
+follows, such as `Stage /NFS/daily: 15 units (3200000000 bytes)`, counting where
+the units are when the run ends (where they would be, in a dry run), and then
+the ledger copies written.
+
+**Restoring moved backups.** `bdbackup restore` and `bdbackup history` find a
+backup where GFS put it. `history` shows a copy that was removed or replaced as
+`unavailable`. Before restoring, every backup file used is checked against its
+ledger checksum; with several paths in a stage, the first path that verifies is
+used, and the `Backup:` line names it. An xtrabackup chain is prepared from the
+stage directory holding it, which keeps the layout of the first stage.
+
+**Ledger copies.** After every applying run, each path of every stage after the
+first holds `<gfs job>.ledger.sqlite3`, a consistent copy of the whole history
+database, written under a temporary name and renamed into place. A path without
+its marker gets none, and the run exits 1. To restore with only a stage left,
+copy that file somewhere outside the stages, point `[history] database` at the
+copy, and run `bdbackup restore`. Paths in the ledger are absolute, so the
+stages must be mounted at the same paths as when the copy was written.
 
 ## Development
 
