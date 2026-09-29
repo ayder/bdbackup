@@ -6,11 +6,14 @@ the directory it leaves and the one it enters, and a busy lock defers the unit (
 
 from __future__ import annotations
 
+import os
+import sqlite3
 from collections.abc import Callable
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from bdbackup.config import Config, Job
 from bdbackup.gfs import store
@@ -42,6 +45,7 @@ class _Tally:
     refused: int = 0
     failed: int = 0
     lines: list[str] = field(default_factory=list)
+    snapshots: list[str] = field(default_factory=list)
 
 
 class _Deferred(Exception):
@@ -84,6 +88,8 @@ class _Run:
         self.out = out
         self.transport = transport
         self.tally = _Tally()
+        # Unit path -> (stage index or None once deleted, size) when the run ends (§4.6).
+        self.where: dict[str, tuple[int | None, int]] = {}
 
     def label(self, index: int | None) -> str:
         return str(self.stages[index].paths[0]) if index is not None else "-"
@@ -194,8 +200,10 @@ class _Run:
         try:
             if decision.action == "move":
                 self.move(unit, current, decision)
+                self.where[str(unit.unit)] = (decision.target, unit.size)
             elif decision.action == "delete":
                 self.delete(unit, current, decision)
+                self.where[str(unit.unit)] = (None, unit.size)
             elif decision.action == "hold":
                 self.tally.held += 1
                 self.line("hold", unit, current, None, decision.reason)
@@ -222,6 +230,7 @@ class _Run:
                 self.refuse(self.ensure_row(unit), None, "stage not configured")
                 continue
             current = max(indexes)
+            self.where[str(unit.unit)] = (current, unit.size)
             leftovers = [loc for loc, i in zip(unit.locations, indexes, strict=True)
                          if i < current]
             if leftovers:
@@ -242,10 +251,60 @@ class _Run:
         for decision in sorted(decisions, key=lambda d: (d.unit.day, str(d.unit.id))):
             unit, current = placed[decision.unit.id]
             self.act(unit, current, decision)
+        if self.apply:
+            self.snapshot()
         self.report(unmanaged)
         if self.tally.failed or self.tally.refused:
             return 1
         return 3 if self.tally.deferred else 0
+
+    def snapshot_failed(self, path: Path, reason) -> None:
+        self.tally.failed += 1
+        self.tally.snapshots.append(f"failed snapshot {path}: {reason}")
+
+    def snapshot(self) -> None:
+        """Copy the whole ledger to every later stage path, whatever the actions' outcome.
+
+        One consistent copy is made locally with SQLite's online backup and then copied to
+        each path under a temporary name, fsynced and renamed, so SQLite never writes on a
+        stage and every path receives the same bytes (spec 2 §4.3, D18).
+        """
+        live = self.history.settings.database
+        if not live.exists():
+            self.tally.snapshots.append("no ledger to snapshot")
+            return
+        local = Path(f"{live}.gfs-{self.job.name}.snapshot")
+        local.unlink(missing_ok=True)  # a leftover of an interrupted run; the job lock is held
+        os.close(os.open(local, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        try:
+            with (
+                closing(sqlite3.connect(f"{live.as_uri()}?mode=ro", uri=True)) as source,
+                closing(sqlite3.connect(local)) as target,
+            ):
+                source.backup(target)
+            fd = os.open(local, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            name = snapshot_name(self.job)
+            for stage in self.stages[1:]:
+                for path in stage.paths:
+                    if not (path / MARKER).is_file():
+                        self.snapshot_failed(path, "destination not ready")
+                        continue
+                    temp = path / f".gfs-tmp-{uuid4().hex}-{name}"
+                    try:
+                        self.transport.copy(local, temp, lambda _name, _digest: None)
+                        self.transport.replace(temp, path / name)
+                    except Exception as exc:  # reported; the next run writes it again
+                        if self.transport.exists(temp):
+                            self.transport.remove(temp)
+                        self.snapshot_failed(path, exc)
+                    else:
+                        self.tally.snapshots.append(f"snapshot {path / name}")
+        finally:
+            local.unlink(missing_ok=True)
 
     def report(self, unmanaged: int) -> None:
         mode = "APPLY" if self.apply else "DRY RUN"
@@ -258,6 +317,12 @@ class _Run:
             f"({t.deleted_bytes} bytes), held {t.held}, deferred {t.deferred}, "
             f"refused {t.refused}, failed {t.failed}, unmanaged {unmanaged}"
         )
+        for index, stage in enumerate(self.stages):
+            sizes = [size for at, size in self.where.values() if at == index]
+            units = "unit" if len(sizes) == 1 else "units"
+            self.out(f"Stage {stage.paths[0]}: {len(sizes)} {units} ({sum(sizes)} bytes)")
+        for line in t.snapshots:
+            self.out(line)
 
 
 def run_job(config: Config, job: Job, *, now: datetime | None = None,
