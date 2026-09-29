@@ -185,6 +185,12 @@ def _handle_errors(func, *args, **kwargs) -> int:
     help="Follow symbolic links when archiving directories.",
 )
 @click.option(
+    "--timestamp/--no-timestamp",
+    default=False,
+    show_default=True,
+    help="Write <dst>-<UTC stamp><ext> instead of replacing one archive.",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="List what would be archived without writing anything.",
@@ -205,6 +211,7 @@ def file(
     exclude_pattern: tuple[str, ...],
     exclude_templates: tuple[str, ...],
     follow_symlinks: bool,
+    timestamp: bool,
     dry_run: bool,
     verify: bool,
 ) -> int:

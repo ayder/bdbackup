@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from bdbackup.backends import BackupError, BackupResult
 from bdbackup.templates import build_matcher, resolve_patterns
-from bdbackup.utils import process_lock
+from bdbackup.utils import process_lock, today_stamp
 
 
 class FileBackup:
@@ -36,6 +36,7 @@ class FileBackup:
         exclude_pattern: Iterable[str] | None = None,
         exclude_templates: Iterable[str] | None = None,
         follow_symlinks: bool = False,
+        timestamp: bool = False,
     ):
         self.chdir = Path(chdir).expanduser().absolute() if chdir else None
         self.template_filename = Path(template_filename).expanduser() if template_filename else None
@@ -68,6 +69,10 @@ class FileBackup:
             raise IsADirectoryError(f"backup_dst must be a file path: {self.backup_dst}")
         if self.template_filename:
             self.load_template(self.template_filename)
+
+    @staticmethod
+    def _stamp() -> str:
+        return today_stamp()
 
     def load_template(self, template: str | Path) -> list[Path]:
         template = Path(template).expanduser()
