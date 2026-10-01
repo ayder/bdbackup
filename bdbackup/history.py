@@ -162,14 +162,13 @@ class History:
                     connection.execute(
                         """CREATE TABLE gfs_members (
                             record_id INTEGER PRIMARY KEY REFERENCES backup_runs(id),
-                            unit_id INTEGER NOT NULL REFERENCES gfs_units(id),
                             managed INTEGER NOT NULL CHECK(managed IN (0, 1))
                         )"""
                     )
                     # Units recorded before this table managed every record of the unit.
                     connection.execute(
-                        """INSERT INTO gfs_members (record_id, unit_id, managed)
-                           SELECT backup_runs.id, gfs_units.id, 1 FROM backup_runs
+                        """INSERT INTO gfs_members (record_id, managed)
+                           SELECT backup_runs.id, 1 FROM backup_runs
                            JOIN gfs_units ON gfs_units.unit = backup_runs.unit
                            WHERE backup_runs.status = 'success'"""
                     )

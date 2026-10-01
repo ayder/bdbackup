@@ -109,14 +109,10 @@ class _Run:
                               outcome, reason)
 
     def ensure_row(self, unit: store.ManagedUnit) -> store.ManagedUnit:
-        """Record the unit, and the S2 judgment of records first seen in this run."""
-        if not self.apply:
+        """Record the unit the first time a run acts on it."""
+        if not self.apply or unit.id is not None:
             return unit
-        if unit.id is None:
-            return replace(unit, id=store.record_unit(self.history, unit), seen=())
-        if unit.seen:
-            store.record_members(self.history, unit.id, unit.seen)
-        return replace(unit, seen=())
+        return replace(unit, id=store.record_unit(self.history, unit))
 
     def refuse(self, unit, current, reason) -> None:
         self.tally.refused += 1
@@ -227,8 +223,11 @@ class _Run:
             self.step(unit, decision.action, None, None, "failed", type(exc).__name__)
 
     def run(self) -> int:
-        units, unmanaged = store.load(self.history, self.stages[0].paths[0],
-                                      {path for stage in self.stages for path in stage.paths})
+        units, unmanaged, judgments = store.load(
+            self.history, self.stages[0].paths[0],
+            {path for stage in self.stages for path in stage.paths})
+        if self.apply and judgments:  # S2 is judged once, whatever happens to the unit next
+            store.record_members(self.history, judgments)
         placed: dict[str, tuple[store.ManagedUnit, int]] = {}
         for unit in units:
             indexes = [_stage_index(self.stages, loc) for loc in unit.locations]

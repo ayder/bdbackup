@@ -98,6 +98,6 @@ def test_schema_4_database_upgrades_to_5(tmp_path):
         location = db.execute(
             "SELECT unit_id, stage_path, path, identities FROM gfs_locations"
         ).fetchall()
-        members = db.execute("SELECT record_id, unit_id, managed FROM gfs_members").fetchall()
+        members = db.execute("SELECT record_id, managed FROM gfs_members").fetchall()
     assert location == [(unit_id, str(tmp_path), str(old), None)]
-    assert members == [(record_id, unit_id, 1)]
+    assert members == [(record_id, 1)]
