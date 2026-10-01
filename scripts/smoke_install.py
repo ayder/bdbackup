@@ -42,26 +42,16 @@ def main(dist: str) -> None:
         if run([str(cli), "--version"]).stdout.strip() != f"bdbackup, version {expected_version}":
             raise RuntimeError("CLI version does not match pyproject.toml")
         run([str(cli), "--help"])
-        run([str(python), "-c", "import bdbackup.dboperations"])
         (work / "source").mkdir()
         (work / "source/data").write_text("recovery check")
         (work / "paths").write_text("data\n")
-        run(
-            [
-                str(cli),
-                "file",
-                "--template",
-                "paths",
-                "-c",
-                "source",
-                "-d",
-                "backup",
-                "--format",
-                "tar.gz",
-            ]
+        (work / "direct.toml").write_text(
+            '[direct]\ntype="file"\ntemplate_filename="paths"\n'
+            'chdir="source"\nbackup_dst="backup"\nformat="tar.gz"\n'
         )
+        run([str(cli), "run", "-c", "direct.toml", "-j", "direct"])
         (work / "restore").mkdir()
-        run([str(cli), "restore", "backup.tar.gz", "-d", "restore"])
+        run([str(cli), "restore", "--archive", "backup.tar.gz", "-d", "restore"])
         if (work / "restore/data").read_text() != "recovery check":
             raise RuntimeError("Installed wheel failed backup/restore round trip")
         (work / "config.toml").write_text(
@@ -69,30 +59,16 @@ def main(dist: str) -> None:
             '[daily]\ntype="file"\ntemplate_filename="paths"\n'
             'chdir="source"\nbackup_dst="tracked"\nformat="tar.gz"\n'
         )
-        run([str(cli), "run", "--config", "config.toml", "daily"])
-        listing = run([str(cli), "history", "--config", "config.toml"])
+        run([str(cli), "run", "-c", "config.toml", "-j", "daily"])
+        listing = run([str(cli), "history", "-c", "config.toml"])
         if "success | available" not in listing.stdout:
             raise RuntimeError("Installed wheel did not persist successful backup history")
-        run([str(cli), "restore", "--config", "config.toml", "--backup-id", "1", "--yes"])
+        run([str(cli), "restore", "-c", "config.toml", "--backup-id", "1", "--yes"])
         if (work / "recovery/daily-1/data").read_text() != "recovery check":
             raise RuntimeError("Installed wheel failed history-based recovery")
         previous = (work / "backup.tar.gz").read_bytes()
         (work / "paths").write_text("missing\n")
-        run(
-            [
-                str(cli),
-                "file",
-                "--template",
-                "paths",
-                "-c",
-                "source",
-                "-d",
-                "backup",
-                "--format",
-                "tar.gz",
-            ],
-            expected=1,
-        )
+        run([str(cli), "run", "-c", "direct.toml", "-j", "direct"], expected=1)
         if (work / "backup.tar.gz").read_bytes() != previous:
             raise RuntimeError("Failed backup replaced the good archive")
     print("Installed wheel: imports, CLI, recovery, history and failed replacement passed")

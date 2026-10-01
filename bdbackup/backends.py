@@ -14,7 +14,6 @@ class BackupResult:
 
     path: Path
     size_bytes: int = 0
-    duration_seconds: float = 0.0
     success: bool = False
 
 

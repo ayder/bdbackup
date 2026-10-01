@@ -78,7 +78,7 @@ def move_and_restore_tip(work, history, xb, info, tip_path):
     cfg.write_text(
         f"[history]\ndatabase = {json.dumps(str(work / 'history.sqlite3'))}\n"
         f"restore_root = {json.dumps(str(work / 'restores'))}\n"
-        '[gfs-main]\ntype = "gfs"\napply = true\n'
+        '[gfs-main]\ntype = "gfs"\n'
         f"[[gfs-main.stage]]\npaths = [{json.dumps(str(work / 'backups'))}]\n"
         'period = "daily"\nkeep = "5d"\n'
         f"[[gfs-main.stage]]\npaths = [{json.dumps(str(cold))}]\n"
@@ -266,7 +266,16 @@ def main(engine="percona"):
                 print("Ledger unit and checksum verified for full and two incrementals",
                       flush=True)
                 full_copy = xb.prepare(full.path, work / "full-recovery")
-                chain_copy = xb.prepare(tip.path, work / "chain-recovery")
+                chain_copy = work / "chain-recovery"
+                args = ["restore", "--backup", str(tip.path), "--root", str(xb.backup_root),
+                        "-d", str(chain_copy), "--binary", binary]
+                if encrypted:
+                    args += ["--encrypt-key-file", str(key_file)]
+                result = CliRunner().invoke(cli, args)
+                if result.exit_code:
+                    raise RuntimeError(f"restore --backup exited {result.exit_code}: "
+                                       f"{result.output} {result.exception!r}")
+                print("Physical restore through restore --backup prepared the chain", flush=True)
                 print("Full and incremental recovery copies prepared", flush=True)
                 moved_copy = move_and_restore_tip(work, history, xb, info, tip.path)
             recoveries = [(full_copy, "1"), (chain_copy, "1,2,3"), (moved_copy, "1,2,3")]

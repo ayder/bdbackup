@@ -79,10 +79,11 @@ def _identities(unit: store.ManagedUnit, at: Path) -> dict[int, str]:
 
 
 class _Run:
-    def __init__(self, config: Config, job: Job, today, out, transport: Transport):
+    def __init__(self, config: Config, job: Job, today, out, transport: Transport,
+                 dry_run: bool):
         self.job = job
         self.stages: tuple[Stage, ...] = job.params["stage"]
-        self.apply: bool = job.params["apply"]
+        self.apply = not dry_run
         self.history = History(config.history)
         self.today = today
         self.out = out
@@ -387,12 +388,16 @@ class _Run:
 
 
 def run_job(config: Config, job: Job, *, now: datetime | None = None,
-            out: Callable[[str], None] = print, transport: Transport | None = None) -> int:
-    """Run one gfs job; return 0, 1 (a failure or refusal) or 3 (locked or deferred only)."""
+            out: Callable[[str], None] = print, transport: Transport | None = None,
+            dry_run: bool = False) -> int:
+    """Run one gfs job; return 0, 1 (a failure or refusal) or 3 (locked or deferred only).
+
+    A dry run reports what would change and changes nothing.
+    """
     today = (now or datetime.now()).date()
     try:
         with process_lock(job_lock_path(config, job.name)):
-            return _Run(config, job, today, out, transport or LocalTransport()).run()
+            return _Run(config, job, today, out, transport or LocalTransport(), dry_run).run()
     except BlockingIOError:
         out(f"another run of {job.name} is in progress")
         return 3

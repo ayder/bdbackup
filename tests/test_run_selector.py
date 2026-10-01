@@ -41,8 +41,8 @@ def recording_runner(physical_runner, monkeypatch):
     return commands, defaults
 
 
-def invoke(config, *args):
-    return CliRunner().invoke(main, ["--config", str(config), "run", *args])
+def invoke(config, job, *flags):
+    return CliRunner().invoke(main, ["run", "-c", str(config), "-j", job, *flags])
 
 
 def records(config):
@@ -116,8 +116,7 @@ def test_run_full_flag_and_default_take_full(xb_config, recording_runner):
 @pytest.mark.parametrize("args,message", [
     (("mysql-prod", "--full", "--incremental"), "Choose --full or --incremental, not both"),
     (("files", "--incremental"), "--incremental applies only to xtrabackup jobs: files"),
-    (("--all", "--incremental"), "--incremental applies only to xtrabackup jobs: files"),
-], ids=["both-flags", "file", "all"])
+], ids=["both-flags", "file"])
 def test_run_selector_usage_errors(xb_config, args, message):
     with (
         patch("bdbackup.mysql.XtraBackup.full_backup") as full,

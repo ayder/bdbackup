@@ -1,4 +1,4 @@
-"""Configuration preflight and cron suggestions never execute configured jobs."""
+"""Configuration preflight never executes configured jobs."""
 
 import subprocess
 from pathlib import Path
@@ -8,8 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from bdbackup.cli import main
-from bdbackup.config import Config, ConfigError, build_backend
-from bdbackup.scheduling import _command, _scheduled_jobs, recommend_cron
+from bdbackup.config import Config
 from bdbackup.validation import _has_grant, validate_config
 
 
@@ -20,12 +19,13 @@ def config_path(tmp_path):
         '[history]\ndatabase="state/history.db"\n'
         '[mysql-prod]\ntype="xtrabackup"\nbackup_root="backups"\n'
         'user="xtrabackup_user"\npassword="private-password"\n'
-        'schedule="30 1 * * *"\n'
-        '[cleanup]\ntype="retention"\nfull_dir="flat/full"\napply=false\n'
     )
     (tmp_path / "data").mkdir()
-    (tmp_path / "flat/full").mkdir(parents=True)
     return path
+
+
+def validate(config_path, *args):
+    return CliRunner().invoke(main, ["run", "-c", str(config_path), "--validate", *args])
 
 
 @pytest.fixture
@@ -36,8 +36,6 @@ def mysql_client(tmp_path, monkeypatch):
 
     def run(args, **kwargs):
         calls.append(args)
-        if args[-1] == "-l":
-            return subprocess.CompletedProcess(args, 1, "", "no crontab for testuser")
         assert args[1].startswith("--defaults-extra-file=")
         defaults = Path(args[1].split("=", 1)[1])
         credentials.append(defaults)
@@ -60,22 +58,11 @@ def mysql_client(tmp_path, monkeypatch):
     return calls, credentials
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["--validate"],
-        ["run", "--validate"],
-        ["run", "mysql-prod", "--validate"],
-        ["run", "--all", "--validate"],
-    ],
-)
+@pytest.mark.parametrize("args", [[], ["-j", "mysql-prod"]], ids=["all", "one-job"])
 def test_validate_is_read_only_and_checks_mysql(config_path, mysql_client, args):
     before = set(config_path.parent.rglob("*"))
-    with (
-        patch("bdbackup.mysql.XtraBackup.full_backup") as backup,
-        patch("bdbackup.retention.run_job", autospec=True) as prune,
-    ):
-        result = CliRunner().invoke(main, ["--config", str(config_path), *args])
+    with patch("bdbackup.mysql.XtraBackup.full_backup") as backup:
+        result = validate(config_path, *args)
     assert result.exit_code == 0, result.output
     assert "Validation passed" in result.output
     assert "Required direct MySQL grants are present" in result.output
@@ -83,7 +70,6 @@ def test_validate_is_read_only_and_checks_mysql(config_path, mysql_client, args)
     assert "private-password" not in result.output
     assert "mkdir -p" in result.output
     backup.assert_not_called()
-    prune.assert_not_called()
     assert set(config_path.parent.rglob("*")) == before
     calls, credentials = mysql_client
     assert len(calls) == 1
@@ -99,7 +85,7 @@ def test_missing_grants_prints_sql_for_actual_mysql_account(config_path, mysql_c
         "",
     )
     with patch("subprocess.run", return_value=response):
-        result = CliRunner().invoke(main, ["run", "--config", str(config_path), "--validate"])
+        result = validate(config_path)
     assert result.exit_code == 1
     assert (
         "GRANT RELOAD, BACKUP_ADMIN, REPLICATION CLIENT, PROCESS, LOCK TABLES ON *.*"
@@ -166,27 +152,14 @@ def test_invalid_settings_do_not_run_mysql_or_backup(config_path, mysql_client, 
     if setting.startswith("user="):
         content = content.replace('user="xtrabackup_user"', setting)
     else:
-        content = content.replace("[cleanup]", setting + "\n[cleanup]")
+        content += setting + "\n"
     config_path.write_text(content)
-    result = CliRunner().invoke(main, ["--config", str(config_path), "--validate"])
+    result = validate(config_path)
     assert result.exit_code == 1
     assert "[FAIL]" in result.output
     assert not mysql_client[0]
     assert not (config_path.parent / "backups").exists()
 
-
-def test_retention_apply_validation_does_not_delete(config_path):
-    config_path.write_text(config_path.read_text().replace("apply=false", "apply=true"))
-    backup = config_path.parent / "flat/full/old-full.sql.gz"
-    backup.write_bytes(b"must survive")
-    with patch("bdbackup.retention.run_job", autospec=True) as run:
-        result = CliRunner().invoke(
-            main, ["run", "--config", str(config_path), "cleanup", "--validate"]
-        )
-    assert result.exit_code == 0, result.output
-    assert "Retention mode: APPLY" in result.output
-    assert backup.read_bytes() == b"must survive"
-    run.assert_not_called()
 
 
 def test_file_validation_checks_template_and_sources_without_archive(tmp_path):
@@ -196,140 +169,14 @@ def test_file_validation_checks_template_and_sources_without_archive(tmp_path):
     )
     (tmp_path / "paths").write_text("source.txt\n")
     (tmp_path / "source.txt").write_text("keep me")
-    result = CliRunner().invoke(main, ["--config", str(config), "--validate"])
+    result = validate(config)
     assert result.exit_code == 0, result.output
     assert not (tmp_path / "backup.tar").exists()
     (tmp_path / "source.txt").unlink()
-    result = CliRunner().invoke(main, ["--config", str(config), "--validate"])
+    result = validate(config)
     assert result.exit_code == 1
 
 
-def test_schedule_is_metadata_not_a_backend_parameter(config_path):
-    config = Config(config_path)
-    job = config.get("mysql-prod")
-    assert job.schedule == "30 1 * * *"
-    assert "schedule" not in job.params
-    assert build_backend(job).user == "xtrabackup_user"
-
-
-@pytest.mark.parametrize(
-    "schedule",
-    [
-        "60 2 * * *",
-        "0 24 * * *",
-        "* * * *",
-        "0 0 0 * *",
-        "*/0 * * * *",
-        "0 0 * * 7-1",
-        "0 0 * * *;whoami",
-        12,
-    ],
-)
-def test_invalid_schedules_rejected(config_path, schedule):
-    text = f'"{schedule}"' if isinstance(schedule, str) else str(schedule)
-    config_path.write_text(config_path.read_text().replace('"30 1 * * *"', text))
-    with pytest.raises(ConfigError, match="cron|schedule|Cron"):
-        Config(config_path)
-
-
-def test_cron_defaults_overrides_and_no_mutations(config_path, mysql_client):
-    before = set(config_path.parent.rglob("*"))
-    with patch("bdbackup.mysql.XtraBackup.full_backup") as backup:
-        result = CliRunner().invoke(main, ["--config", str(config_path), "--cron"])
-    assert result.exit_code == 0, result.output
-    assert "30 1 * * * cd " in result.output
-    assert "0 4 * * * cd " in result.output
-    assert "dry-run retention" in result.output
-    assert "automatic XtraBackup pruning" in result.output
-    assert "private-password" not in result.output
-    assert mysql_client[0] == [["/usr/bin/crontab", "-l"]]
-    backup.assert_not_called()
-    assert set(config_path.parent.rglob("*")) == before
-
-
-def test_cron_backup_default_and_job_selection_are_stable(config_path, mysql_client):
-    config_path.write_text(
-        config_path.read_text().replace('schedule="30 1 * * *"\n', "")
-        + '[second]\ntype="xtrabackup"\nbackup_root="second"\n'
-    )
-    config = Config(config_path)
-    lines, ok = recommend_cron(config, [config.get("second")])
-    assert ok
-    assert any(line.startswith("15 2 * * * ") for line in lines)
-
-
-@pytest.mark.parametrize("style", ["generated", "global_config", "all", "different_schedule"])
-def test_existing_cron_jobs_are_not_duplicated(config_path, mysql_client, style):
-    config = Config(config_path)
-    job = config.get("mysql-prod")
-    if style == "generated":
-        command = _command(config, job)
-    elif style == "global_config":
-        command = f"/usr/bin/bdbackup --config {config.path} run mysql-prod"
-    elif style == "all":
-        command = f"bdbackup run --config {config.path} --all"
-    else:
-        command = f"bdbackup run --config={config.path} mysql-prod"
-    with patch(
-        "subprocess.run",
-        return_value=subprocess.CompletedProcess([], 0, f"5 9 * * * {command}\n", ""),
-    ):
-        lines, ok = recommend_cron(config, [job])
-    assert ok
-    assert any("already scheduled at 5 9 * * *" in line for line in lines)
-    assert not any(line.startswith("30 1 * * * ") for line in lines)
-
-
-def test_cron_matching_ignores_comments_other_configs_and_echo(config_path, mysql_client):
-    config = Config(config_path)
-    command = _command(config, config.get("mysql-prod"))
-    crontab = (
-        f"# 0 2 * * * {command}\n"
-        f"0 2 * * * echo {command}\n"
-        "0 2 * * * bdbackup run --config /different.toml mysql-prod\n"
-        f"0 2 * * * bdbackup run --config {config.path} mysql-prod --validate\n"
-    )
-    assert not _scheduled_jobs(crontab, config)
-
-
-@pytest.mark.parametrize("failure", ["denied", "timeout", "missing"])
-def test_cron_read_failures_are_not_reported_as_empty(config_path, mysql_client, failure):
-    config = Config(config_path)
-    with patch("subprocess.run") as run:
-        if failure == "denied":
-            run.return_value = subprocess.CompletedProcess([], 1, "", "access denied")
-        elif failure == "timeout":
-            run.side_effect = subprocess.TimeoutExpired("crontab", 10)
-        else:
-            with patch("shutil.which", return_value=None):
-                lines, ok = recommend_cron(config, list(config.jobs.values()))
-        if failure != "missing":
-            lines, ok = recommend_cron(config, list(config.jobs.values()))
-    assert not ok
-    assert "[FAIL]" in "\n".join(lines)
-    assert any(line.startswith("30 1 * * * ") for line in lines)
-
-
-def test_cron_quotes_shell_metacharacters_and_percent(tmp_path, mysql_client):
-    config_file = tmp_path / "space % $(touch sentinel).toml"
-    config_file.write_text('["job % ; $(touch sentinel)"]\ntype="xtrabackup"\nbackup_root="backup"')
-    config = Config(config_file)
-    (job,) = config.jobs.values()
-    command = _command(config, job)
-    assert r"\%" in command
-    assert "'job" in command
-    assert _scheduled_jobs("0 2 * * * " + command, config) == {job.name: ["0 2 * * *"]}
-    assert not (tmp_path / "sentinel").exists()
-
-
-def test_combined_helpers_and_usage_guards(config_path, mysql_client):
-    result = CliRunner().invoke(main, ["run", "--config", str(config_path), "--validate", "--cron"])
-    assert result.exit_code == 0, result.output
-    assert "Validation passed" in result.output and "Suggested user crontab" in result.output
-    assert CliRunner().invoke(main, ["--validate"]).exit_code == 2
-    assert (
-        CliRunner().invoke(main, ["--config", str(config_path), "--validate", "run"]).exit_code == 2
-    )
 
 
 def test_mariadb_grants_use_binlog_monitor(config_path, mysql_client):
@@ -346,7 +193,7 @@ def test_mariadb_grants_use_binlog_monitor(config_path, mysql_client):
         "",
     )
     with patch("subprocess.run", return_value=response):
-        result = CliRunner().invoke(main, ["--config", str(config_path), "--validate"])
+        result = validate(config_path)
     assert result.exit_code == 1
     assert "GRANT RELOAD, BINLOG MONITOR, PROCESS, LOCK TABLES" in result.output
     assert "BACKUP_ADMIN" not in result.output
@@ -368,7 +215,7 @@ def test_mysqldump_scoped_grants(config_path, mysql_client):
         "",
     )
     with patch("subprocess.run", return_value=response):
-        result = CliRunner().invoke(main, ["--config", str(config_path), "--validate"])
+        result = validate(config_path)
     assert result.exit_code == 0, result.output
     assert "Required direct MySQL grants are present" in result.output
     assert "BACKUP_ADMIN" not in result.output
@@ -376,12 +223,9 @@ def test_mysqldump_scoped_grants(config_path, mysql_client):
 
 def test_encryption_validation_reports_missing_key_without_history_write(config_path, mysql_client):
     config_path.write_text(
-        config_path.read_text().replace(
-            "[cleanup]",
-            'encrypt=true\nencrypt_key_file="missing.key"\n[cleanup]',
-        )
+        config_path.read_text() + 'encrypt=true\nencrypt_key_file="missing.key"\n'
     )
-    result = CliRunner().invoke(main, ["--config", str(config_path), "--validate"])
+    result = validate(config_path)
     assert result.exit_code == 1
     assert "Cannot read encryption key file" in result.output
     assert not (config_path.parent / "state").exists()
@@ -398,19 +242,10 @@ def test_partial_revokes_never_claim_effective_access(config_path, mysql_client)
         "",
     )
     with patch("subprocess.run", return_value=response):
-        result = CliRunner().invoke(main, ["--config", str(config_path), "--validate"])
+        result = validate(config_path)
     assert result.exit_code == 1
     assert "Partial revokes require manual privilege review" in result.output
 
-
-def test_selector_does_not_change_validate_or_cron(config_path, mysql_client):
-    runner = CliRunner()
-    for mode in ("--validate", "--cron"):
-        args = ["--config", str(config_path), "run", mode]
-        default = runner.invoke(main, args)
-        incremental = runner.invoke(main, [*args, "--incremental"])
-        assert default.exit_code == incremental.exit_code == 0
-        assert default.output == incremental.output
 
 
 @pytest.mark.parametrize("creatable", [True, False], ids=["creatable", "blocked"])
@@ -428,7 +263,7 @@ def test_validate_reports_job_restore_root(tmp_path, creatable):
         'chdir="."\nbackup_dst="backup.tar"\n'
         f'restore_root="{root}"\n'
     )
-    result = CliRunner().invoke(main, ["--config", str(config), "run", "--validate", "files"])
+    result = validate(config, "-j", "files")
     section = result.output.split("Job 'files' (file)", 1)[1]
     status = "OK" if creatable else "FAIL"
     assert f"[{status}] Recovery root: {root.resolve()}" in section

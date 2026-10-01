@@ -77,7 +77,7 @@ def test_encrypted_config_history_and_relocated_key_restore(tmp_path, key_file, 
     assert Config(config).get("mysql-prod").params["encrypt_key_file"] == key_file
     runner, commands = encrypted_runner
     with patch("subprocess.run", side_effect=runner):
-        result = CliRunner().invoke(main, ["run", "--config", str(config), "mysql-prod"])
+        result = CliRunner().invoke(main, ["run", "-c", str(config), "-j", "mysql-prod"])
     assert result.exit_code == 0, result.output
     history = History(Config(config).history)
     record, = history.records()
@@ -110,16 +110,13 @@ def test_encrypted_config_history_and_relocated_key_restore(tmp_path, key_file, 
     assert all(moved.read_text() not in " ".join(cmd) for cmd in commands)
 
 
-def test_encrypted_full_incremental_cli_and_history_restore(tmp_path, key_file, encrypted_runner):
-    config = configured_job(tmp_path, "")
+def test_encrypted_full_incremental_job_and_history_restore(tmp_path, key_file, encrypted_runner):
+    config = configured_job(tmp_path, 'encrypt=true\nencrypt_key_file="xtrabackup.key"\n')
     runner, commands = encrypted_runner
     with patch("subprocess.run", side_effect=runner):
-        for kind in ("full", "incremental", "incremental"):
-            result = CliRunner().invoke(main, [
-                "--config", str(config), "xtrabackup", kind, "--database", "prod",
-                "--root", str(tmp_path / "backups"), "--encrypt",
-                "--encrypt-key-file", str(key_file), "--compress", "zstd",
-            ])
+        for flags in ((), ("--incremental",), ("--incremental",)):
+            result = CliRunner().invoke(main, ["run", "-c", str(config), "-j", "mysql-prod",
+                                               *flags])
             assert result.exit_code == 0, result.output
         records = History(Config(config).history).records()
         assert len(records) == 3 and all(r.encrypted for r in records)
@@ -161,7 +158,7 @@ def test_encrypted_backup_requires_valid_key_before_execution(tmp_path, key_kind
 def test_missing_key_failure_is_recorded_as_encrypted_attempt(tmp_path):
     config = configured_job(tmp_path, "encrypt=true\n")
     with patch("subprocess.run") as run:
-        result = CliRunner().invoke(main, ["run", "--config", str(config), "mysql-prod"])
+        result = CliRunner().invoke(main, ["run", "-c", str(config), "-j", "mysql-prod"])
     assert result.exit_code == 1
     run.assert_not_called()
     record, = History(Config(config).history).records()
@@ -174,12 +171,12 @@ def test_unreadable_key_fails_without_exposing_contents(tmp_path, key_file):
             XtraBackup(tmp_path / "backups", encrypt=True, encrypt_key_file=key_file)
 
 
-def test_uncompressed_encrypted_prepare_cli_requires_key(tmp_path, key_file, encrypted_runner):
+def test_restore_backup_encrypted_requires_key(tmp_path, key_file, encrypted_runner):
     xb = XtraBackup(tmp_path / "backups", encrypt=True, encrypt_key_file=key_file)
     runner, commands = encrypted_runner
     with patch("subprocess.run", side_effect=runner):
         full = xb.full_backup()
-        args = ["xtrabackup", "prepare", str(full.path), "--root", str(xb.backup_root),
+        args = ["restore", "--backup", str(full.path), "--root", str(xb.backup_root),
                 "--dst", str(tmp_path / "recovery")]
         failed = CliRunner().invoke(main, args)
         assert failed.exit_code == 2

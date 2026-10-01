@@ -61,12 +61,12 @@ class Env:
             (root / name).mkdir(parents=True, exist_ok=True)
             if name != "BACKUP":
                 (root / name / ".bdbackup-destination").touch()
+        self.dry_run = False
         self.write(DEFAULT_STAGES)
         self.history = History(Config(self.config_path).history)
 
-    def write(self, stages, apply=True):
-        text = ('[history]\ndatabase="state/history.sqlite3"\n'
-                f'[gfs-main]\ntype="gfs"\napply={"true" if apply else "false"}\n')
+    def write(self, stages):
+        text = '[history]\ndatabase="state/history.sqlite3"\n[gfs-main]\ntype="gfs"\n'
         for paths, period, keep in stages:
             quoted = ", ".join(f'"{p}"' for p in paths)
             text += (f"[[gfs-main.stage]]\npaths = [{quoted}]\nperiod = \"{period}\"\n"
@@ -151,12 +151,14 @@ class Env:
         return chain
 
     def run_cli(self):
-        return invoke("run", "--config", self.config_path, "gfs-main")
+        return invoke("run", "-c", self.config_path, "-j", "gfs-main",
+                      *(["--dry-run"] if self.dry_run else []))
 
     def run_api(self, now):
         config = Config(self.config_path)
         lines = []
-        code = runner.run_job(config, config.get("gfs-main"), now=now, out=lines.append)
+        code = runner.run_job(config, config.get("gfs-main"), now=now, out=lines.append,
+                              dry_run=self.dry_run)
         return code, "\n".join(lines)
 
     def query(self, sql, *args):
@@ -452,7 +454,7 @@ def test_missing_marker_blocks_writes(env):
 
 
 def test_dry_run_changes_nothing(env):
-    env.write(DEFAULT_STAGES, apply=False)
+    env.dry_run = True
     env.file_unit("a.tar.gz", days_ago=7)
     env.file_unit("c.tar.gz", days_ago=70)
     env.file_unit("b.tar.gz", days_ago=0)
@@ -926,7 +928,7 @@ def test_report_lists_per_stage_totals(env, tmp_path):
     b = env.file_unit("b", days_ago=0)
     sizes = {a.name: a.stat().st_size, b.name: b.stat().st_size}
     dry = Env(tmp_path / "dry")
-    dry.write(DEFAULT_STAGES, apply=False)
+    dry.dry_run = True
     dry.file_unit("a", days_ago=7)
     dry.file_unit("b", days_ago=0)
     for run in (env, dry):

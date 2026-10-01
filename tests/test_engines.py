@@ -40,8 +40,8 @@ def test_builtin_engines_registered():
     assert engines["xtrabackup"].family == "mysql"
 
 
-def test_supported_types_includes_engines_and_retention():
-    assert supported_types() == {"file", "retention", "gfs", "mysqldump", "xtrabackup"}
+def test_supported_types_are_file_gfs_and_engines():
+    assert supported_types() == {"file", "gfs", "mysqldump", "xtrabackup"}
 
 
 def test_unknown_engine_error_lists_available():
@@ -103,7 +103,7 @@ def test_config_rejects_unknown_type_with_registered_names(tmp_path):
         Config(cfg)
     msg = str(exc.value)
     assert "mysqldump" in msg and "xtrabackup" in msg
-    assert "retention" in msg
+    assert "gfs" in msg
 
 
 def test_build_backend_file_type_still_direct():

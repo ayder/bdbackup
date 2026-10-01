@@ -32,22 +32,11 @@ def xtrabackup_config(tmp_path, retention_days):
     return path
 
 
-@pytest.mark.parametrize("surface", ["prune-cli", "full-cli", "config-run"])
-def test_retention_zero_disables_engine_deletion(tmp_path, old_chain, physical_runner, surface):
-    root = tmp_path / "physical"
+def test_retention_zero_disables_engine_deletion(tmp_path, old_chain, physical_runner):
     with patch("subprocess.run", side_effect=physical_runner):
-        if surface == "prune-cli":
-            result = invoke("xtrabackup", "prune", "--database", "db", "-r", root,
-                            "--retention", "0")
-        elif surface == "full-cli":
-            result = invoke("xtrabackup", "full", "--database", "db", "-r", root,
-                            "--retention", "0", "--binary", "mariadb-backup")
-        else:
-            result = invoke("run", "--config", xtrabackup_config(tmp_path, 0), "xb")
+        result = invoke("run", "-c", xtrabackup_config(tmp_path, 0), "-j", "xb")
     assert result.exit_code == 0, result.output
     assert old_chain.is_dir()
-    if surface == "prune-cli":
-        assert "Engine deletion is disabled (retention 0); nothing pruned" in result.output
 
 
 def test_retention_days_setting_accepts_zero_not_negative(tmp_path):
@@ -78,20 +67,14 @@ def file_records(config):
     return History(Config(config).history).records()
 
 
-@pytest.mark.parametrize("surface", ["config-job", "direct-command"])
-def test_file_timestamp_writes_one_archive_per_run(file_config, surface):
+def test_file_timestamp_writes_one_archive_per_run(file_config):
     from bdbackup.filebackup import FileBackup
 
     root = file_config.parent
     stamps = ["2026-09-29-020000", "2026-09-30-020000"]
     with patch.object(FileBackup, "_stamp", side_effect=stamps):
         for _ in stamps:
-            if surface == "config-job":
-                result = invoke("run", "--config", file_config, "daily")
-            else:
-                result = invoke("--config", file_config, "file", "--template", root / "paths",
-                                "-c", root / "source", "-d", root / "archives/daily",
-                                "-f", "tar.gz", "--timestamp")
+            result = invoke("run", "-c", file_config, "-j", "daily")
             assert result.exit_code == 0, result.output
     names = [f"daily-{stamp}.tar.gz" for stamp in stamps]
     for name in names:
@@ -116,10 +99,10 @@ def test_file_timestamp_never_overwrites(file_config):
                 if p.suffix != ".lock"}
 
     with patch.object(FileBackup, "_stamp", return_value="2026-09-29-020000"):
-        assert invoke("run", "--config", file_config, "daily").exit_code == 0
+        assert invoke("run", "-c", file_config, "-j", "daily").exit_code == 0
         before = digests()
         (file_config.parent / "source/hello").write_text("new content")
-        result = invoke("run", "--config", file_config, "daily")
+        result = invoke("run", "-c", file_config, "-j", "daily")
     assert result.exit_code == 1, result.output
     assert digests() == before
     assert not list(archives.glob("*.tmp"))

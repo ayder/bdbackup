@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 
 import pytest
@@ -87,27 +86,8 @@ chdir = "{tmp_path}"
     runner = CliRunner()
     result = runner.invoke(
         __import__("bdbackup.cli", fromlist=["main"]).main,
-        ["run", "--config", str(cfg_path), "files"],
+        ["run", "-c", str(cfg_path), "-j", "files"],
     )
     assert result.exit_code == 0, result.output
     assert archive.with_suffix(".tar").exists()
 
-
-def test_run_command_requires_job_or_all(tmp_path: Path):
-    cfg_path = tmp_path / "jobs.toml"
-    cfg_path.write_text("""
-[files]
-type = "file"
-backup_dst = "/tmp/ignored"
-""")
-    from bdbackup.cli import main
-    runner = CliRunner()
-    result = runner.invoke(main, ["run", "--config", str(cfg_path)])
-    assert result.exit_code != 0
-    assert "Provide a JOB_NAME or use --all" in result.output
-
-
-def test_package_init_does_not_import_pymysql():
-    import bdbackup
-
-    assert "pymysql" not in sys.modules or bdbackup is not None

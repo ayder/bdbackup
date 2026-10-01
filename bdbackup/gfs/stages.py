@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 PERIODS = ("daily", "weekly", "monthly", "yearly")
 MARKER = ".bdbackup-destination"
 _KEEP = re.compile(r"([1-9][0-9]*)([dwmy])")
-_JOB_KEYS = {"type", "schedule", "apply", "stage"}
+_JOB_KEYS = {"type", "stage"}
 _STAGE_KEYS = {"paths", "period", "keep"}
 # (shortest, longest) days of one unit, so "longer on every calendar" is decidable.
 _UNIT_DAYS = {"d": (1, 1), "w": (7, 7), "m": (28, 31), "y": (365, 366)}
@@ -106,17 +106,14 @@ def _stage(index: int, table: object, base: Path, previous: Stage | None) -> Sta
 def parse_gfs_job(section: Mapping[str, object], base: Path) -> dict[str, object]:
     """Validate one gfs job table; errors omit the ``Job '<name>': `` prefix."""
     if set(section) - _JOB_KEYS:
-        raise ValueError("a gfs job accepts only type, schedule, apply and stage")
-    apply = section.get("apply", False)
-    if not isinstance(apply, bool):
-        raise ValueError("apply must be true or false")
+        raise ValueError("a gfs job accepts only type, active and stage")
     tables = section.get("stage")
     if not isinstance(tables, list) or not tables:
         raise ValueError("stage must be a non-empty array of tables")
     stages: list[Stage] = []
     for index, table in enumerate(tables, 1):
         stages.append(_stage(index, table, base, stages[-1] if stages else None))
-    return {"stage": tuple(stages), "apply": apply}
+    return {"stage": tuple(stages)}
 
 
 def _overlap(a: Path, b: Path) -> bool:

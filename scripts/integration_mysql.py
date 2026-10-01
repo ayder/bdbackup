@@ -45,13 +45,13 @@ def move_and_restore_dump(work, password):
     cfg.write_text(
         f"[history]\ndatabase = {json.dumps(str(work / 'history.sqlite3'))}\n"
         f"restore_root = {json.dumps(str(work / 'restores'))}\n"
-        '[gfs-main]\ntype = "gfs"\napply = true\n'
+        '[gfs-main]\ntype = "gfs"\n'
         f"[[gfs-main.stage]]\npaths = [{json.dumps(str(work / 'gfs-hot'))}]\n"
         'period = "daily"\nkeep = "1d"\n'
         f"[[gfs-main.stage]]\npaths = [{json.dumps(str(weekly))}]\n"
         'period = "weekly"\nkeep = "8w"\n'
     )
-    run = CliRunner().invoke(cli, ["run", "--config", str(cfg), "gfs-main"])
+    run = CliRunner().invoke(cli, ["run", "-c", str(cfg), "-j", "gfs-main"])
     moved = weekly / "audit" / Path(first.path).name
     if run.exit_code or not moved.is_file():
         raise RuntimeError(f"GFS did not move the dump (exit {run.exit_code}): {run.output}")
@@ -153,8 +153,8 @@ def main(image="mysql:8.4"):
                 patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}),
                 patch.object(tempfile, "tempdir", str(work)),
             ):
-                backend = MySQLBackup(work / "dumps", jobs=2, user="backup", password=password)
-                dumps = backend.backup_all(["audit_one", "audit_two"])
+                backend = MySQLBackup(work / "dumps", user="backup", password=password)
+                dumps = [backend.backup(db) for db in ("audit_one", "audit_two")]
                 full = MySQLBackup(
                     work / "full", options=["--all-databases"], user="backup", password=password
                 ).backup()
@@ -199,7 +199,7 @@ def main(image="mysql:8.4"):
             print("GFS moved a mysqldump unit to the weekly stage and it restored from there",
                   flush=True)
             print(
-                f"MySQL {version}: parallel dumps, full dump, data/routine/event/trigger "
+                f"MySQL {version}: two dumps, full dump, data/routine/event/trigger "
                 "recovery passed",
                 flush=True,
             )
