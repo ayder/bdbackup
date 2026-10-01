@@ -66,6 +66,7 @@ pip install -e ".[dev]"
 ```bash
 bdbackup run      -c CONFIG -j JOB [--full | --incremental] [--no-verify] [--dry-run]
 bdbackup run      -c CONFIG --validate [-j JOB]
+bdbackup run      -c CONFIG -j GFS_JOB --initialize-structure
 bdbackup restore  -c CONFIG [--backup-id N] [--job JOB] [-y] [-d DIR] [--encrypt-key-file KEY]
 bdbackup restore  --archive ARCHIVE -d DIR
 bdbackup restore  --backup BACKUP --root ROOT -d DIR [--binary BINARY] [--encrypt-key-file KEY]
@@ -230,6 +231,9 @@ Checks cover direct grants; role-derived privileges and partial revokes may need
 manual review. Physical datadir checks cover root-directory access, not every data
 file or external tablespace. Custom mysqldump options, routine visibility, GTID
 settings and exact server/binary version compatibility still need review.
+For a GFS job, every stage path after the first must exist and be writable, and
+its `.bdbackup-destination` marker must be present and writable; a missing
+marker's line names the `--initialize-structure` command that creates it.
 An unreachable database or missing client is a failed/incomplete check, not a pass.
 Validation does not add SQLite history rows. It exits 0 when its checks pass, 1
 for failed or incomplete checks, and 2 for invalid command or configuration syntax.
@@ -685,8 +689,36 @@ the first stage, so `/BACKUP/mysql/prod/2026-09-29` becomes
 `/NFS/daily/mysql/prod/2026-09-29`. The newest unit of each job always stays in
 the first stage, so the next incremental finds its full.
 
-**Safety.** Each later stage path must contain an empty file named
-`.bdbackup-destination`; an unmounted mount point is an empty local directory
+**Preparing stages.** Create the stage directories and their markers with:
+
+```bash
+bdbackup run -c config.toml -j gfs-main --initialize-structure
+```
+
+For each stage path, in order, it reports `<path>: created` or `<path>: exists`,
+and for every stage after the first adds `, marker written`. A stage path is
+created only when its parent directory already exists, and only its last
+component; otherwise it fails with `parent does not exist`. Every path must be
+writable by the OS user running the command. Into each path after the first stage
+it writes `.bdbackup-destination`, holding the bdbackup version, the GFS job, the
+stage number and the time, rewriting an existing marker in place. A failure
+prints `FAIL <path>: <reason>` and the other paths are still prepared. It exits
+0 when every path is ready, 1 when one failed, and 2 for a usage or configuration
+error; it cannot be combined with other `run` options, starts no GFS run, and
+writes nothing to the history database.
+
+The parent rule protects a stage path at least two levels below a mount point.
+Create one directory on the share by hand while it is mounted, such as
+`/NFS/bdbackup`, and put the stage paths inside it: if the share is not mounted,
+`/NFS/bdbackup` is missing and the command fails. A stage path directly under
+the mount point (`/NFS/daily`) is not protected, because an unmounted mount
+point is an existing empty directory. Run the command only while every share is
+mounted, and as the OS user that runs GFS. It never checks filesystem types or
+mounts.
+
+**Safety.** Each later stage path must contain a file named
+`.bdbackup-destination`, made by `--initialize-structure` or by hand (an empty
+file is still valid); an unmounted mount point is an empty local directory
 without it, and GFS writes nothing there (`--validate` reports it). GFS copies to
 a temporary name, checks every checksum while reading the source, and removes
 the original only after every copy is in place and recorded; a failed copy
