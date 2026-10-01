@@ -581,6 +581,37 @@ def test_replaced_record_stays_unmanaged_after_first_run(env):
                      " ORDER BY record_id", *ids) == [(ids[0], 0), (ids[1], 1)]
 
 
+def test_first_unavailable_judgment_is_remembered_without_managed_unit(env):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    record_id = env.query("SELECT id FROM backup_runs WHERE path=?", str(a.resolve()))[0][0]
+    original, stats = a.read_bytes(), a.stat()
+    env.file_unit("b.tar.gz", days_ago=0)
+    a.write_bytes(b"not the original backup")
+    result = env.run_cli()
+    assert result.exit_code == 0 and "unmanaged 1" in result.output, result.output
+    assert env.query("SELECT record_id, managed FROM gfs_members WHERE record_id=?",
+                     record_id) == [(record_id, 0)]
+    a.write_bytes(original)
+    os.utime(a, ns=(stats.st_atime_ns, stats.st_mtime_ns))  # its identity matches again
+    result = env.run_cli()
+    assert result.exit_code == 0 and "unmanaged 1" in result.output, result.output
+    assert a.exists()
+    assert not (env.root / "NFS/daily/files/a.tar.gz").exists()
+
+
+def test_held_unit_judgment_is_stored(env):
+    env.write([(["BACKUP"], "daily", "2d"), (["NFS/weekly"], "weekly", "8w")])
+    held = None
+    for day in [date(2026, 9, 26) + timedelta(n) for n in range(5)]:
+        path = env.file_unit(f"{day}.tar.gz", day=day)
+        held = path if day == date(2026, 9, 28) else held
+    held_id = env.query("SELECT id FROM backup_runs WHERE path=?", str(held.resolve()))[0][0]
+    code, output = env.run_api(datetime(2026, 9, 30, 12))
+    assert "held: 2026-W40 not complete" in output, output
+    assert env.query("SELECT record_id, managed FROM gfs_members WHERE record_id=?",
+                     held_id) == [(held_id, 1)]
+
+
 def test_record_added_to_managed_unit_is_member(env):
     # S2 is judged per record: a later incremental of the newest unit joins its unit.
     unit = env.xtrabackup_unit(3, incrementals=1)
