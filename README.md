@@ -2,20 +2,44 @@
 
 **Backups by design.**
 
-`bdbackup` is a Python library and command-line tool for file and MySQL/MariaDB
-backups with verification, retention, and guided recovery. Define repeatable jobs
-in a TOML file, run them with one command, track their outcomes, and prepare
-recovery copies with explicit safeguards at each step.
+bdbackup is a command-line backup tool and Python library for MySQL, MariaDB and
+files on Linux and macOS. It takes MySQL and MariaDB backups with mysqldump,
+Percona XtraBackup and MariaDB Backup (full and incremental physical backups,
+compressed and optionally encrypted), archives files and directories as tar,
+tar.gz or tar.zst, and rotates the results across storage stages with GFS
+(grandfather-father-son) retention. Every backup is verified before it is
+published and recorded with a SHA-256 checksum in an SQLite backup history, from
+which a guided restore prepares a recovery copy. Jobs live in one TOML file and
+run from cron.
 
-Choose the backup method that fits your data:
+## Features
 
-- **file** backups from a plain-text template file into a tar archive
-- **mysqldump** logical backups (gzip-compressed)
-- **xtrabackup / mariabackup** physical full and incremental backups
+- [MySQL and MariaDB physical backups](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) with Percona
+  XtraBackup and MariaDB Backup: full and incremental, compressed, AES-256
+  encrypted with Percona, prepared for recovery with `restore --backup`.
+- [MySQL and MariaDB logical backups](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md) with mysqldump,
+  gzip-compressed, one database or all.
+- [File and directory backups](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md) as tar archives, with
+  gitignore-style exclusion templates.
+- [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md): daily,
+  weekly, monthly and yearly stages on local disks and NFS mounts, driven by a
+  checksummed backup ledger.
+- [Backup history and guided restore](#backup-history-and-guided-restore) with
+  SHA-256 checksums in SQLite.
+- [Configuration validation](#validate-configuration-and-permissions) of
+  settings, filesystem permissions and MySQL grants, without running a backup.
+- [Custom backup engines](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) as plugins.
 
-Built for day-to-day system administration: TOML configuration, credential files,
-verification before publication, process locking, atomic publication, and optional
-SQLite history keep backup operations explicit and inspectable.
+## Documentation
+
+| Document | Covers |
+|---|---|
+| [File and directory backups with tar](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md) | file jobs, template files, exclusion templates, restoring an archive |
+| [MySQL and MariaDB logical backups with mysqldump](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md) | mysqldump jobs, credentials, default options |
+| [MySQL and MariaDB physical backups with Percona XtraBackup and MariaDB Backup](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) | xtrabackup jobs, full and incremental backups, encryption, preparing a recovery copy, engine pruning |
+| [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, preparing stage directories, safety rules, run and step logs, ledger copies |
+| [Custom backup engines (plugins)](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) | the engine registry and writing your own engine |
+| [Annotated configuration](https://github.com/ayder/bdbackup/blob/master/config.toml.example) | every config key with a comment |
 
 ## Support and safety
 
@@ -45,7 +69,7 @@ Install the current code from the original GitHub repository:
 pip install "git+https://github.com/ayder/bdbackup.git"
 ```
 
-For versions published to PyPI:
+From PyPI:
 
 ```bash
 pip install bdbackup
@@ -73,7 +97,8 @@ bdbackup restore  --backup BACKUP --root ROOT -d DIR [--binary BINARY] [--encryp
 bdbackup history  -c CONFIG [--job JOB] [--successful | --create-checksum]
 ```
 
-`-c` is always `--config`, and `-j` is `--job`. `bdbackup` itself takes only
+`-c` is `--config` on every command; `-j` is the short form of `--job` on `run`
+only (`restore` and `history` take `--job`). `bdbackup` itself takes only
 `--version`, `--help` and `--logging LEVEL`, placed before the command:
 `bdbackup --logging DEBUG run -c config.toml -j files-daily`. Levels: `DEBUG`,
 `INFO`, `WARNING`, `ERROR`.
@@ -83,8 +108,8 @@ The CLI uses these exit codes:
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Backup/verify failure, or validation checks failed/incomplete |
-| 2 | Usage or configuration error, including an inactive job |
+| 1 | Backup/verify failure (including a job whose backend rejects its settings in a real run), or validation checks failed/incomplete |
+| 2 | Usage error, an inactive job, or a configuration error found when the config loads or by `--dry-run` |
 | 3 | Lock held; for GFS, another run of the job is in progress or only deferred work remains |
 
 ## Config-driven jobs
@@ -128,7 +153,7 @@ mysqldump job, set `database = "mydatabase"`; for all databases include
 Except for the optional `[history]` settings, each top-level table is one job;
 its keys (except `type`, `active` and `restore_root`) are passed
 to the backend constructor, so they use Python-style underscores
-(`exclude_templates`). See [config.toml.example](https://github.com/ayder/bdbackup/blob/main/config.toml.example)
+(`exclude_templates`). See [config.toml.example](https://github.com/ayder/bdbackup/blob/master/config.toml.example)
 for a fully annotated config with every option explained.
 
 Run one job:
@@ -137,38 +162,34 @@ Run one job:
 bdbackup run -c ~/.config/bdbackup/config.toml -j mysql-prod
 ```
 
-For an xtrabackup job, take an incremental using its own `backup_root`, credentials,
-binary, and encryption settings:
+An xtrabackup job also takes `--incremental`; see
+[MySQL and MariaDB physical backups](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#full-and-incremental-backups).
 
-```bash
-bdbackup run -c ~/.config/bdbackup/config.toml -j mysql-prod --incremental
-```
+### Dry run
 
-`--full` is the default; an incremental requires a successful full in that job's
-root and chains to the latest successful incremental, if present. `--full` and
-`--incremental` together exit 2, and so does `--incremental` on any other job type.
-`--verify/--no-verify` applies to both backup kinds.
-
-**Dry run.** `--dry-run` reports what a job would do and changes nothing: it runs
-no backup tool, writes no file and records no history.
-
-- A file job lists every entry it would archive and the archive name.
-- A mysqldump job names the database (or all databases) and the dump directory.
-- An xtrabackup job names the backup kind and its root, and an incremental also
-  names the backup it would chain from.
-- A GFS job prints its plan.
+`--dry-run` reports what a job would do: it runs no backup tool, writes no
+backup and records no history; a GFS dry run creates only its job's lock file
+beside the history database. What each job type reports is described with it:
+[file jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md#dry-run),
+[mysqldump jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md#dry-run),
+[xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#dry-run) and
+[GFS jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md#dry-run).
 
 A dry run exits 1 where the real run would fail before writing anything (an
 incremental without a full, a file job that selects nothing). `--dry-run` cannot
 be combined with `--verify` or `--no-verify`.
 
-**Pausing a job.** Set `active = false` in a job's table to pause it. Every
+### Pausing a job
+
+Set `active = false` in a job's table to pause it. Every
 `run -j` of that job, including `--dry-run` and `--validate -j`, then exits 2 with
 `Job '<name>' is inactive (active = false)`, and a full `--validate` names it as
 not checked. `active` defaults to `true`. Configuration rules still apply to an
 inactive job, and GFS still rotates its backups.
 
-**Scheduling.** bdbackup does not install schedules. Add crontab lines yourself,
+### Scheduling with cron
+
+bdbackup does not install schedules. Add crontab lines yourself,
 run as the OS account the backups belong to. For example, a weekly full on
 Sunday, incrementals on the other days, a nightly file backup, and GFS after
 the backups:
@@ -183,12 +204,6 @@ the backups:
 Times use the cron daemon's timezone, and separate lines do not wait for each
 other: leave enough time for backups before GFS. Add `--dry-run` to the GFS line
 until its report looks right.
-
-Pruning after each full deletes whole dated chains older than `retention_days`.
-Set `retention_days` longer than the interval between fulls to preserve the previous
-full's incrementals. `retention_days = 0` disables engine deletion for the job;
-use it when GFS or another tool rotates the backups. History records physical
-backups as `xtrabackup-full` / `xtrabackup-incremental`.
 
 ### Validate configuration and permissions
 
@@ -238,260 +253,6 @@ An unreachable database or missing client is a failed/incomplete check, not a pa
 Validation does not add SQLite history rows. It exits 0 when its checks pass, 1
 for failed or incomplete checks, and 2 for invalid command or configuration syntax.
 
-## File jobs
-
-A file job archives the paths listed in a template file (one per line, `#` for
-comments, whitespace allowed):
-
-```text
-# files.template
-Documents
-Videos
-data/projects
-```
-
-| Key | Description |
-|-----|-------------|
-| `template_filename` | Template file listing paths to archive |
-| `backup_dst` | Destination archive path (without extension) |
-| `chdir` | Source path: resolve template paths and relative excludes against it |
-| `format` | Archive format: `tar`, `tar.gz`, `tar.zst` (Python 3.14+) |
-| `exclude` | Exact paths to exclude |
-| `exclude_pattern` | Glob patterns to exclude |
-| `exclude_templates` | Named exclusion templates, e.g. `["python-dev"]` |
-| `follow_symlinks` | Follow symbolic links when archiving (default: `false`) |
-| `timestamp` | Write `<dst>-<UTC YYYY-MM-DD-HHMMSS><ext>` instead of replacing one archive; an existing name is never overwritten (default: `false`) |
-
-Without `timestamp`, every run replaces the same archive, so only the newest
-run stays restorable. With it, each run writes a new archive such as
-`daily-2026-09-29-020000.tar.gz`, and a run that would reuse an existing name
-fails instead. File jobs that GFS rotates set `timestamp = true`.
-
-List what a job would archive without writing anything:
-
-```bash
-bdbackup run -c config.toml -j files-daily --dry-run
-```
-
-Restore any file archive, with or without history:
-
-```bash
-bdbackup restore --archive /backup/files/daily.tar -d /restore/here
-```
-
-### Exclusion templates
-
-`exclude_templates` applies named bundles of gitignore-style exclusion
-patterns so you don't have to repeat common artifact rules:
-
-```toml
-exclude_templates = ["python-dev"]
-```
-
-The built-in `python-dev` template skips `__pycache__/`, `*.pyc`, `.venv/`,
-`venv/`, `uv.lock`, `Pipfile.lock`, `poetry.lock`, `*.egg-info/`, `build/`,
-`dist/`, and common tool caches (`.mypy_cache/`, `.pytest_cache/`,
-`.ruff_cache/`, `.tox/`, ...). Templates combine with `exclude` and
-`exclude_pattern`.
-
-Patterns use gitignore-style syntax: `*.pyc` matches at any depth, a trailing
-`/` matches directories only, patterns containing a `/` (e.g.
-`tests/containers/*img`) match relative to the backup root, a leading `/`
-anchors to the root, and `!` negates a previous pattern.
-
-Custom templates are plain Python files in `~/.config/bdbackup/templates/`
-(honours `$XDG_CONFIG_HOME` and `$BDBACKUP_CONFIG_DIR`) that self-register —
-no existing code needs to change to add one:
-
-```python
-# ~/.config/bdbackup/templates/go_dev.py
-from bdbackup.templates import ExclusionTemplate
-
-TEMPLATE = ExclusionTemplate(
-    name="go-dev",
-    patterns=("vendor/", "vendor/**", "*.test", "go.work"),
-    description="Go development artifacts",
-)
-```
-
-## Database engines
-
-`active` and `restore_root` are job metadata and are not passed to an engine backend.
-
-Database engines are pluggable and live in per-database family packages
-(`bdbackup/mysql/` today; `bdbackup/postgres/` is planned). Each engine maps a
-config `type` name to a backend class; adding one never requires editing
-existing wiring code:
-
-| Engine | Config `type` | Backend | Notes |
-|--------|---------------|---------|-------|
-| `mysqldump` | `mysqldump` | `bdbackup.mysql.MySQLBackup` | Logical, gzip-compressed SQL dumps |
-| `xtrabackup` | `xtrabackup` | `bdbackup.mysql.XtraBackup` | Percona XtraBackup / MariaDB mariabackup |
-
-To add an engine, drop a self-registering module into either
-`bdbackup/mysql/` (shipped with the package) or
-`~/.config/bdbackup/engines/` (user-level, no package changes) — a versioned
-xtrabackup variant or a mysql-shell `util.dump()` engine both follow the same
-recipe:
-
-```python
-# ~/.config/bdbackup/engines/mysql_shell.py
-from bdbackup.engines import EngineInfo
-
-class MySQLShellDump:
-    def __init__(self, out_dir: str = ".", **params): ...
-    def backup(self, name=None): ...          # BackupBackend protocol
-    def verify(self, result=None): ...
-    def prune(self): ...
-
-ENGINE = EngineInfo(
-    name="mysql-shell",          # usable as type = "mysql-shell" in config
-    backend=MySQLShellDump,
-    description="MySQL Shell util.dump() backups",
-    family="mysql",
-)
-```
-
-A config `type` is validated against the live registry, so the new engine is
-immediately usable from `config.toml`. MySQL-specific helpers shared by the
-family (e.g. `mysql_cnf_file` for credential-safe defaults files) live in
-`bdbackup/mysql/helpers.py`. A new database family means creating
-`bdbackup/postgres/` and appending `"bdbackup.postgres"` to
-`bdbackup.engines.FAMILIES` — the single deliberate modification point.
-A dry run of a custom engine exits 2: only the built-in types describe their run.
-
-## mysqldump jobs
-
-| Key | Description |
-|-----|-------------|
-| `out_dir` | Directory for the dump file (created if missing) |
-| `database` | Database to dump; omit it and add `--all-databases` to `options` to dump everything |
-| `user`, `password`, `host`, `port` | MySQL connection (defaults: `root`, none, `localhost`, `3306`) |
-| `options` | Additional mysqldump options, as an array of strings |
-
-One job dumps one database or all of them; for several selected databases, define
-one job per database. Keep a config that holds a `password` readable only by the
-backup account (`chmod 600`). Child database processes receive only a temporary
-credentials-file path; its contents are quoted, its permissions are `0600`, and it
-is removed after the run.
-
-Mysqldump retains `--single-transaction`, `--routines`, `--events` and `--triggers`
-by default. `options` adds options; explicit `--skip-*` flags can override
-applicable defaults. `--all-databases` retains these defaults.
-Single-transaction consistency applies to transactional tables; quiesce writes
-to nontransactional tables and avoid schema changes during a dump.
-
-## xtrabackup jobs
-
-| Key | Description |
-|-----|-------------|
-| `backup_root` | Backup root directory; dated subdirectories are created underneath |
-| `user`, `password` | MySQL user and password |
-| `binary` | `xtrabackup`, `mariabackup` or `mariadb-backup` |
-| `compress` | Compression algorithm (default: uncompressed) |
-| `compress_threads` | Compression threads (default: 4) |
-| `encrypt` | AES256 backup encryption (default: `false`; Percona only) |
-| `encrypt_key_file` | Required 32-byte key file when encrypting |
-| `parallel` | Number of copy threads (default: 1) |
-| `throttle` | Limit I/O to this many IOPS |
-| `retention_days` | Days of backups to keep (default: 5); `0` disables engine deletion |
-
-Take a full with `run -j JOB` and an incremental, which chains to the latest
-successful full, with `run -j JOB --incremental`.
-
-Prepare a full backup or an incremental recovery point into a new directory:
-
-```bash
-bdbackup restore --backup /backup/mysql/production/2026-09-10/Full_ID \
-    --root /backup/mysql/production -d /restore/production
-```
-
-Use the exact path printed by the backup run in place of `Full_ID`. Passing
-an incremental path prepares its full and every prerequisite incremental up to
-that point. Preparation needs no MySQL credentials. `--binary` selects
-`mariadb-backup` for MariaDB backups (default: `xtrabackup`), and
-`--encrypt-key-file` is required for encrypted backups. Preparation copies sources to private working directories,
-decompresses compressed copies, applies the increments in dependency order, and
-publishes the recovery directory only on success. The destination must be new
-and outside the backup root. Original backups remain available for new
-incrementals and repeated recovery attempts. With `[history]` configured,
-`restore -c CONFIG --backup-id N` finds the root, binary and key itself.
-
-Use XtraBackup matching your MySQL/Percona server series (8.0 with 8.0, 8.4 with
-8.4); use `mariabackup` or `mariadb-backup` matching your MariaDB installation.
-MariaDB preparation omits XtraBackup's `--apply-log-only` option. Compression is
-**off by default**. For a compatible recent XtraBackup, set `compress = "zstd"`;
-MariaDB's deprecated built-in compression accepts only `quicklz` and requires
-`qpress` for decompression. Compatibility must be established with an actual
-recovery test for the exact server and backup binary versions in use.
-
-New physical backups record parent/full identities and LSNs in `bdbackup.json`.
-Incrementals live under `DATE/Incremental/FULL_ID/UNIQUE_ID`, and cannot attach to
-another full taken on the same day. Older backups without this metadata require
-a new full before taking further incrementals; full backups can still be
-prepared as recovery copies. Engine pruning removes complete dated chains, preserves
-the newest successful full's date, and refuses to prune without a valid full.
-
-A process lock prevents two backup runs from corrupting the same backup root.
-Failed backups are written to a temporary directory first and cleaned up on
-error, so a partial backup can never be mistaken for a complete one.
-
-### Encrypted physical backups
-
-Percona XtraBackup jobs can optionally encrypt full and incremental backups with
-AES256. In the existing job's TOML section, add:
-
-```toml
-encrypt = true
-encrypt_key_file = "/etc/mysql/xtrabackup.key"
-```
-
-TOML uses `true`/`false`, not `yes`/`no`. The key file must already exist, be
-readable by the backup account, and contain exactly 32 bytes. To create a new
-key once (this command refuses to overwrite an existing key):
-
-```bash
-sudo python3 - <<'PY'
-import os
-from pathlib import Path
-
-key_path = Path("/etc/mysql/xtrabackup.key")
-fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(fd, "wb") as key_file:
-    key_file.write(os.urandom(32))
-PY
-```
-
-Keep this key outside the backup tree and store a separate secure copy: losing
-it makes its encrypted backups unrecoverable. Take a new full backup when changing
-keys or encryption settings; incrementals must use their parent's settings and
-key. Encryption is not supported by the mariabackup backend.
-
-Run the configured job normally:
-
-```bash
-bdbackup run -c /opt/dbs/config.toml -j mysql-prod
-```
-
-History records `encrypted = 1` in SQLite's `backup_runs` table for encrypted
-attempts (`0` otherwise), including failed attempts. The `status` column indicates
-whether an attempt succeeded. History also stores the algorithm and key-file
-path for recovery, never the key itself. Existing history databases upgrade
-automatically on the next backup; old entries remain unencrypted.
-
-History restore uses the recorded key path. If the key has moved, provide its
-new location:
-
-```bash
-bdbackup restore -c /opt/dbs/config.toml --backup-id 12 \
-  --dst /restore/mysql-prod-12 --encrypt-key-file /secure/saved-xtrabackup.key --yes
-```
-
-Recovery decrypts each full/incremental work copy, then decompresses and prepares
-it. Original backups remain encrypted; the recovery directory contains plaintext.
-For `restore --backup`, supply `--encrypt-key-file` as well.
-See [Percona's encryption documentation](https://docs.percona.com/percona-xtrabackup/8.4/encrypt-backups.html).
-
 ## Backup history and guided restore
 
 Enable SQLite history in your TOML configuration. No extra Python dependency
@@ -523,7 +284,7 @@ path and size. Physical full and incremental runs record their respective types
 and the root/binary needed for preparation.
 Credentials and raw error messages are not stored; failed rows contain only the
 exception class. Restores, validation, GFS runs and dry runs are not backup
-attempts and do not create rows. Direct Python backend calls are not automatically
+attempts and create no backup-attempt rows. Direct Python backend calls are not automatically
 recorded; applications can wrap them with `History.run`.
 
 Every successful backup also records its unit and a SHA-256 checksum taken right
@@ -543,7 +304,7 @@ cd /backup/mysql/production/2026-09-29/Full_<id> && find . -type f -print0 \
   | LC_ALL=C sort -z | xargs -0 sha256sum | sed 's|  \./|  |' | sha256sum
 ```
 
-Records taken before this release have no checksum. Record them explicitly:
+Records written by bdbackup 0.6.2 or earlier have no checksum. Record them explicitly:
 
 ```bash
 bdbackup history -c config.toml --create-checksum
@@ -555,8 +316,8 @@ missing or was replaced, or `<id>: skipped: unexpected unit` for a physical back
 outside its dated layout, and then exits 1. A checksum already recorded is never
 changed. `--create-checksum` cannot be combined with `--successful`. The checksum lives in the `checksum` column of the `backup_runs` table.
 
-History uses schema version 5. An existing database upgrades on the next write;
-older bdbackup versions refuse a version-5 database.
+History uses schema version 5. A database at an older schema upgrades on the next
+write; bdbackup 0.6.2 or earlier refuses a version-5 database.
 
 History is written before work starts, and success only after the backup and its
 requested verification finish. If history cannot be written, the command fails;
@@ -593,238 +354,20 @@ the exact backup ID and use `--yes`:
 bdbackup restore -c config.toml --backup-id 12 --dst /restore/job-12 --yes
 ```
 
-- File archives are extracted into the selected directory with the existing
-  safe extraction filters.
-- MySQL dumps are decompressed and checked into `<destination>/backup.sql`.
-  Importing SQL into a running server is a separate administrator action.
-- XtraBackup/MariaDB backups produce a prepared recovery directory, including
-  prerequisite increments. The destination must be outside the backup root.
-  Server ownership, copy-back, and startup remain administrator actions.
-- Custom engines are recorded, but require their own restore support unless
-  they inherit a supported backend.
+What a restore produces depends on the job type; see
+[file jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md#history-restore),
+[mysqldump jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md#history-restore),
+[xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#history-restore) and
+[custom engines](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md#history-restore).
 
 Deleted artifacts remain in history as unavailable. File identity, size, and
 modification time detect replaced archives, so older rows for a reused filename
 are not offered as older recovery points. Availability uses these file checks.
 Restore checks the recorded checksum of every file it uses for backups that GFS
-manages (see [Ledger and GFS](#ledger-and-gfs)); for other backups it
+manages (see [GFS backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md)); for other backups it
 validates the actual archive or physical dependency chain. History stores
 references to artifacts and does not preserve an archive that a later backup
 replaces.
-
-## Ledger and GFS
-
-GFS moves bdbackup's own backups through a chain of storage tiers, called stages,
-using only the history ledger: it never guesses from what lies on disk. A typical
-chain keeps everything for 5 days on a fast local disk, everything for 15 more
-days on cheap NFS storage (point-in-time recovery from incrementals), then one
-backup per week, per month and per year.
-
-```toml
-[gfs-main]
-type = "gfs"
-
-[[gfs-main.stage]]
-paths = ["/BACKUP"]         # engines write here
-period = "daily"
-keep = "5d"
-
-[[gfs-main.stage]]
-paths = ["/NFS/daily"]
-period = "daily"
-keep = "20d"                # 5 days hot + 15 days on NFS
-
-[[gfs-main.stage]]
-paths = ["/NFS/weekly"]
-period = "weekly"
-keep = "8w"
-
-[[gfs-main.stage]]
-paths = ["/NFS/monthly"]
-period = "monthly"
-keep = "12m"
-
-[[gfs-main.stage]]
-paths = ["/NFS/yearly", "/DD/yearly"]   # every path receives a copy
-period = "yearly"
-keep = "7y"
-```
-
-Run it with `bdbackup run -c config.toml -j gfs-main`, after the backups (see
-Scheduling under [Config-driven jobs](#config-driven-jobs)). A run applies its plan
-unless `--dry-run` is given.
-
-**Stages and ages.** `keep` is an age counted from the backup day: `Nd` days,
-`Nw` weeks, `Nm` calendar months, `Ny` years. A backup belongs to the first stage
-whose `keep` it is still within; past the last stage it is deleted. Each `keep`
-must be longer than the previous one on every calendar (a month counts as 28–31
-days), and periods never go backwards along the chain. The first stage has
-exactly one path and is where backup jobs write.
-
-**Periods.** A daily stage keeps every backup. A weekly stage keeps the newest
-backup of each ISO week; a monthly stage, of those, the newest dated in each
-month; a yearly stage, of those, the newest dated in each year. Selection is per
-job, so a tar job and a MySQL job never compete for one slot. A week is decided
-only once it has ended, and a month or year only once the ISO week holding its
-last day has ended, so a choice never changes later; until then the backup is
-reported `held: <bucket> not complete` and stays where it is.
-
-With the configuration above on Tuesday 2026-09-29 and one backup per day:
-
-| Backup | Result | Why |
-|---|---|---|
-| 2026-09-24 | `/NFS/daily` | within 20d |
-| 2026-09-09 | deleted | its week's newest backup is 09-13 |
-| 2026-09-06 (Sun) | `/NFS/weekly` | newest of ISO week 36 |
-| 2026-08-30 (Sun) | `/NFS/weekly` | newest of week 35; also August's monthly backup |
-| 2026-08-02 (Sun) | deleted | newest of its week, not of August |
-| 2026-07-26 (Sun) | `/NFS/monthly` | July's newest weekly backup |
-| 2025-12-28 (Sun) | `/NFS/monthly` | also 2025's yearly backup |
-| 2024-12-29 (Sun) | `/NFS/yearly` | 2024's yearly backup |
-
-**Units and paths.** GFS moves a unit as one piece: an archive or dump file, or
-an xtrabackup dated directory with its full and every incremental (and its
-`Full_Latest` and `.full_success` markers). A unit keeps its path relative to
-the first stage, so `/BACKUP/mysql/prod/2026-09-29` becomes
-`/NFS/daily/mysql/prod/2026-09-29`. The newest unit of each job always stays in
-the first stage, so the next incremental finds its full.
-
-**Preparing stages.** Create the stage directories and their markers with:
-
-```bash
-bdbackup run -c config.toml -j gfs-main --initialize-structure
-```
-
-For each stage path, in order, it reports `<path>: created` or `<path>: exists`,
-and for every stage after the first adds `, marker written`. A stage path is
-created only when its parent directory already exists, and only its last
-component; otherwise it fails with `parent does not exist`. Every path must be
-writable by the OS user running the command. Into each path after the first stage
-it writes `.bdbackup-destination`, holding the bdbackup version, the GFS job, the
-stage number and the time, rewriting an existing marker in place. A failure
-prints `FAIL <path>: <reason>` and the other paths are still prepared. It exits
-0 when every path is ready, 1 when one failed, and 2 for a usage or configuration
-error; it cannot be combined with other `run` options, starts no GFS run, and
-writes nothing to the history database.
-
-The parent rule protects a stage path at least two levels below a mount point.
-Create one directory on the share by hand while it is mounted, such as
-`/NFS/bdbackup`, and put the stage paths inside it: if the share is not mounted,
-`/NFS/bdbackup` is missing and the command fails. A stage path directly under
-the mount point (`/NFS/daily`) is not protected, because an unmounted mount
-point is an existing empty directory. Run the command only while every share is
-mounted, and as the OS user that runs GFS. It never checks filesystem types or
-mounts.
-
-**Safety.** Each later stage path must contain a file named
-`.bdbackup-destination`, made by `--initialize-structure` or by hand (an empty
-file is still valid); an unmounted mount point is an empty local directory
-without it, and GFS writes nothing there (`--validate` reports it). GFS copies to
-a temporary name, checks every checksum while reading the source, and removes
-the original only after every copy is in place and recorded; a failed copy
-removes its temporary copies and the next run retries. Before a move,
-every copy of the unit is checked, not only the one copied, and
-copies keep the permission bits of every file and directory. If the
-ledger lists a unit in two stages (left by an earlier version or a hand edit),
-the next run removes the earlier copy only after the later copies verify.
-Copies hold no backup lock,
-so a slow NFS copy never blocks a backup; if an xtrabackup root is locked when
-GFS commits, the unit is reported `deferred: locked` and retried next run. GFS
-only touches backups recorded in the ledger. It refuses, and reports:
-
-- `refused: checksum mismatch`: the backup changed since it was recorded. To
-  accept the change, set the `checksum` column of its `backup_runs` rows to the
-  new value with `sqlite3`; the next run acts on it. A backup that changed
-  before GFS first saw it is never managed.
-- `refused: unexpected entry …`: a unit holds something that is not one of its
-  recorded backups or engine markers, such as a leftover `.tmp` directory, or a
-  symlink or special file inside a backup.
-- `refused: stage not configured`: the unit lives under a stage no longer in the
-  configuration. Removing a stage never deletes its backups; restore the stage
-  or remove them yourself. Changing the first stage's path keeps managing units
-  already moved to later stages; units left under the
-  old first-stage path are no longer managed.
-- `refused: destination not ready …`: a stage path lacks its marker.
-
-Backup jobs writing into the first stage must not delete or overwrite on their
-own: xtrabackup jobs set `retention_days = 0` and file jobs set
-`timestamp = true`. Configuration validation enforces both, rejects stage paths
-that overlap, and keeps the live history database out of stage paths.
-
-`--dry-run` prints what would move or be deleted and changes nothing. Exit codes: 0 done, 1 a refusal or failure, 2 configuration error, 3
-another run of the same job is in progress, or the only unfinished units were
-deferred.
-
-**Unmanaged backups.** A backup that was unavailable when GFS first saw it (for
-example an older run of a file job without `timestamp`, whose archive a later
-run replaced) stays unmanaged on every later run: GFS never moves or deletes it,
-and the report counts it in `unmanaged`.
-
-**Report.** Each run lists every unit it acted on, held, deferred or refused,
-then a `Summary:` line with counts and bytes per action. One line per stage
-follows, such as `Stage /NFS/daily: 15 units (3200000000 bytes)`, counting where
-the units are when the run ends (where they would be, in a dry run), and then
-the ledger copies written.
-
-**Step log.** Every step is also recorded in the `gfs_steps` table of the history
-database, one row per path, with its source, destination, outcome
-and reason. A failed step keeps the error message.
-
-**Run log.** Every applying run records one row in the `gfs_runs` table:
-the GFS job, start and finish time, status, exit code and the Summary counts.
-The status is `running` while the run works, `completed` once it reaches its report
-(whatever the exit code), and `failed` if the run itself crashed. A row left
-`running` shows a run that was cut off; check that run's steps for leftovers
-(Known limits below). Each `gfs_steps` row names its run in `run_id`. A dry run
-records nothing.
-
-**Running backups.** While a job has a backup in state `running` in the
-ledger, GFS leaves every backup of that job where it is, whatever its age, and
-reports each one as
-`deferred: backup running (record <id>, started <time>)`.
-Other jobs proceed as usual, and a run whose only unfinished work is these
-deferrals exits 3. A backup killed before it finished (`kill -9`, a power loss)
-leaves its row `running`, and that job stays deferred until you fix the row. After
-checking that no backup of that job is running, mark it failed:
-`sqlite3 <history database> "UPDATE backup_runs SET status = 'failed' WHERE id = <id>"`.
-
-**Restoring moved backups.** `bdbackup restore` and `bdbackup history` find a
-backup where GFS put it. `history` shows a copy that was removed or replaced as
-`unavailable`. Before restoring, every backup file used is checked against its
-ledger checksum; with several paths in a stage, the first path that verifies is
-used, and the `Backup:` line names it. An xtrabackup chain is prepared from the
-stage directory holding it, which keeps the layout of the first stage.
-
-**Ledger copies.** After every applying run, each path of every stage after the
-first holds `<gfs job>.ledger.sqlite3`, a consistent copy of the whole history
-database, written under a temporary name and renamed into place. A path without
-its marker gets none, and the run exits 1. To restore with only a stage left,
-copy that file somewhere outside the stages, point `[history] database` at the
-copy, and run `bdbackup restore`. Paths in the ledger are absolute, so the
-stages must be mounted at the same paths as when the copy was written.
-
-**Known limits.** GFS does not yet keep a journal of a move or delete while it
-runs, so a few failures leave work for the operator. The report and the step log
-name the paths involved, and each leftover is
-removed by hand:
-
-- A move was recorded, but removing the old copy failed. The old copy stays on
-  disk, no longer in the ledger, and GFS never touches it again. Delete it.
-- A move failed, or the process stopped, after some new copies were renamed into
-  place but before the move was recorded. The next run reports
-  `refused: final name exists: <path>`. Delete that copy; the next run moves the
-  unit again.
-- A delete failed part way. The next run reports `refused: missing location …`
-  for a copy already removed. Delete its row with
-  `sqlite3 <history database> "DELETE FROM gfs_locations WHERE path = '<path>'"`.
-  If that was the unit's last row, also mark the unit deleted, or later runs
-  report `refused: stage not configured`:
-  `sqlite3 <history database> "UPDATE gfs_units SET deleted_at = datetime('now') WHERE id = <unit_id>"`
-  (the `unit_id` of the row you deleted).
-- A restore stops when the xtrabackup copy at the first path of a stage has
-  damaged checkpoints or chain metadata; it does not move on to the next path.
-  Prepare the copy at another path of that stage with
-  `bdbackup restore --backup <backup> --root <directory holding the copy> -d <new dir>`.
 
 ## Development
 
@@ -876,4 +419,4 @@ configuration and actual database recovery evidence are release prerequisites.
 
 ## License
 
-MIT License. See [LICENSE](https://github.com/ayder/bdbackup/blob/main/LICENSE).
+MIT License. See [LICENSE](https://github.com/ayder/bdbackup/blob/master/LICENSE).
