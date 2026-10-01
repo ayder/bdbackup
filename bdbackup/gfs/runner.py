@@ -115,6 +115,17 @@ class _Run:
             return unit
         return replace(unit, id=store.record_unit(self.history, unit))
 
+    def defer_running(self, unit, indexes, backup: tuple[int, str]) -> None:
+        """Its job is still backing up: no action of any kind, whatever its age (r8 R2)."""
+        current = max(indexes) if indexes and None not in indexes else None
+        if current is not None:
+            self.where[str(unit.unit)] = (current, unit.size)
+        record_id, started = backup
+        self.tally.deferred += 1
+        self.line("defer", unit, current, None,
+                  f"deferred: backup running (record {record_id}, started {started})")
+        self.step(unit, "defer", None, None, "deferred", "backup running")
+
     def refuse(self, unit, current, reason) -> None:
         self.tally.refused += 1
         self.line("refused", unit, current, None, f"refused: {reason}")
@@ -265,9 +276,13 @@ class _Run:
             {path for stage in self.stages for path in stage.paths})
         if self.apply and judgments:  # S2 is judged once, whatever happens to the unit next
             store.record_members(self.history, judgments)
+        running = store.running_backups(self.history)
         placed: dict[str, tuple[store.ManagedUnit, int]] = {}
         for unit in units:
             indexes = [_stage_index(self.stages, loc) for loc in unit.locations]
+            if unit.series in running:
+                self.defer_running(unit, indexes, running[unit.series])
+                continue
             if None in indexes or not indexes:
                 self.refuse(self.ensure_row(unit), None, "stage not configured")
                 continue

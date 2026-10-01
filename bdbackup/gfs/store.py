@@ -156,6 +156,20 @@ def load(history: History, first_stage: Path,
     return units, unmanaged, tuple(judgments)
 
 
+def running_backups(history: History) -> dict[str, tuple[int, str]]:
+    """Job name -> (id, started_at) of its oldest backup still ``running`` (spec 2 r8 R2)."""
+    if not history.settings.database.exists():
+        return {}
+    with history._connect() as db:
+        rows = db.execute(
+            "SELECT id, job_name, started_at FROM backup_runs WHERE status='running' ORDER BY id"
+        ).fetchall()
+    running: dict[str, tuple[int, str]] = {}
+    for row in rows:
+        running.setdefault(row["job_name"], (row["id"], row["started_at"]))
+    return running
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
