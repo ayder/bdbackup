@@ -28,7 +28,7 @@ class ConfigError(Exception):
     """Raised when a configuration file is invalid."""
 
 
-# Keys removed in 0.6.4, by the job types that had them (None: every type).
+# Keys removed in 0.7.0, by the job types that had them (None: every type).
 _REMOVED_KEYS = {"schedule": None, "apply": {"gfs"}, "jobs": {"mysqldump"}}
 
 
@@ -78,7 +78,7 @@ class Config:
                 )
             for key, types in _REMOVED_KEYS.items():
                 if key in section and (types is None or job_type in types):
-                    raise ConfigError(f"Job {name!r}: key {key!r} was removed in 0.6.4")
+                    raise ConfigError(f"Job {name!r}: key {key!r} was removed in 0.7.0")
             section = dict(section)
             active = section.pop("active", True)
             if not isinstance(active, bool):
