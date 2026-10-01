@@ -11,7 +11,6 @@ from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job
 from bdbackup.history import HistorySettings
-from bdbackup.scheduling import validate_schedule
 
 
 @dataclass
@@ -21,17 +20,21 @@ class Job:
     name: str
     type: str
     params: dict[str, Any]
-    schedule: str | None = None
     restore_root: Path | None = None
+    active: bool = True
 
 
 class ConfigError(Exception):
     """Raised when a configuration file is invalid."""
 
 
+# Keys removed in 0.6.4, by the job types that had them (None: every type).
+_REMOVED_KEYS = {"schedule": None, "apply": {"gfs"}, "jobs": {"mysqldump"}}
+
+
 def supported_types() -> set[str]:
     """Return all valid job types: builtins plus every registered engine name."""
-    return {"file", "retention", "gfs"} | set(list_engines())
+    return {"file", "gfs"} | set(list_engines())
 
 
 class Config:
@@ -67,41 +70,35 @@ class Config:
         for name, section in data.items():
             if not isinstance(section, dict):
                 raise ConfigError(f"Job {name!r} must be a table")
-            section = {k: v for k, v in section.items() if k != "active"}
             job_type = section.get("type")
             if job_type not in supported_types():
                 raise ConfigError(
                     f"Job {name!r} has unsupported type {job_type!r}; "
                     f"expected one of {sorted(supported_types())}"
                 )
-            schedule = section.get("schedule")
-            if "schedule" in section:
-                try:
-                    schedule = validate_schedule(schedule)
-                except ValueError as exc:
-                    raise ConfigError(f"Job {name!r}: {exc}") from exc
+            for key, types in _REMOVED_KEYS.items():
+                if key in section and (types is None or job_type in types):
+                    raise ConfigError(f"Job {name!r}: key {key!r} was removed in 0.6.4")
+            section = dict(section)
+            active = section.pop("active", True)
+            if not isinstance(active, bool):
+                raise ConfigError(f"Job {name!r}: active must be true or false")
             if job_type == "gfs":
                 try:
                     params = parse_gfs_job(section, self.path.parent)
                 except ValueError as exc:
                     raise ConfigError(f"Job {name!r}: {exc}") from exc
-                self.jobs[name] = Job(name=name, type=job_type, params=params, schedule=schedule)
+                self.jobs[name] = Job(name=name, type=job_type, params=params, active=active)
                 continue
             restore_root = None
             if "restore_root" in section:
                 value = section["restore_root"]
                 if not isinstance(value, str) or not value.strip():
                     raise ConfigError(f"Job {name!r}: restore_root must be a nonempty path string")
-                if job_type == "retention":
-                    raise ConfigError(
-                        f"Job {name!r}: restore_root is not allowed in retention jobs"
-                    )
                 if self.history is None:
                     raise ConfigError(f"Job {name!r}: restore_root requires a [history] section")
                 restore_root = (self.path.parent / Path(value).expanduser()).resolve()
-            params = {
-                k: v for k, v in section.items() if k not in {"type", "schedule", "restore_root"}
-            }
+            params = {k: v for k, v in section.items() if k not in {"type", "restore_root"}}
             # Config paths are relative to the config file; file-template entries
             # and excludes remain relative to the explicitly selected source path.
             for key in (
@@ -111,9 +108,6 @@ class Config:
                 "out_dir",
                 "backup_root",
                 "encrypt_key_file",
-                "full_dir",
-                "incr_dir",
-                "log_dir",
             ):
                 if key in params:
                     try:
@@ -121,8 +115,8 @@ class Config:
                     except TypeError as exc:
                         raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
             self.jobs[name] = Job(
-                name=name, type=job_type, params=params, schedule=schedule,
-                restore_root=restore_root,
+                name=name, type=job_type, params=params, restore_root=restore_root,
+                active=active,
             )
 
         if any(job.type == "gfs" for job in self.jobs.values()):

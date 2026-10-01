@@ -38,7 +38,6 @@ class MySQLBackup:
         host: str = "localhost",
         port: int = 3306,
         options: Iterable[str] | None = None,
-        jobs: int = 1,
         database: str | None = None,
     ):
         self.out_dir = Path(out_dir).expanduser().absolute()
@@ -47,9 +46,6 @@ class MySQLBackup:
         self.host = host
         self.port = port
         self.database = database
-        if jobs < 1:
-            raise ValueError("jobs must be >= 1")
-        self.jobs = jobs
         self.options = list(dict.fromkeys([*self.DEFAULT_OPTIONS, *(options or [])]))
         if "--all-databases" in self.options:
             self.options.remove("--databases")
@@ -65,8 +61,8 @@ class MySQLBackup:
             cmd.append(database)
         return cmd
 
-    def backup(self, database: str | None = None) -> BackupResult:
-        """Stream only SQL to a private gzip file, then verify and publish it."""
+    def selection(self, database: str | None = None) -> str:
+        """Name what a dump covers, refusing a selection ``backup`` would refuse."""
         database = database if database is not None else self.database
         if database is not None and (
             not database or database.startswith("-") or "\x00" in database
@@ -74,6 +70,12 @@ class MySQLBackup:
             raise BackupError("Invalid database name")
         if not database and "--all-databases" not in self.options:
             raise BackupError("Specify a database or include --all-databases")
+        return database or "all databases"
+
+    def backup(self, database: str | None = None) -> BackupResult:
+        """Stream only SQL to a private gzip file, then verify and publish it."""
+        database = database if database is not None else self.database
+        self.selection(database)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         label = quote(database or "all-databases", safe="")
         out_filename = self.out_dir / f"{label}-{today_stamp()}-{uuid4().hex}.sql.gz"
@@ -136,16 +138,6 @@ class MySQLBackup:
         except (OSError, EOFError) as exc:
             raise BackupError(f"Dump verification failed for {dump}: {exc}") from exc
         return BackupResult(dump, size_bytes=dump.stat().st_size, success=True)
-
-    def backup_all(self, databases: Iterable[str]) -> list[BackupResult]:
-        """Dump multiple databases, optionally in parallel."""
-        dbs = list(databases)
-        if self.jobs == 1:
-            return [self.backup(db) for db in dbs]
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=self.jobs) as pool:
-            return list(pool.map(self.backup, dbs))
 
     def prune(self) -> list[Path]:
         """mysqldump has no built-in retention policy; return an empty list."""

@@ -65,7 +65,7 @@ def test_invalid_history_config(tmp_path, section):
 
 
 def test_success_persists_job_type_utc_timestamps_and_artifact(config_file):
-    result = invoke("run", "--config", config_file, "daily")
+    result = invoke("run", "-c", config_file, "-j", "daily")
     assert result.exit_code == 0, result.output
     record, = history_for(config_file).records()
     assert record.job_name == "daily"
@@ -88,8 +88,8 @@ def test_failure_and_later_job_are_both_recorded(config_file):
         config_file.read_text().replace('[daily]', '[broken]\ntype="file"\n'
             'template_filename="missing"\nbackup_dst="bad"\n[daily]')
     )
-    result = invoke("run", "--config", config_file, "--all")
-    assert result.exit_code == 1
+    assert invoke("run", "-c", config_file, "-j", "broken").exit_code == 1
+    assert invoke("run", "-c", config_file, "-j", "daily").exit_code == 0
     good, bad = history_for(config_file).records()
     assert (good.job_name, good.status) == ("daily", "success")
     assert (bad.job_name, bad.status) == ("broken", "failed")
@@ -101,7 +101,7 @@ def test_failure_and_later_job_are_both_recorded(config_file):
 def test_verify_failure_is_not_success(config_file):
     # The backend's mandatory first verification succeeds; the optional second fails.
     with patch("bdbackup.filebackup.FileBackup.verify", side_effect=[None, BackupError("bad")]):
-        result = invoke("run", "--config", config_file, "daily")
+        result = invoke("run", "-c", config_file, "-j", "daily")
     assert result.exit_code == 1
     assert history_for(config_file).records()[0].status == "failed"
 
@@ -126,7 +126,7 @@ def test_unwritable_history_stops_backup_before_work(config_file):
     settings = Config(config_file).history
     settings.database.parent.mkdir()
     settings.database.mkdir()
-    result = invoke("run", "--config", config_file, "daily")
+    result = invoke("run", "-c", config_file, "-j", "daily")
     assert result.exit_code == 1
     assert not (config_file.parent / "archives").exists()
 
@@ -192,7 +192,7 @@ def test_unsuccessful_backend_result_is_recorded_as_failure(tmp_path):
 
 
 def test_interactive_history_restore_suggests_path_and_recovers(config_file):
-    assert invoke("run", "--config", config_file, "daily").exit_code == 0
+    assert invoke("run", "-c", config_file, "-j", "daily").exit_code == 0
     result = invoke("restore", "--config", config_file, input="\n\ny\n")
     assert result.exit_code == 0, result.output
     assert "Successful backups" in result.output
@@ -201,14 +201,14 @@ def test_interactive_history_restore_suggests_path_and_recovers(config_file):
 
 
 def test_restore_decline_has_no_filesystem_effects(config_file):
-    invoke("run", "--config", config_file, "daily")
+    invoke("run", "-c", config_file, "-j", "daily")
     result = invoke("restore", "--config", config_file, input="\n\nn\n")
     assert result.exit_code == 1
     assert not (config_file.parent / "recovery").exists()
 
 
 def test_explicit_backup_id_and_destination_restore(config_file):
-    invoke("run", "--config", config_file, "daily")
+    invoke("run", "-c", config_file, "-j", "daily")
     dst = config_file.parent / "custom"
     result = invoke("restore", "--config", config_file, "--backup-id", "1", "--yes", "-d", dst)
     assert result.exit_code == 0, result.output
@@ -219,7 +219,7 @@ def test_explicit_backup_id_and_destination_restore(config_file):
 
 
 def test_restore_rejects_dangling_destination_link(config_file):
-    invoke("run", "--config", config_file, "daily")
+    invoke("run", "-c", config_file, "-j", "daily")
     dst = config_file.parent / "link"
     dst.symlink_to(config_file.parent / "absent", target_is_directory=True)
     result = invoke("restore", "--config", config_file, "--backup-id", "1", "--yes", "-d", dst)
@@ -228,9 +228,9 @@ def test_restore_rejects_dangling_destination_link(config_file):
 
 
 def test_reused_archive_path_makes_older_run_unavailable(config_file):
-    invoke("run", "--config", config_file, "daily")
+    invoke("run", "-c", config_file, "-j", "daily")
     (config_file.parent / "source/hello").write_text("new content")
-    invoke("run", "--config", config_file, "daily")
+    invoke("run", "-c", config_file, "-j", "daily")
     newest, older = history_for(config_file).records()
     assert newest.available
     assert not older.available
@@ -243,7 +243,7 @@ def test_reused_archive_path_makes_older_run_unavailable(config_file):
 
 
 def test_history_filters_jobs_and_restore_requires_explicit_id_for_yes(config_file):
-    invoke("run", "--config", config_file, "daily")
+    invoke("run", "-c", config_file, "-j", "daily")
     assert history_for(config_file).records(job="other") == []
     assert invoke("restore", "--config", config_file, "--yes").exit_code == 2
     assert invoke("restore", "--config", config_file, "--backup-id", "1",
@@ -251,23 +251,11 @@ def test_history_filters_jobs_and_restore_requires_explicit_id_for_yes(config_fi
     assert invoke("restore", "--config", config_file, "--backup-id", "999", "--yes").exit_code == 1
 
 
-def test_global_config_records_direct_file_command_and_skips_dry_run(config_file):
-    root = config_file.parent
-    args = ["--config", config_file, "file", "--template", root / "paths",
-            "-c", root / "source", "-d", root / "direct"]
-    assert invoke(*args, "--dry-run").exit_code == 0
-    assert not Config(config_file).history.database.exists()
-    assert invoke(*args).exit_code == 0
-    record, = history_for(config_file).records()
-    assert record.job_name == "direct"
-    assert record.available
-    assert invoke("--config", config_file, "run", "daily").exit_code == 0
-
 
 def test_live_history_database_is_excluded_from_file_backup(config_file):
     config_file.write_text(config_file.read_text().replace("state/history.sqlite3", "source/db"))
     (config_file.parent / "paths").write_text(".\n")
-    assert invoke("run", "--config", config_file, "daily").exit_code == 0
+    assert invoke("run", "-c", config_file, "-j", "daily").exit_code == 0
     result = invoke("restore", "--config", config_file, "--backup-id", "1", "--yes")
     assert result.exit_code == 0, result.output
     restored = config_file.parent / "recovery/daily-1"
@@ -279,7 +267,7 @@ def test_archive_cannot_replace_history_database(config_file):
     config_file.write_text(
         config_file.read_text().replace("state/history.sqlite3", "archives/daily.tar.gz")
     )
-    result = invoke("run", "--config", config_file, "daily")
+    result = invoke("run", "-c", config_file, "-j", "daily")
     assert result.exit_code == 1
     assert history_for(config_file).records()[0].status == "failed"
 
@@ -291,33 +279,31 @@ def test_configured_mysql_records_only_safe_restore_metadata(config_file):
     with gzip.open(artifact, "wb") as output:
         output.write(b"SELECT 1;")
     with patch.object(MySQLBackup, "backup", return_value=BackupResult(artifact, success=True)):
-        assert invoke("run", "--config", config_file, "sql").exit_code == 0
+        assert invoke("run", "-c", config_file, "-j", "sql").exit_code == 0
     record, = history_for(config_file).records()
     assert json.loads(record.restore_info) == {"kind": "mysqldump"}
     raw = Config(config_file).history.database.read_bytes()
     assert b"never-store-this" not in raw
 
 
-def test_parallel_mysql_partial_failure_and_sql_recovery(config_file):
+def test_mysqldump_job_sql_recovery(config_file):
     root = config_file.parent
+    config_file.write_text(config_file.read_text() + '[good]\ntype="mysqldump"\ndatabase="app"\n')
 
-    def backup(database):
-        if database == "bad":
-            raise BackupError("failed")
-        path = root / f"{database}.sql.gz"
+    def backup(self, database=None):
+        path = root / "app.sql.gz"
         with gzip.open(path, "wb") as output:
             output.write(b"CREATE DATABASE example;\n")
         return BackupResult(path, size_bytes=path.stat().st_size, success=True)
 
-    with patch.object(MySQLBackup, "backup", side_effect=backup):
-        result = invoke("--config", config_file, "mysqldump", "--database", "good,bad", "-j", "2")
-    assert result.exit_code == 1
-    records = {r.job_name: r for r in history_for(config_file).records()}
-    assert records["bad"].status == "failed"
-    assert records["good"].available
-    result = invoke("restore", "--config", config_file, "--backup-id", records["good"].id, "--yes")
+    with patch.object(MySQLBackup, "backup", backup):
+        result = invoke("run", "-c", config_file, "-j", "good")
     assert result.exit_code == 0, result.output
-    dst = root / f"recovery/good-{records['good'].id}/backup.sql"
+    record, = history_for(config_file).records()
+    assert record.available
+    result = invoke("restore", "--config", config_file, "--backup-id", record.id, "--yes")
+    assert result.exit_code == 0, result.output
+    dst = root / f"recovery/good-{record.id}/backup.sql"
     assert dst.read_text() == "CREATE DATABASE example;\n"
     assert dst.stat().st_mode & 0o777 == 0o600
 
@@ -334,10 +320,11 @@ def test_corrupt_sql_restore_cleans_its_new_directory(tmp_path):
 
 def test_physical_full_incremental_history_and_prepare_dispatch(config_file, physical_runner):
     root = config_file.parent / "physical"
-    for kind in ("full", "incremental"):
+    config_file.write_text(config_file.read_text() + '[db]\ntype="xtrabackup"\n'
+                           'backup_root="physical/db"\nbinary="mariadb-backup"\n')
+    for flags in ((), ("--incremental",)):
         with patch("subprocess.run", side_effect=physical_runner):
-            result = invoke("--config", config_file, "xtrabackup", kind, "--database", "db",
-                            "--root", root, "--binary", "mariadb-backup")
+            result = invoke("run", "-c", config_file, "-j", "db", *flags)
         assert result.exit_code == 0, result.output
     incremental, full = history_for(config_file).records()
     assert full.backup_type == "xtrabackup-full"
@@ -377,7 +364,7 @@ def test_job_restore_root_does_not_reach_backend(config_file, physical_runner, j
                  'restore_root="job-recovery"\n')
     config_file.write_text(text)
     with patch("subprocess.run", side_effect=physical_runner):
-        result = invoke("run", "--config", config_file, job_name)
+        result = invoke("run", "-c", config_file, "-j", job_name)
     assert result.exit_code == 0, result.output
     if job_name == "daily":
         assert list((config_file.parent / "archives").glob("daily*.tar.gz")) == [
@@ -394,7 +381,7 @@ def test_restore_suggests_job_root_then_history_root(config_file):
         '[other]\ntype="file"\ntemplate_filename="paths"\n'
         'chdir="source"\nbackup_dst="archives/other"\nformat="tar.gz"\n')
     for job in ("daily", "other"):
-        result = invoke("run", "--config", config_file, job)
+        result = invoke("run", "-c", config_file, "-j", job)
         assert result.exit_code == 0, result.output
     config_file.write_text(config_file.read_text().replace(
         '[daily]', '[daily]\nrestore_root="job-recovery"'))
@@ -406,18 +393,16 @@ def test_restore_suggests_job_root_then_history_root(config_file):
     assert not (config_file.parent / "recovery").exists()
 
 
-@pytest.mark.parametrize("case", ["retention", "no-history", "number", "empty"])
+@pytest.mark.parametrize("case", ["no-history", "number", "empty"])
 def test_restore_root_misplaced_or_invalid_is_config_error(config_file, case):
     text = config_file.read_text()
     value = '5' if case == "number" else '""' if case == "empty" else '"r"'
     text = text.replace('[daily]', f'[daily]\nrestore_root={value}')
-    if case == "retention":
-        text = text.replace('type="file"', 'type="retention"')
-    elif case == "no-history":
+    if case == "no-history":
         text = text[text.index('[daily]'):]
     config_file.write_text(text)
     for flags in (("--validate",), ()):
-        result = invoke("run", "--config", config_file, "daily", *flags)
+        result = invoke("run", "-c", config_file, "-j", "daily", *flags)
         assert result.exit_code == 2, result.output
         assert "restore_root" in result.output
         assert "daily" in result.output

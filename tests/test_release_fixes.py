@@ -5,7 +5,6 @@ from __future__ import annotations
 import gzip
 import io
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -23,7 +22,6 @@ from bdbackup.config import Config, build_backend
 from bdbackup.filebackup import FileBackup
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.mysql.helpers import mysql_cnf_file
-from bdbackup.retention import BackupFile, Policy
 from bdbackup.templates import build_matcher
 from bdbackup.utils import process_lock
 from tests.conftest import write_checkpoints
@@ -36,6 +34,14 @@ def file_job(tmp_path, entries="hello\n", **kwargs):
     template = tmp_path / "paths"
     template.write_text(entries.replace("\\n", "\n"))
     return FileBackup(tmp_path / "daily", template, chdir=source, **kwargs)
+
+
+def job_config(tmp_path):
+    """A config whose ``daily`` job matches ``file_job``'s destination and template."""
+    config = tmp_path / "config.toml"
+    config.write_text('[daily]\ntype="file"\ntemplate_filename="paths"\nchdir="source"\n'
+                      'backup_dst="daily"\n')
+    return config
 
 
 @pytest.mark.parametrize("member_name", ["../escaped", "/absolute-escape"])
@@ -90,7 +96,7 @@ def test_roundtrip_preserves_directories_links_and_metadata(tmp_path, format):
     result = fb.backup()
     restored = tmp_path / "restore"
     restored.mkdir()
-    cli = CliRunner().invoke(main, ["restore", str(result.path), "-d", str(restored)])
+    cli = CliRunner().invoke(main, ["restore", "--archive", str(result.path), "-d", str(restored)])
     assert cli.exit_code == 0, cli.output
     assert (restored / "hello").read_text() == "must survive"
     assert (restored / "hardlink").stat().st_ino == (restored / "hello").stat().st_ino
@@ -104,7 +110,7 @@ def test_follow_symlinks_keeps_alias_names_and_rejects_cycles(tmp_path):
     fb = file_job(tmp_path, ".\n", follow_symlinks=True)
     (fb.chdir / "alias").symlink_to("hello")
     result = fb.backup()
-    fb.restore(tmp_path / "restore", result.path)
+    FileBackup.restore_archive(result.path, tmp_path / "restore")
     assert not (tmp_path / "restore" / "alias").is_symlink()
     assert (tmp_path / "restore" / "alias").read_text() == "must survive"
     previous = result.path.read_bytes()
@@ -192,25 +198,15 @@ def test_zstd_has_explicit_python_requirement(tmp_path):
             file_job(tmp_path, format="tar.zst")
     else:
         fb = file_job(tmp_path, format="tar.zst")
-        fb.restore(tmp_path / "restored", fb.backup().path)
+        FileBackup.restore_archive(fb.backup().path, tmp_path / "restored")
         assert (tmp_path / "restored" / "hello").read_text() == "must survive"
 
 
 def test_cli_process_returns_failure_for_missing_input(tmp_path):
     fb = file_job(tmp_path, "missing\n")
     result = subprocess.run(  # noqa: S603
-        [
-            sys.executable,
-            "-m",
-            "bdbackup.cli",
-            "file",
-            "--template",
-            str(fb.template_filename),
-            "-c",
-            str(fb.chdir),
-            "-d",
-            str(fb.backup_dst),
-        ],
+        [sys.executable, "-m", "bdbackup.cli", "run", "-c", str(job_config(tmp_path)),
+         "-j", "daily"],
         capture_output=True,
         text=True,
     )
@@ -221,43 +217,13 @@ def test_cli_process_returns_failure_for_missing_input(tmp_path):
 def test_cli_lock_contention_is_exit_three(tmp_path):
     fb = file_job(tmp_path)
     with process_lock(fb.lock_filename):
-        result = CliRunner().invoke(
-            main,
-            [
-                "file",
-                "--template",
-                str(fb.template_filename),
-                "-c",
-                str(fb.chdir),
-                "-d",
-                str(fb.backup_dst),
-            ],
-        )
+        result = CliRunner().invoke(main, ["run", "-c", str(job_config(tmp_path)), "-j", "daily"])
     assert result.exit_code == 3
 
 
-def test_password_prompt_and_parallel_database_dispatch(tmp_path):
-    with patch("bdbackup.cli.MySQLBackup") as backend:
-        backend.return_value.backup_all.return_value = [BackupResult(tmp_path / "dump")]
-        result = CliRunner().invoke(
-            main,
-            ["mysqldump", "--database", "db1,db2", "--jobs", "4", "-p"],
-            input="synthetic-secret\n",
-        )
-    assert result.exit_code == 0, result.output
-    assert "synthetic-secret" not in result.output
-    assert backend.call_args.kwargs["password"] == "synthetic-secret"  # noqa: S105
-    backend.return_value.backup_all.assert_called_once_with(["db1", "db2"])
-    backend.return_value.verify.assert_called_once()
 
-
-def test_full_dump_retains_safe_and_custom_options(tmp_path):
-    with patch("bdbackup.cli.MySQLBackup") as backend:
-        backend.return_value.backup.return_value = BackupResult(tmp_path / "dump")
-        result = CliRunner().invoke(main, ["mysqldump", "--full", "--options=--hex-blob"])
-    assert result.exit_code == 0
-    options = backend.call_args.kwargs["options"]
-    mb = MySQLBackup(options=options)
+def test_full_dump_retains_safe_and_custom_options():
+    mb = MySQLBackup(options=["--hex-blob", "--all-databases"])
     assert "--all-databases" in mb.options
     assert "--databases" not in mb.options
     assert {"--single-transaction", "--routines", "--events", "--hex-blob"} <= set(mb.options)
@@ -337,21 +303,6 @@ def test_config_expands_home_and_resolves_relative_paths(tmp_path, monkeypatch):
         job = Config(cfg).get("files")
         assert build_backend(job).backup().success
 
-
-def test_metadata_module_uses_standard_logger():
-    from bdbackup.dboperations import MySQLOps
-
-    with patch.object(MySQLOps, "_connect"):
-        ops = MySQLOps()
-    assert isinstance(ops.logger, logging.Logger)
-
-
-def test_retention_keeps_intermediate_dependencies():
-    full = BackupFile("full", "full", datetime(2026, 7, 1), 1, "name")
-    old = BackupFile("old", "incr", datetime(2026, 7, 2), 1, "name")
-    recent = BackupFile("recent", "incr", datetime(2026, 7, 29), 1, "name")
-    Policy().apply_to_incrementals([full], [old, recent], datetime(2026, 7, 29).date())
-    assert full.keep and old.keep and recent.keep
 
 
 def test_unverified_physical_backup_cannot_prune_good_backup(tmp_path, physical_runner):
@@ -489,35 +440,6 @@ def test_release_gate_uses_only_pyproject(tmp_path):
     with pytest.raises(SystemExit, match="matching pyproject.toml"):
         check_release("refs/tags/v1.2.3", root=tmp_path)
 
-
-def test_run_all_continues_after_constructor_failure(tmp_path):
-    file_job(tmp_path)
-    config = tmp_path / "jobs.toml"
-    config.write_text(
-        '[bad]\ntype="file"\nbackup_dst="bad"\ntemplate_filename="missing"\n'
-        '[good]\ntype="file"\nbackup_dst="good"\ntemplate_filename="paths"\nchdir="source"\n'
-    )
-    result = CliRunner().invoke(main, ["run", "--all", "--config", str(config)])
-    assert result.exit_code == 1
-    assert (tmp_path / "good.tar").exists()
-    assert not (tmp_path / "bad.tar").exists()
-
-
-def test_retention_defers_deletion_when_incremental_is_still_writing(tmp_path):
-    from bdbackup.retention import run_job
-    from tests.test_retention import mkfile
-
-    fulls = tmp_path / "fulls"
-    incrs = tmp_path / "incrs"
-    fulls.mkdir()
-    incrs.mkdir()
-    now = datetime(2026, 7, 29)
-    for day in (1, 2, 3):
-        mkfile(fulls, f"full_202607{day:02}_000000.mbi", datetime(2026, 7, day))
-    mkfile(incrs, "incr_20260729_000000.mbi", now - timedelta(minutes=5))
-    rc = run_job(full_dir=fulls, incr_dir=incrs, now=now, apply_changes=True)
-    assert rc == 3
-    assert len(list(fulls.iterdir())) == 3
 
 
 def test_prepare_rejects_success_without_prepared_checkpoints(tmp_path, physical_runner):

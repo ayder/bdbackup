@@ -30,7 +30,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mysql = ["PyMySQL>=1.0"]
 dev = ["pytest>=7.0", "pytest-cov", "ruff", "twine", "build"]
 
 [project.scripts]

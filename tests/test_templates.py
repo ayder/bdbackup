@@ -195,94 +195,15 @@ def _write_cli_project(tmp_path: Path) -> tuple[Path, Path]:
     return template, tmp_path / "archive"
 
 
-def test_cli_exclude_template_end_to_end(tmp_path: Path):
+
+def test_dry_run_lists_only_included_files(tmp_path: Path, caplog):
     template, archive = _write_cli_project(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        [
-            "file",
-            "--template",
-            str(template),
-            "-d",
-            str(archive),
-            "-c",
-            str(tmp_path),
-            "--exclude-template",
-            "python-dev",
-        ],
+    config = tmp_path / "jobs.toml"
+    config.write_text(
+        f'[files]\ntype = "file"\nbackup_dst = "{archive}"\ntemplate_filename = "{template}"\n'
+        f'chdir = "{tmp_path}"\nexclude_templates = ["python-dev"]\n'
     )
-    assert result.exit_code == 0, result.output
-    members = _archive_members(archive.with_suffix(".tar"))
-    assert members == {"proj/pkg/mod.py", "proj/pyproject.toml"}
-
-
-def test_cli_exclude_template_repeated_and_comma_separated(tmp_path: Path):
-    register_template(ExclusionTemplate(name="logs-dev", patterns=("*.log",)))
-    template, archive = _write_cli_project(tmp_path)
-    (tmp_path / "proj" / "debug.log").write_text("log")
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        [
-            "file",
-            "--template",
-            str(template),
-            "-d",
-            str(archive),
-            "-c",
-            str(tmp_path),
-            "--exclude-template",
-            "python-dev,logs-dev",
-            "--exclude-template",
-            "python-dev",
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    members = _archive_members(archive.with_suffix(".tar"))
-    assert members == {"proj/pkg/mod.py", "proj/pyproject.toml"}
-
-
-def test_cli_unknown_template_is_usage_error(tmp_path: Path):
-    template, archive = _write_cli_project(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        [
-            "file",
-            "--template",
-            str(template),
-            "-d",
-            str(archive),
-            "--exclude-template",
-            "cobol-dev",
-        ],
-    )
-    assert result.exit_code == 2
-    assert "cobol-dev" in result.output
-    assert "python-dev" in result.output
-
-
-def test_cli_dry_run_lists_only_included_files(tmp_path: Path, caplog):
-    template, archive = _write_cli_project(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(
-        main,
-        [
-            "--logging",
-            "DEBUG",
-            "file",
-            "--template",
-            str(template),
-            "-d",
-            str(archive),
-            "-c",
-            str(tmp_path),
-            "--exclude-template",
-            "python-dev",
-            "--dry-run",
-        ],
-    )
+    result = CliRunner().invoke(main, ["run", "-c", str(config), "-j", "files", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert not archive.with_suffix(".tar").exists()
     backed_up = [
@@ -318,7 +239,7 @@ exclude_templates = ["python-dev"]
 """
     )
     runner = CliRunner()
-    result = runner.invoke(main, ["run", "--config", str(cfg_path), "files"])
+    result = runner.invoke(main, ["run", "-c", str(cfg_path), "-j", "files"])
     assert result.exit_code == 0, result.output
     members = _archive_members(archive.with_suffix(".tar"))
     assert members == {"proj/pkg/mod.py", "proj/pyproject.toml"}

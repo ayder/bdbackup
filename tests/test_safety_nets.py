@@ -65,7 +65,7 @@ def test_file_backup_restore(tmp_path: Path):
     fb.close_archive()
 
     out = tmp_path / "out"
-    fb.restore(out, result.path)
+    FileBackup.restore_archive(result.path, out)
     assert (out / "file.txt").read_text() == "hello"
 
 

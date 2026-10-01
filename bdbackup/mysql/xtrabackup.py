@@ -169,16 +169,6 @@ class XtraBackup:
                 raise BackupError(f"{self.binary} failed ({proc.returncode}): {output.read()}")
 
     @staticmethod
-    def _read_to_lsn(checkpoints: Path) -> int | None:
-        try:
-            values = dict(
-                line.split("=", 1) for line in checkpoints.read_text().splitlines() if "=" in line
-            )
-            return int({key.strip(): value.strip() for key, value in values.items()}["to_lsn"])
-        except (OSError, ValueError, KeyError):
-            return None
-
-    @staticmethod
     def _checkpoints(target: Path) -> dict:
         checkpoint = target / "mariadb_backup_checkpoints"
         if not checkpoint.exists():
@@ -318,17 +308,22 @@ class XtraBackup:
             self.prune(acquire_lock=False)
             return result
 
+    def incremental_parent(self) -> Path:
+        """The backup the next incremental continues: the chain's tip, or its full."""
+        return self._parent(self._latest_full())
+
+    def _parent(self, full: Path) -> Path:
+        # Legacy incrementals have no reliable parent identity; never guess their chain.
+        if not (full / self.METADATA).exists():
+            raise BackupError("Legacy backup has no dependency metadata; take a new full backup")
+        self._metadata(full)
+        chain = self._chain(full)
+        return chain[-1] if chain else full
+
     def incremental_backup(self, *, acquire_lock: bool = True) -> BackupResult:
         with process_lock(self.lock_path) if acquire_lock else nullcontext():
             full = self._latest_full()
-            # Legacy incrementals have no reliable parent identity; never guess their chain.
-            if not (full / self.METADATA).exists():
-                raise BackupError(
-                    "Legacy backup has no dependency metadata; take a new full backup"
-                )
-            self._metadata(full)
-            chain = self._chain(full)
-            parent = chain[-1] if chain else full
+            parent = self._parent(full)
             target = full.parent / "Incremental" / full.name / self._identity()
             return self._create(target, full, parent)
 

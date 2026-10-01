@@ -80,14 +80,14 @@ def test_backup_records_unit_and_checksum(ledger_config, physical_runner, engine
         patch.object(MySQLBackup, "backup", mysqldump_backup(root)),
     ):
         if engine == "file":
-            result = invoke("run", "--config", ledger_config, "daily")
+            result = invoke("run", "-c", ledger_config, "-j", "daily")
         elif engine == "mysqldump":
-            result = invoke("run", "--config", ledger_config, "sql")
+            result = invoke("run", "-c", ledger_config, "-j", "sql")
         else:
-            result = invoke("run", "--config", ledger_config, "xb")
+            result = invoke("run", "-c", ledger_config, "-j", "xb")
             if engine == "xtrabackup-incremental":
                 assert result.exit_code == 0, result.output
-                result = invoke("run", "--config", ledger_config, "xb", "--incremental")
+                result = invoke("run", "-c", ledger_config, "-j", "xb", "--incremental")
     assert result.exit_code == 0, result.output
     record = records(ledger_config)[0]
     assert record.checksum == expected_checksum(Path(record.path))
@@ -107,7 +107,7 @@ def test_member_with_symlink_fails_backup(ledger_config, physical_runner):
         return result
 
     with patch("subprocess.run", side_effect=runner):
-        result = invoke("run", "--config", ledger_config, "xb")
+        result = invoke("run", "-c", ledger_config, "-j", "xb")
     assert result.exit_code == 1, result.output
     record, = records(ledger_config)
     assert record.status == "failed"
@@ -115,7 +115,7 @@ def test_member_with_symlink_fails_backup(ledger_config, physical_runner):
 
 
 def test_history_listing_shows_unit(ledger_config):
-    assert invoke("run", "--config", ledger_config, "daily").exit_code == 0
+    assert invoke("run", "-c", ledger_config, "-j", "daily").exit_code == 0
     with closing(sqlite3.connect(database(ledger_config))) as db, db:
         db.execute(
             "INSERT INTO backup_runs (job_name, backup_type, started_at, completed_at, status,"
@@ -190,10 +190,10 @@ def ledger_rows(config):
         return db.execute(query).fetchall()
 
 
-def test_history_checksum_backfills_available_records(ledger_config):
-    assert invoke("run", "--config", ledger_config, "daily").exit_code == 0
+def test_create_checksum_backfills_available_records(ledger_config):
+    assert invoke("run", "-c", ledger_config, "-j", "daily").exit_code == 0
     (ledger_config.parent / "source/hello").write_text("new content")
-    assert invoke("run", "--config", ledger_config, "daily").exit_code == 0
+    assert invoke("run", "-c", ledger_config, "-j", "daily").exit_code == 0
     with closing(sqlite3.connect(database(ledger_config))) as db, db:
         db.execute("UPDATE backup_runs SET unit=NULL, checksum=NULL")
         db.execute(
@@ -204,11 +204,11 @@ def test_history_checksum_backfills_available_records(ledger_config):
         )
     before = ledger_rows(ledger_config)
 
-    other = invoke("history", "checksum", "--config", ledger_config, "--job", "other")
+    other = invoke("history", "-c", ledger_config, "--create-checksum", "--job", "other")
     assert other.exit_code == 0, other.output
     assert ledger_rows(ledger_config) == before
 
-    result = invoke("history", "checksum", "--config", ledger_config)
+    result = invoke("history", "-c", ledger_config, "--create-checksum")
     assert result.exit_code == 0, result.output
     newest, older = [r for r in records(ledger_config) if r.job_name == "daily"]
     sql_row = next(r for r in records(ledger_config) if r.job_name == "sql")
@@ -222,8 +222,8 @@ def test_history_checksum_backfills_available_records(ledger_config):
     ]
 
 
-def test_history_checksum_unexpected_unit_exits_1(ledger_config):
-    assert invoke("run", "--config", ledger_config, "daily").exit_code == 0
+def test_create_checksum_unexpected_unit_exits_1(ledger_config):
+    assert invoke("run", "-c", ledger_config, "-j", "daily").exit_code == 0
     member = ledger_config.parent / "elsewhere/2026-09-01/Full_x"
     member.mkdir(parents=True)
     (member / "data.ibd").write_bytes(b"pages")
@@ -237,7 +237,7 @@ def test_history_checksum_unexpected_unit_exits_1(ledger_config):
             (str(member.resolve()), artifact_identity(member.resolve()), json.dumps(info)),
         )
         row_id = cursor.lastrowid
-    result = invoke("history", "checksum", "--config", ledger_config)
+    result = invoke("history", "-c", ledger_config, "--create-checksum")
     assert result.exit_code == 1, result.output
     assert f"{row_id}: skipped: unexpected unit" in result.output.splitlines()
     row = next(r for r in records(ledger_config) if r.id == row_id)

@@ -15,7 +15,7 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.gfs import runner
 from bdbackup.mysql import XtraBackup
 from tests.conftest import write_checkpoints
-from tests.test_gfs_run import DEFAULT_STAGES, Env
+from tests.test_gfs_run import Env
 
 
 def invoke(*args):
@@ -328,8 +328,6 @@ def test_dry_run_xtrabackup(file_config, physical_runner, caplog, case):
 
 def test_gfs_applies_without_dry_run(tmp_path):
     env = Env(tmp_path)
-    env.write(DEFAULT_STAGES)
-    env.config_path.write_text(env.config_path.read_text().replace("apply=true\n", ""))
     old = env.file_unit("a.tar.gz", days_ago=7)
     env.file_unit("b.tar.gz", days_ago=0)
     config = Config(env.config_path)

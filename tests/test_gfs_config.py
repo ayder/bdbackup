@@ -1,7 +1,5 @@
-"""GFS job configuration: stage parsing, the §3.1 rules, --validate and --cron."""
+"""GFS job configuration: stage parsing, the §3.1 rules and --validate."""
 
-import subprocess
-from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
@@ -60,7 +58,6 @@ def test_gfs_config_parses_stages(gfs_tree):
         Stage((root / "NFS/daily",), "daily", Keep(20, "d")),
         Stage((root / "NFS/weekly",), "weekly", Keep(8, "w")),
     )
-    assert job.params["apply"] is False
 
 
 def case_config(tmp_path, case):
@@ -114,11 +111,9 @@ def case_config(tmp_path, case):
         extra = '[daily]\ntype="file"\nbackup_dst="BACKUP/files/daily"\n'
         return (write_config(tmp_path, extra=extra),
                 f"Job 'daily' writes into first stage {p / 'BACKUP'}: set timestamp = true")
-    if case == "apply-not-bool":
-        return write_config(tmp_path, job='apply="yes"'), "apply must be true or false"
     if case == "unknown-job-key":
         return (write_config(tmp_path, job='restore_root="r"'),
-                "a gfs job accepts only type, schedule, apply and stage")
+                "a gfs job accepts only type, active and stage")
     raise AssertionError(case)
 
 
@@ -126,14 +121,14 @@ CASES = [
     "no-history", "history-in-stage", "no-stages", "unknown-stage-key", "first-two-paths",
     "first-not-daily", "period-backwards", "keep-format", "keep-bool", "keep-not-longer",
     "paths-nested", "job-into-later-stage", "xtrabackup-needs-zero", "file-needs-timestamp",
-    "apply-not-bool", "unknown-job-key",
+    "unknown-job-key",
 ]
 
 
 @pytest.mark.parametrize("case", CASES)
 def test_gfs_config_rule_violations_exit_2(gfs_tree, case):
     path, message = case_config(gfs_tree, case)
-    for args in (("run", "--validate", "--config", path), ("run", "--config", path, "gfs-main")):
+    for args in (("run", "--validate", "--config", path), ("run", "-c", path, "-j", "gfs-main")):
         result = invoke(*args)
         output = " ".join(result.output.split())
         assert result.exit_code == 2, result.output
@@ -150,16 +145,3 @@ def test_gfs_validate_reports_stage_markers(gfs_tree):
             in result.output)
     assert f"Stage path {root / 'BACKUP'}" not in result.output
 
-
-def test_gfs_cron_groups_with_retention(gfs_tree):
-    def crontab(args, **kwargs):
-        return subprocess.CompletedProcess(args, 1, "", "no crontab for testuser")
-
-    with patch("shutil.which", lambda name: f"/usr/bin/{name}"), \
-            patch("subprocess.run", side_effect=crontab):
-        result = invoke("run", "--cron", "--config", write_config(gfs_tree, job="apply=false"))
-    assert result.exit_code == 0, result.output
-    entry = next(line for line in result.output.splitlines() if line.endswith(" gfs-main"))
-    assert entry.startswith("0 4 * * * "), entry
-    assert ("# 'gfs-main': dry-run GFS (apply = false); nothing moved or deleted."
-            in result.output)

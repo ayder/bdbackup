@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import inspect
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -11,13 +11,15 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 
-from bdbackup import retention
 from bdbackup.config import Config, Job, build_backend
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import MARKER
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.mysql.helpers import mysql_cnf_file
-from bdbackup.scheduling import os_user
+
+
+def os_user() -> str:
+    return pwd.getpwuid(os.geteuid()).pw_name
 
 
 class Report:
@@ -87,7 +89,7 @@ def _binary(report: Report, name: str) -> None:
 
 
 def _settings(job: Job) -> None:
-    integer_options = {"parallel", "compress_threads", "retention_days", "throttle", "jobs", "port"}
+    integer_options = {"parallel", "compress_threads", "retention_days", "throttle", "port"}
     boolean_options = {"encrypt", "follow_symlinks", "timestamp"}
     string_options = {"user", "password", "host", "binary", "compress", "database", "format"}
     list_options = {"options", "exclude", "exclude_pattern", "exclude_templates"}
@@ -281,36 +283,6 @@ def _mysql(report: Report, backend) -> None:
         _grant_help(report, backend, account, requirements)
 
 
-def _retention(report: Report, job: Job) -> None:
-    params = dict(job.params)
-    if "apply" in params:
-        params["apply_changes"] = params.pop("apply")
-    if "pick" in params:
-        params["pick_mode"] = params.pop("pick")
-    bound = inspect.signature(retention.run_job).bind(**params)
-    bound.apply_defaults()
-    values = bound.arguments
-    for key, minimum in (
-        ("daily", 1),
-        ("weekly", 0),
-        ("monthly", 0),
-        ("incr_days", 0),
-        ("log_days", 0),
-        ("min_keep_fulls", 1),
-    ):
-        if type(values[key]) is not int or values[key] < minimum:
-            raise ValueError(f"{key} must be an integer >= {minimum}")
-    if values["pick_mode"] not in {"first", "last"}:
-        raise ValueError("pick must be first or last")
-    if not isinstance(values["apply_changes"], bool):
-        raise ValueError("apply must be true or false")
-    for key in ("full_dir", "incr_dir", "log_dir"):
-        if values[key] is not None:
-            _directory(report, Path(values[key]), key, write=values["apply_changes"])
-    report.add("INFO", "Retention mode: " + ("APPLY" if values["apply_changes"] else "DRY RUN"))
-    report.add("INFO", "Retention settings/access checked; no deletion scan or deletion performed.")
-
-
 def _gfs(report: Report, job: Job) -> None:
     for stage in job.params["stage"][1:]:
         for path in stage.paths:
@@ -322,7 +294,6 @@ def _gfs(report: Report, job: Job) -> None:
                 report.add("FAIL", f"Stage path {path}: {MARKER} missing")
             else:
                 report.add("OK", f"Stage path {path}: writable, marker present")
-    report.add("INFO", "GFS mode: " + ("APPLY" if job.params["apply"] else "DRY RUN"))
 
 
 def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
@@ -337,13 +308,15 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
             _file(report, db, "SQLite history", write=True)
         _directory(report, config.history.restore_root, "Recovery root", write=True, create=True)
     for job in jobs:
+        if not job.active:
+            report.lines.append(
+                f"\nJob {job.name!r} ({job.type}): inactive (active = false), not checked"
+            )
+            continue
         report.lines.append(f"\nJob {job.name!r} ({job.type})")
         try:
             if job.restore_root is not None:
                 _directory(report, job.restore_root, "Recovery root", write=True, create=True)
-            if job.type == "retention":
-                _retention(report, job)
-                continue
             if job.type == "gfs":
                 _gfs(report, job)
                 continue

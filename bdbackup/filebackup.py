@@ -21,9 +21,9 @@ class FileBackup:
     """Create a verified archive without replacing a good backup on failure."""
 
     FORMATS = {
-        "tar": ("w", ".tar", "r"),
-        "tar.gz": ("w:gz", ".tar.gz", "r:gz"),
-        "tar.zst": ("w:zst", ".tar.zst", "r:zst"),
+        "tar": ("w", ".tar"),
+        "tar.gz": ("w:gz", ".tar.gz"),
+        "tar.zst": ("w:zst", ".tar.zst"),
     }
 
     def __init__(
@@ -62,7 +62,7 @@ class FileBackup:
             raise ValueError(f"Unsupported format {format!r}; choose from {set(self.FORMATS)}")
         if format == "tar.zst" and sys.version_info < (3, 14):
             raise ValueError("tar.zst requires Python 3.14 or newer; use tar or tar.gz")
-        self.tar_opt, self.tar_ext, self.tar_read_opt = self.FORMATS[format]
+        self.tar_opt, self.tar_ext = self.FORMATS[format]
         self.timestamp = timestamp
         # One lock per destination, whether or not each run gets its own stamped name.
         self.lock_filename = Path(str(self.backup_dst) + self.tar_ext + ".lock")
@@ -224,7 +224,7 @@ class FileBackup:
             base = self.chdir or (None if raw_path.is_absolute() else Path.cwd())
             yield from visit(self._resolve_path(raw_path), frozenset(), base)
 
-    def backup(self, *, debug: bool = False, dry_run: bool = False) -> BackupResult:
+    def backup(self, *, dry_run: bool = False) -> BackupResult:
         if not self.backup_paths:
             self.close_archive(publish=False)
             raise BackupError("No backup paths selected; the template is empty")
@@ -233,7 +233,7 @@ class FileBackup:
             if not dry_run:
                 self.open_archive()
             for path, arcname in self._walk():
-                if debug or dry_run:
+                if dry_run:
                     self.logger.info("Would back up: %s -> %s", path, arcname)
                 before = path.stat() if self.follow_symlinks else path.lstat()
                 if not dry_run:
@@ -306,9 +306,6 @@ class FileBackup:
         except (tarfile.TarError, OSError, EOFError) as exc:
             raise BackupError(f"Restore failed: {exc}") from exc
         return dest
-
-    def restore(self, extract_dir: str | Path, archive: str | Path | None = None) -> Path:
-        return self.restore_archive(archive or self.tar_filename, extract_dir)
 
     def __enter__(self) -> FileBackup:
         return self
