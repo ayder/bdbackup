@@ -127,7 +127,12 @@ def load(history: History, first_stage: Path,
         row = rows.get(unit_text)
         if row is not None and row["deleted_at"] is not None:
             continue
-        if not path.is_relative_to(first_stage):
+        # A recorded unit is taken by any location in the job's stages, so changing the first
+        # stage's path keeps managing copies already moved (spec 2 §4.2).
+        if not path.is_relative_to(first_stage) and (
+            row is None
+            or not any(loc.stage_path in stage_paths for loc in locations[row["id"]])
+        ):
             continue
         if row is not None and judged is None:
             seen, members = [], records_of_unit
