@@ -16,6 +16,7 @@ from bdbackup.config import Config, ConfigError, Job, build_backend
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs import runner as gfs_runner
 from bdbackup.gfs import store as gfs_store
+from bdbackup.gfs import structure as gfs_structure
 from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
@@ -144,6 +145,8 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
 @click.option("--validate", "validate_only", is_flag=True,
               help="Check settings, filesystem access and MySQL grants of every job, or of "
                    "--job; run nothing.")
+@click.option("--initialize-structure", "initialize", is_flag=True,
+              help="Create the stage directories and destination markers of a gfs job.")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -154,9 +157,18 @@ def run(
     verify: bool,
     dry_run: bool,
     validate_only: bool,
+    initialize: bool,
 ) -> int:
     """Run one configured job, or validate the configuration."""
     verify_given = ctx.get_parameter_source("verify") is not ParameterSource.DEFAULT
+    if initialize:
+        for flag, given in (("--full", full), ("--incremental", incremental),
+                            ("--verify" if verify else "--no-verify", verify_given),
+                            ("--dry-run", dry_run), ("--validate", validate_only)):
+            if given:
+                raise click.UsageError(f"--initialize-structure cannot be combined with {flag}")
+        if job_name is None:
+            raise click.UsageError("--initialize-structure requires --job NAME")
     if full and incremental:
         raise click.UsageError("Choose --full or --incremental, not both")
     if validate_only:
@@ -176,6 +188,10 @@ def run(
             raise click.UsageError(str(exc)) from exc
         if not job.active:
             raise click.UsageError(f"Job {job.name!r} is inactive (active = false)")
+    if initialize:
+        if job.type != "gfs":
+            raise click.UsageError(f"--initialize-structure applies only to gfs jobs: {job.name}")
+        ctx.exit(gfs_structure.initialize(job, click.echo))
     if validate_only:
         jobs = [job] if job else list(config.jobs.values())
         if not jobs:

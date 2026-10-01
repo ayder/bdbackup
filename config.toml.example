@@ -174,7 +174,9 @@ encrypt = false
 # GFS: move bdbackup's own backups through a chain of stage directories, using
 # only the [history] ledger. Requires [history]. Jobs writing into the first
 # stage must set retention_days = 0 (xtrabackup) or timestamp = true (file).
-# Every later stage path must contain an empty .bdbackup-destination file.
+# Every later stage path must contain a .bdbackup-destination marker. Create
+# the stage directories and markers with:
+#   bdbackup run -c config.toml -j gfs-main --initialize-structure
 # After each applying run, every later stage path also receives
 # <job>.ledger.sqlite3 (here gfs-main.ledger.sqlite3), a copy of the whole
 # history database that restore can use when only a stage survives.
