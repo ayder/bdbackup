@@ -436,6 +436,31 @@ def test_removed_stage_is_refused(env):
     assert weekly.exists()
 
 
+def test_changed_first_stage_keeps_managing_cold_copies(env):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    cold = env.root / "NFS/daily/files/a.tar.gz"
+    (env.root / "HOT").mkdir()
+    env.write([(["HOT"], "daily", "5d"), *DEFAULT_STAGES[1:]])
+    later = datetime.now() + timedelta(days=60)
+    code, output = env.run_api(later)
+    assert code == 0, output
+    assert cold.exists()
+    assert f"Stage {env.abs('NFS/daily')}: 1 unit" in output, output
+    new = env.root / "HOT/files/n.tar.gz"
+    new.parent.mkdir()
+    new.write_bytes(b"new backup")
+    env._record(new, {"kind": "file"}, "files", later.date(), "file")
+    code, output = env.run_api(later)
+    assert code == 0, output
+    assert "delete files files/a.tar.gz" in output, output
+    assert not cold.exists()
+    assert env.query("SELECT deleted_at IS NOT NULL FROM gfs_units WHERE unit=?",
+                     str(a.resolve())) == [(1,)]
+    assert new.exists()
+
+
 def test_copy_holds_no_engine_lock_and_commit_defers(env):
     unit = env.xtrabackup_unit(7)
     env.xtrabackup_unit(0)

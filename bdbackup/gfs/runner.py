@@ -227,7 +227,8 @@ class _Run:
             self.step(unit, decision.action, None, None, "failed", type(exc).__name__)
 
     def run(self) -> int:
-        units, unmanaged = store.load(self.history, self.stages[0].paths[0])
+        units, unmanaged = store.load(self.history, self.stages[0].paths[0],
+                                      {path for stage in self.stages for path in stage.paths})
         placed: dict[str, tuple[store.ManagedUnit, int]] = {}
         for unit in units:
             indexes = [_stage_index(self.stages, loc) for loc in unit.locations]

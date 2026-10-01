@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -105,7 +105,8 @@ def _unit(unit_id, path, series, relative, members, locations, seen) -> ManagedU
     )
 
 
-def load(history: History, first_stage: Path) -> tuple[list[ManagedUnit], int]:
+def load(history: History, first_stage: Path,
+         stage_paths: Collection[Path] = ()) -> tuple[list[ManagedUnit], int]:
     """Return the units this chain manages and the count of unmanaged records.
 
     A record is managed only if it was available when GFS first saw it (spec 2 r7, S2). The
