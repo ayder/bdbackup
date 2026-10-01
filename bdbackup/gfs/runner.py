@@ -90,6 +90,7 @@ class _Run:
         self.tally = _Tally()
         # Unit path -> (stage index or None once deleted, size) when the run ends (§4.6).
         self.where: dict[str, tuple[int | None, int]] = {}
+        self.run_id: int | None = None
 
     def label(self, index: int | None) -> str:
         return str(self.stages[index].paths[0]) if index is not None else "-"
@@ -106,7 +107,7 @@ class _Run:
         if self.apply:
             store.record_step(self.history, self.job.name, unit.id, action,
                               source and str(source), destination and str(destination),
-                              outcome, reason)
+                              outcome, reason, self.run_id)
 
     def ensure_row(self, unit: store.ManagedUnit) -> store.ManagedUnit:
         """Record the unit the first time a run acts on it."""
@@ -236,6 +237,29 @@ class _Run:
                           str(exc) or type(exc).__name__)
 
     def run(self) -> int:
+        """Run once; an applying run records its row in ``gfs_runs`` (spec 2 r8 R1)."""
+        if self.apply:
+            self.run_id = store.begin_run(self.history, self.job.name)
+        try:
+            return self._run()
+        except BaseException:
+            if self.run_id is not None:
+                store.fail_run(self.history, self.run_id)
+            raise
+
+    def exit_code(self) -> int:
+        if self.tally.failed or self.tally.refused:
+            return 1
+        return 3 if self.tally.deferred else 0
+
+    def finish(self, unmanaged: int) -> None:
+        t = self.tally
+        counts = {"moved": t.moved, "deleted": t.deleted, "held": t.held,
+                  "deferred": t.deferred, "refused": t.refused, "failed": t.failed,
+                  "unmanaged": unmanaged}
+        store.finish_run(self.history, self.run_id, self.exit_code(), counts)
+
+    def _run(self) -> int:
         units, unmanaged, judgments = store.load(
             self.history, self.stages[0].paths[0],
             {path for stage in self.stages for path in stage.paths})
@@ -270,11 +294,15 @@ class _Run:
             unit, current = placed[decision.unit.id]
             self.act(unit, current, decision)
         if self.apply:
+            # Completed before the snapshots, so every stage copy shows this run finished; a
+            # failed copy then updates the live row's exit code and count.
+            self.finish(unmanaged)
+            failed = self.tally.failed
             self.snapshot()
+            if self.tally.failed != failed:
+                self.finish(unmanaged)
         self.report(unmanaged)
-        if self.tally.failed or self.tally.refused:
-            return 1
-        return 3 if self.tally.deferred else 0
+        return self.exit_code()
 
     def snapshot_failed(self, path: Path, reason) -> None:
         self.tally.failed += 1

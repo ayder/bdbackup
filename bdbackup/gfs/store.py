@@ -211,18 +211,34 @@ def record_delete(history: History, unit_id: int) -> None:
         db.execute("UPDATE gfs_units SET deleted_at=? WHERE id=?", (_now(), unit_id))
 
 
+RUN_COUNTS = ("moved", "deleted", "held", "deferred", "refused", "failed", "unmanaged")
+
+
 def begin_run(history: History, gfs_job: str) -> int:
     """Record an applying run as ``running``; return its id (spec 2 r8 R1)."""
-    return 0
+    with history._connect(create=True) as db:
+        return db.execute(
+            "INSERT INTO gfs_runs (gfs_job, started_at, status) VALUES (?, ?, 'running')",
+            (gfs_job, _now()),
+        ).lastrowid
 
 
 def finish_run(history: History, run_id: int, exit_code: int,
                counts: Mapping[str, int]) -> None:
     """Mark a run ``completed`` with its exit code and Summary counts."""
+    with history._connect(create=True) as db:
+        db.execute(
+            "UPDATE gfs_runs SET status='completed', finished_at=?, exit_code=?, moved=?,"
+            " deleted=?, held=?, deferred=?, refused=?, failed=?, unmanaged=? WHERE id=?",
+            (_now(), exit_code, *(counts[key] for key in RUN_COUNTS), run_id),
+        )
 
 
 def fail_run(history: History, run_id: int) -> None:
     """Mark a run ``failed``: something raised out of it."""
+    with history._connect(create=True) as db:
+        db.execute("UPDATE gfs_runs SET status='failed', finished_at=? WHERE id=?",
+                   (_now(), run_id))
 
 
 def record_step(history: History, gfs_job: str, unit_id: int | None, action: str,
@@ -231,8 +247,8 @@ def record_step(history: History, gfs_job: str, unit_id: int | None, action: str
     with history._connect(create=True) as db:
         db.execute(
             "INSERT INTO gfs_steps (run_at, gfs_job, unit_id, action, source, destination,"
-            " outcome, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (_now(), gfs_job, unit_id, action, source, destination, outcome, reason),
+            " outcome, reason, run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (_now(), gfs_job, unit_id, action, source, destination, outcome, reason, run_id),
         )
 
 
