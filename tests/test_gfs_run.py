@@ -441,6 +441,27 @@ def test_interrupted_move_completes(env):
     assert env.query("SELECT count(*) FROM gfs_locations WHERE unit_id=?", unit_id)[0][0] == 1
 
 
+def test_interrupted_move_keeps_earlier_copy_when_later_is_missing(env):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    original = a.read_bytes()
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    moved = env.root / "NFS/daily/files/a.tar.gz"
+    shutil.copy2(moved, a)
+    unit_id, = env.query("SELECT id FROM gfs_units WHERE unit=?", str(a.resolve()))[0]
+    with closing(sqlite3.connect(env.database)) as db, db:
+        db.execute("INSERT INTO gfs_locations (unit_id, stage_path, path) VALUES (?, ?, ?)",
+                   (unit_id, str(env.abs("BACKUP")), str(a.resolve())))
+    moved.unlink()
+    result = env.run_cli()
+    assert result.exit_code == 1, result.output
+    assert f"refused: missing location {env.abs('NFS/daily/files/a.tar.gz')}" in result.output
+    assert a.read_bytes() == original
+    assert env.query("SELECT path FROM gfs_locations WHERE unit_id=? ORDER BY id", unit_id) == [
+        (str(moved.resolve()),), (str(a.resolve()),)
+    ]
+
+
 def test_history_shows_stage_locations_and_deleted(env):
     a = env.file_unit("a.tar.gz", days_ago=7)
     c = env.file_unit("c.tar.gz", days_ago=70)
