@@ -233,13 +233,13 @@ REMOVED_CONFIG = {
     "retention-type": ('[old]\ntype="retention"\nfull_dir="flat"\n',
                        "Job 'old' has unsupported type 'retention'"),
     "schedule": ('[daily]\nschedule="0 2 * * *"\n',
-                 "Job 'daily': key 'schedule' was removed in 0.6.4"),
+                 "Job 'daily': key 'schedule' was removed in 0.7.0"),
     "apply": ('[gfs-main]\ntype="gfs"\napply=false\n'
               '[[gfs-main.stage]]\npaths=["BACKUP"]\nperiod="daily"\nkeep="5d"\n'
               '[[gfs-main.stage]]\npaths=["NFS/daily"]\nperiod="daily"\nkeep="20d"\n',
-              "Job 'gfs-main': key 'apply' was removed in 0.6.4"),
+              "Job 'gfs-main': key 'apply' was removed in 0.7.0"),
     "jobs": ('[sql]\ntype="mysqldump"\ndatabase="app"\njobs=2\n',
-             "Job 'sql': key 'jobs' was removed in 0.6.4"),
+             "Job 'sql': key 'jobs' was removed in 0.7.0"),
     "active-not-bool": ('[daily]\nactive="yes"\n', "Job 'daily': active must be true or false"),
 }
 
