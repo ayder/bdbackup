@@ -283,7 +283,7 @@ def _mysql(report: Report, backend) -> None:
         _grant_help(report, backend, account, requirements)
 
 
-def _gfs(report: Report, job: Job) -> None:
+def _gfs(report: Report, job: Job, config_path: Path) -> None:
     for stage in job.params["stage"][1:]:
         for path in stage.paths:
             if not path.is_dir():
@@ -291,9 +291,13 @@ def _gfs(report: Report, job: Job) -> None:
             elif not _access(path, os.W_OK | os.X_OK):
                 report.add("FAIL", f"Stage path {path}: not writable by OS user {os_user()}")
             elif not (path / MARKER).is_file():
-                report.add("FAIL", f"Stage path {path}: {MARKER} missing")
+                report.add("FAIL", f"Stage path {path}: {MARKER} missing; run bdbackup run -c "
+                                   f"{config_path} -j {job.name} --initialize-structure")
+            elif not _access(path / MARKER, os.W_OK):
+                report.add("FAIL", f"Stage path {path}: {MARKER} not writable by OS user "
+                                   f"{os_user()}")
             else:
-                report.add("OK", f"Stage path {path}: writable, marker present")
+                report.add("OK", f"Stage path {path}: writable, marker present and writable")
 
 
 def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
@@ -318,7 +322,7 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
             if job.restore_root is not None:
                 _directory(report, job.restore_root, "Recovery root", write=True, create=True)
             if job.type == "gfs":
-                _gfs(report, job)
+                _gfs(report, job, config.path)
                 continue
             if job.type not in {"file", "xtrabackup", "mysqldump"}:
                 report.add("FAIL", f"Preflight checks are not implemented for engine {job.type!r}.")

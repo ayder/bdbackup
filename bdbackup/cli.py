@@ -161,6 +161,14 @@ def run(
 ) -> int:
     """Run one configured job, or validate the configuration."""
     verify_given = ctx.get_parameter_source("verify") is not ParameterSource.DEFAULT
+    if initialize:
+        for flag, given in (("--full", full), ("--incremental", incremental),
+                            ("--verify" if verify else "--no-verify", verify_given),
+                            ("--dry-run", dry_run), ("--validate", validate_only)):
+            if given:
+                raise click.UsageError(f"--initialize-structure cannot be combined with {flag}")
+        if job_name is None:
+            raise click.UsageError("--initialize-structure requires --job NAME")
     if full and incremental:
         raise click.UsageError("Choose --full or --incremental, not both")
     if validate_only:
@@ -181,7 +189,9 @@ def run(
         if not job.active:
             raise click.UsageError(f"Job {job.name!r} is inactive (active = false)")
     if initialize:
-        ctx.exit(gfs_structure.initialize(config, job, click.echo))
+        if job.type != "gfs":
+            raise click.UsageError(f"--initialize-structure applies only to gfs jobs: {job.name}")
+        ctx.exit(gfs_structure.initialize(job, click.echo))
     if validate_only:
         jobs = [job] if job else list(config.jobs.values())
         if not jobs:
