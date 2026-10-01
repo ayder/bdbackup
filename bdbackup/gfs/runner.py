@@ -179,7 +179,8 @@ class _Run:
         self.tally.moved += 1
         self.tally.moved_bytes += unit.size
         self.line("move", unit, current, target, decision.reason)
-        self.step(unit, "move", source, finals[0], "ok", decision.reason)
+        for final in finals:
+            self.step(unit, "move", source, final, "ok", decision.reason)
 
     def delete(self, unit, current: int, decision: Decision) -> None:
         if not self.apply:
@@ -195,7 +196,17 @@ class _Run:
         self.tally.deleted += 1
         self.tally.deleted_bytes += unit.size
         self.line("delete", unit, current, None, decision.reason)
-        self.step(unit, "delete", unit.locations[0].path, None, "ok", decision.reason)
+        for location in unit.locations:
+            self.step(unit, "delete", location.path, None, "ok", decision.reason)
+
+    def paths(self, unit, decision: Decision) -> list[tuple[Path | None, Path | None]]:
+        """The (source, destination) of each step an action writes: one per path."""
+        if decision.action == "move":
+            return [(unit.locations[0].path, path / unit.relative)
+                    for path in self.stages[decision.target].paths]
+        if decision.action == "delete":
+            return [(location.path, None) for location in unit.locations]
+        return [(None, None)]
 
     def act(self, unit, current: int, decision: Decision) -> None:
         try:
@@ -220,7 +231,9 @@ class _Run:
         except Exception as exc:  # the next run retries; nothing was recorded as done
             self.tally.failed += 1
             self.line("failed", unit, current, decision.target, f"failed: {exc}")
-            self.step(unit, decision.action, None, None, "failed", type(exc).__name__)
+            for source, destination in self.paths(unit, decision):
+                self.step(unit, decision.action, source, destination, "failed",
+                          str(exc) or type(exc).__name__)
 
     def run(self) -> int:
         units, unmanaged, judgments = store.load(
