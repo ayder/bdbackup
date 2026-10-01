@@ -862,7 +862,15 @@ def retention_cmd(
 )
 @click.option("--encrypt-key-file", type=click.Path(dir_okay=False, path_type=Path),
               help="Override the encryption key file recorded in physical backup history.")
+@click.option("--archive", "archive_option", type=click.Path(path_type=Path))
+@click.option("--backup", "backup_option", type=click.Path(path_type=Path))
+@click.option("--root", "root_option", type=click.Path(path_type=Path))
+@click.option("--binary", "binary_option")
 def restore(
+    archive_option: Path | None,
+    backup_option: Path | None,
+    root_option: Path | None,
+    binary_option: str | None,
     archive: Path | None,
     dst: Path | None,
     chdir: Path | None,
@@ -960,9 +968,11 @@ def restore(
               type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--job", help="Show only this job.")
 @click.option("--successful", is_flag=True, help="Show only successful runs.")
+@click.option("--create-checksum", "create_checksum", is_flag=True)
 @click.pass_context
 def history_cmd(
     ctx: click.Context, config_path: Path | None, job: str | None, successful: bool,
+    create_checksum: bool,
 ) -> int:
     """List recorded backup attempts and whether their artifacts are still available."""
     if ctx.invoked_subcommand is not None:
@@ -1023,6 +1033,8 @@ def history_checksum(config_path: Path | None, job: str | None) -> int:
     help="TOML configuration file with job definitions.",
 )
 @click.argument("job_name", required=False)
+@click.option("-j", "--job", "job_option")
+@click.option("--dry-run", "dry_run", is_flag=True)
 @click.option("--all", "run_all", is_flag=True, help="Run every job in the config.")
 @click.option("--full", is_flag=True, help="Take a full backup (the default).")
 @click.option("--incremental", is_flag=True, help="Take an incremental backup of xtrabackup jobs.")
@@ -1039,6 +1051,8 @@ def history_checksum(config_path: Path | None, job: str | None) -> int:
 def run(
     config_path: Path | None,
     job_name: str | None,
+    job_option: str | None,
+    dry_run: bool,
     run_all: bool,
     full: bool,
     incremental: bool,

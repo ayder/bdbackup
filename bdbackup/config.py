@@ -67,6 +67,7 @@ class Config:
         for name, section in data.items():
             if not isinstance(section, dict):
                 raise ConfigError(f"Job {name!r} must be a table")
+            section = {k: v for k, v in section.items() if k != "active"}
             job_type = section.get("type")
             if job_type not in supported_types():
                 raise ConfigError(
