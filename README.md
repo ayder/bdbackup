@@ -895,6 +895,24 @@ the ledger copies written.
 database, one row per path, with its source, destination, outcome
 and reason. A failed step keeps the error message.
 
+**Run log.** Every applying run records one row in the `gfs_runs` table:
+the GFS job, start and finish time, status, exit code and the Summary counts.
+The status is `running` while the run works, `completed` once it reaches its report
+(whatever the exit code), and `failed` if the run itself crashed. A row left
+`running` shows a run that was cut off; check that run's steps for leftovers
+(Known limits below). Each `gfs_steps` row names its run in `run_id`. A dry run
+records nothing.
+
+**Running backups.** While a job has a backup in state `running` in the
+ledger, GFS leaves every backup of that job where it is, whatever its age, and
+reports each one as
+`deferred: backup running (record <id>, started <time>)`.
+Other jobs proceed as usual, and a run whose only unfinished work is these
+deferrals exits 3. A backup killed before it finished (`kill -9`, a power loss)
+leaves its row `running`, and that job stays deferred until you fix the row. After
+checking that no backup of that job is running, mark it failed:
+`sqlite3 <history database> "UPDATE backup_runs SET status = 'failed' WHERE id = <id>"`.
+
 **Restoring moved backups.** `bdbackup restore` and `bdbackup history` find a
 backup where GFS put it. `history` shows a copy that was removed or replaced as
 `unavailable`. Before restoring, every backup file used is checked against its
