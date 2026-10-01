@@ -133,6 +133,9 @@ class _Run:
         """Locations in an earlier stage are left over from a move recorded but not finished."""
         if not self.apply:
             return unit
+        for location in unit.locations:  # never remove the earlier copy unless the new ones hold
+            if location not in leftovers:
+                verify(unit, location.path)
         with ExitStack() as stack:
             _engine_locks(stack, unit, [loc.path for loc in leftovers])
             self.remove_locations(unit, leftovers, verified=False)
