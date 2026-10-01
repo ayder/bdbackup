@@ -566,6 +566,34 @@ def test_gfs_run_snapshot_failure_sets_exit_code(env):
         assert db.execute("SELECT status FROM gfs_runs").fetchall() == [("completed",)]
 
 
+def test_running_backup_defers_its_job(env):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    c = env.file_unit("c.tar.gz", days_ago=70)  # expired, but its job is still backing up
+    env.file_unit("b.tar.gz", days_ago=0)
+    env.file_unit("x.tar.gz", days_ago=7, series="other")
+    env.file_unit("y.tar.gz", days_ago=0, series="other")
+    with closing(sqlite3.connect(env.database)) as db, db:
+        running = db.execute(
+            "INSERT INTO backup_runs (job_name, backup_type, started_at, status, restore_info)"
+            " VALUES ('files', 'file', ?, 'running', '{}')", (datetime.now(UTC).isoformat(),),
+        ).lastrowid
+    result = env.run_cli()
+    assert result.exit_code == 3, result.output
+    deferred = [line for line in result.output.splitlines()
+                if f"deferred: backup running (record {running}, started " in line]
+    assert any("files/a.tar.gz" in line for line in deferred), result.output
+    assert any("files/c.tar.gz" in line for line in deferred), result.output
+    assert a.exists() and c.exists()
+    assert not (env.root / "NFS/daily/files/a.tar.gz").exists()
+    assert (env.root / "NFS/daily/files/x.tar.gz").exists()
+    with closing(sqlite3.connect(env.database)) as db, db:
+        db.execute("UPDATE backup_runs SET status='failed' WHERE id=?", (running,))
+    result = env.run_cli()
+    assert result.exit_code == 0, result.output
+    assert (env.root / "NFS/daily/files/a.tar.gz").exists()
+    assert not c.exists()
+
+
 def test_second_run_exits_3(env):
     env.file_unit("a.tar.gz", days_ago=7)
     env.file_unit("b.tar.gz", days_ago=0)
