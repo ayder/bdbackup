@@ -159,6 +159,8 @@ class _Run:
             self.line("move", unit, current, target, decision.reason)
             return
         source = unit.locations[0].path
+        for location in unit.locations[1:]:  # the source is hashed while it is copied
+            verify(unit, location.path)
         temps: list[Path] = []
         try:
             for final in finals:
