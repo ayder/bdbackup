@@ -113,6 +113,9 @@ GATE COMPLETE
 quote the last 20 lines of that step's log under the report; for a step 4 baseline mismatch,
 also the line `expected <baseline>, measured <N>`.
 
+Print nothing else: no analysis, no explanation of why a step failed, no guess whether a
+failure was intended. The report and, for a FAIL, the quoted lines are the whole answer.
+
 ## Measured baselines
 
 Measured by the runner, never calculated from a diff. The developer agent writes the new value
