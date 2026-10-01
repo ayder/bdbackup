@@ -271,6 +271,22 @@ def test_incomplete_bucket_is_held(env):
     assert "held: 2026-W40 not complete" in output, output
 
 
+def test_move_refuses_modified_mirror(env):
+    env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
+               (["NFS/weekly"], "weekly", "8w")])
+    env.file_unit("a.tar.gz", day=date(2026, 8, 30))  # a Sunday, alone in ISO week 35
+    env.file_unit("z.tar.gz", day=date(2026, 9, 29))
+    assert env.run_api(datetime(2026, 9, 5, 12))[0] == 0
+    mirror = env.root / "NFS/daily2/files/a.tar.gz"
+    mirror.write_bytes(b"tampered")
+    code, output = env.run_api(datetime(2026, 9, 29, 12))  # a's target is weekly
+    assert code == 1, output
+    assert "refused: checksum mismatch" in output
+    assert mirror.read_bytes() == b"tampered"
+    assert (env.root / "NFS/daily/files/a.tar.gz").exists()
+    assert not (env.root / "NFS/weekly/files").exists()
+
+
 def test_failed_path_leaves_no_copy(env):
     env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
                (["NFS/weekly"], "weekly", "8w")])
