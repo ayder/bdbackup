@@ -3,9 +3,9 @@
 **Backups by design.**
 
 `bdbackup` is a Python library and command-line tool for file and MySQL/MariaDB
-backups with verification, retention, and guided recovery. Define repeatable jobs,
-track their outcomes, and prepare recovery copies with explicit safeguards at
-each step.
+backups with verification, retention, and guided recovery. Define repeatable jobs
+in a TOML file, run them with one command, track their outcomes, and prepare
+recovery copies with explicit safeguards at each step.
 
 Choose the backup method that fits your data:
 
@@ -51,12 +51,6 @@ For versions published to PyPI:
 pip install bdbackup
 ```
 
-With optional MySQL metadata support:
-
-```bash
-pip install "bdbackup[mysql]"
-```
-
 For development:
 
 ```bash
@@ -65,86 +59,236 @@ cd bdbackup
 pip install -e ".[dev]"
 ```
 
-## Global options
+## Commands
 
-Place the global option before the command: `bdbackup --logging DEBUG file ...`.
-Levels: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
+`bdbackup` has three commands; everything else is an option:
+
+```bash
+bdbackup run      -c CONFIG -j JOB [--full | --incremental] [--no-verify] [--dry-run]
+bdbackup run      -c CONFIG --validate [-j JOB]
+bdbackup restore  -c CONFIG [--backup-id N] [--job JOB] [-y] [-d DIR] [--encrypt-key-file KEY]
+bdbackup restore  --archive ARCHIVE -d DIR
+bdbackup restore  --backup BACKUP --root ROOT -d DIR [--binary BINARY] [--encrypt-key-file KEY]
+bdbackup history  -c CONFIG [--job JOB] [--successful | --create-checksum]
+```
+
+`-c` is always `--config`, and `-j` is `--job`. `bdbackup` itself takes only
+`--version`, `--help` and `--logging LEVEL`, placed before the command:
+`bdbackup --logging DEBUG run -c config.toml -j files-daily`. Levels: `DEBUG`,
+`INFO`, `WARNING`, `ERROR`.
+
 The CLI uses these exit codes:
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Backup/verify failure, or configuration helper checks failed/incomplete |
-| 2 | Usage error |
-| 3 | Lock held, or retention refused an unsafe/incomplete scan |
+| 1 | Backup/verify failure, or validation checks failed/incomplete |
+| 2 | Usage or configuration error, including an inactive job |
+| 3 | Lock held; for GFS, another run of the job is in progress or only deferred work remains |
 
-## File backup
+## Config-driven jobs
 
-Create a template file listing paths (one per line, `#` for comments,
-whitespace allowed):
+Every backup is a job in a TOML config file. Convention: keep all bdbackup
+settings under `~/.config/bdbackup/` (honours `$XDG_CONFIG_HOME` /
+`$BDBACKUP_CONFIG_DIR`) — `config.toml`, the `files.template` path lists,
+`templates/*.py` exclusion presets, and `engines/*.py` database engines.
+
+```toml
+# ~/.config/bdbackup/config.toml
+[files-daily]
+type = "file"
+template_filename = "~/.config/bdbackup/files.template"
+backup_dst = "/backup/files/daily"
+chdir = "/srv/www"   # source path: template/exclude entries resolve against it
+format = "tar.gz"  # tar.zst requires Python 3.14+
+exclude_pattern = ["*.log", "node_modules"]
+exclude_templates = ["python-dev"]
+
+[mysql-prod]
+type = "xtrabackup"
+backup_root = "/backup/mysql/production"
+user = "xtrabackup"
+retention_days = 7
+parallel = 2
+
+[mysqldump-all]
+type = "mysqldump"
+out_dir = "/backup/mysql/dumps"
+user = "backup"
+options = ["--single-transaction", "--all-databases"]
+```
+
+Configuration paths expand `~`; relative config paths resolve against the
+config file's directory. Template entries and `exclude` entries resolve against
+`chdir` (or the process working directory if omitted). For a single-database
+mysqldump job, set `database = "mydatabase"`; for all databases include
+`--all-databases` in `options`.
+
+Except for the optional `[history]` settings, each top-level table is one job;
+its keys (except `type`, `active` and `restore_root`) are passed
+to the backend constructor, so they use Python-style underscores
+(`exclude_templates`). See [config.toml.example](https://github.com/ayder/bdbackup/blob/main/config.toml.example)
+for a fully annotated config with every option explained.
+
+Run one job:
+
+```bash
+bdbackup run -c ~/.config/bdbackup/config.toml -j mysql-prod
+```
+
+For an xtrabackup job, take an incremental using its own `backup_root`, credentials,
+binary, and encryption settings:
+
+```bash
+bdbackup run -c ~/.config/bdbackup/config.toml -j mysql-prod --incremental
+```
+
+`--full` is the default; an incremental requires a successful full in that job's
+root and chains to the latest successful incremental, if present. `--full` and
+`--incremental` together exit 2, and so does `--incremental` on any other job type.
+`--verify/--no-verify` applies to both backup kinds.
+
+**Dry run.** `--dry-run` reports what a job would do and changes nothing: it runs
+no backup tool, writes no file and records no history.
+
+- A file job lists every entry it would archive and the archive name.
+- A mysqldump job names the database (or all databases) and the dump directory.
+- An xtrabackup job names the backup kind and its root, and an incremental also
+  names the backup it would chain from.
+- A GFS job prints its plan.
+
+A dry run exits 1 where the real run would fail before writing anything (an
+incremental without a full, a file job that selects nothing). `--dry-run` cannot
+be combined with `--verify` or `--no-verify`.
+
+**Pausing a job.** Set `active = false` in a job's table to pause it. Every
+`run -j` of that job, including `--dry-run` and `--validate -j`, then exits 2 with
+`Job '<name>' is inactive (active = false)`, and a full `--validate` names it as
+not checked. `active` defaults to `true`. Configuration rules still apply to an
+inactive job, and GFS still rotates its backups.
+
+**Scheduling.** bdbackup does not install schedules. Add crontab lines yourself,
+run as the OS account the backups belong to. For example, a weekly full on
+Sunday, incrementals on the other days, a nightly file backup, and GFS after
+the backups:
+
+```cron
+0 2 * * 0   bdbackup run -c /opt/dbs/config.toml -j mysql-prod
+0 2 * * 1-6 bdbackup run -c /opt/dbs/config.toml -j mysql-prod --incremental
+30 2 * * *  bdbackup run -c /opt/dbs/config.toml -j files-daily
+0 4 * * *   bdbackup run -c /opt/dbs/config.toml -j gfs-main
+```
+
+Times use the cron daemon's timezone, and separate lines do not wait for each
+other: leave enough time for backups before GFS. Add `--dry-run` to the GFS line
+until its report looks right.
+
+Pruning after each full deletes whole dated chains older than `retention_days`.
+Set `retention_days` longer than the interval between fulls to preserve the previous
+full's incrementals. `retention_days = 0` disables engine deletion for the job;
+use it when GFS or another tool rotates the backups. History records physical
+backups as `xtrabackup-full` / `xtrabackup-incremental`.
+
+### Validate configuration and permissions
+
+Check all configured jobs without creating a backup or running retention:
+
+```bash
+bdbackup run -c /opt/dbs/config.toml --validate
+# Or validate only one job:
+bdbackup run -c /opt/dbs/config.toml --validate -j mysql-prod
+```
+
+`--validate` cannot be combined with `--full`, `--incremental`, `--verify`,
+`--no-verify` or `--dry-run`. Run validation as the OS account that will run your cron jobs. It checks backend
+settings, required executables, destination access, SQLite/recovery directories,
+file-template sources, and encryption key requirements. Missing directories are
+reported with `mkdir -p` guidance and the required OS-user permissions. A missing
+directory that the backend can create under a writable parent is reported as
+creatable; validation does not create it.
+
+For MySQL jobs, the installed `mysql`/`mariadb` client authenticates using the job's
+credentials and reads `CURRENT_USER()`, server version, datadir and `SHOW GRANTS`.
+Passwords are passed through a temporary mode-0600 options file, removed afterward.
+No `CREATE USER` or `GRANT` is executed. Missing privileges produce SQL for an
+administrator, for example:
+
+```sql
+GRANT RELOAD, BACKUP_ADMIN, REPLICATION CLIENT, PROCESS, LOCK TABLES
+ON *.* TO 'xtrabackup_user'@'localhost';
+GRANT SELECT ON `performance_schema`.`log_status`
+TO 'xtrabackup_user'@'localhost';
+```
+
+The helper also checks the performance-schema tables used by current Percona
+XtraBackup and prints `CREATE TABLESPACE` separately as an optional privilege for
+importing individual tables. MariaDB Backup gets its own privilege recommendations.
+See [Percona privileges](https://docs.percona.com/percona-xtrabackup/8.4/privileges.html)
+and [MariaDB Backup privileges](https://mariadb.com/docs/server/server-usage/backup-and-restore/mariadb-backup/mariadb-backup-overview).
+
+Checks cover direct grants; role-derived privileges and partial revokes may need
+manual review. Physical datadir checks cover root-directory access, not every data
+file or external tablespace. Custom mysqldump options, routine visibility, GTID
+settings and exact server/binary version compatibility still need review.
+An unreachable database or missing client is a failed/incomplete check, not a pass.
+Validation does not add SQLite history rows. It exits 0 when its checks pass, 1
+for failed or incomplete checks, and 2 for invalid command or configuration syntax.
+
+## File jobs
+
+A file job archives the paths listed in a template file (one per line, `#` for
+comments, whitespace allowed):
 
 ```text
-# backup-template.txt
+# files.template
 Documents
 Videos
 data/projects
 ```
 
-Run the backup:
+| Key | Description |
+|-----|-------------|
+| `template_filename` | Template file listing paths to archive |
+| `backup_dst` | Destination archive path (without extension) |
+| `chdir` | Source path: resolve template paths and relative excludes against it |
+| `format` | Archive format: `tar`, `tar.gz`, `tar.zst` (Python 3.14+) |
+| `exclude` | Exact paths to exclude |
+| `exclude_pattern` | Glob patterns to exclude |
+| `exclude_templates` | Named exclusion templates, e.g. `["python-dev"]` |
+| `follow_symlinks` | Follow symbolic links when archiving (default: `false`) |
+| `timestamp` | Write `<dst>-<UTC YYYY-MM-DD-HHMMSS><ext>` instead of replacing one archive; an existing name is never overwritten (default: `false`) |
 
-```bash
-bdbackup file --template backup-template.txt -d /backup/files/daily
-```
-
-Gzip-compress:
-
-```bash
-bdbackup file --template backup-template.txt -d /backup/files/daily --format tar.gz
-```
-
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `--template` | Template file listing paths to archive |
-| `-d, --dst` | Destination archive path (without extension) |
-| `-c, --chdir` | Source path: resolve template paths and relative excludes against it |
-| `-f, --format` | Archive format: `tar`, `tar.gz`, `tar.zst` (Python 3.14+) |
-| `-x, --exclude` | Exact resolved path to exclude (repeatable) |
-| `--exclude-pattern` | Glob pattern to exclude (repeatable) |
-| `--exclude-template` | Named exclusion template, e.g. `python-dev` (repeatable, comma-separated allowed) |
-| `--follow-symlinks` | Follow symbolic links when archiving |
-| `--timestamp / --no-timestamp` | Write `<dst>-<UTC YYYY-MM-DD-HHMMSS><ext>` instead of replacing one archive; an existing name is never overwritten (default: off) |
-| `--dry-run` | List what would be archived without writing anything |
-| `--verify / --no-verify` | Verify the archive after creation (default: on) |
-| `--logging` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
-
-Without `--timestamp`, every run replaces the same archive, so only the newest
+Without `timestamp`, every run replaces the same archive, so only the newest
 run stays restorable. With it, each run writes a new archive such as
 `daily-2026-09-29-020000.tar.gz`, and a run that would reuse an existing name
-fails instead. Config jobs set `timestamp = true`.
+fails instead. File jobs that GFS rotates set `timestamp = true`.
 
-Restore a file archive:
+List what a job would archive without writing anything:
 
 ```bash
-bdbackup restore /backup/files/daily.tar -d /restore/here
+bdbackup run -c config.toml -j files-daily --dry-run
+```
+
+Restore any file archive, with or without history:
+
+```bash
+bdbackup restore --archive /backup/files/daily.tar -d /restore/here
 ```
 
 ### Exclusion templates
 
-`--exclude-template` applies a named bundle of gitignore-style exclusion
+`exclude_templates` applies named bundles of gitignore-style exclusion
 patterns so you don't have to repeat common artifact rules:
 
-```bash
-bdbackup file --template backup-template.txt -d /backup/files/daily \
-    --exclude-template python-dev
+```toml
+exclude_templates = ["python-dev"]
 ```
 
 The built-in `python-dev` template skips `__pycache__/`, `*.pyc`, `.venv/`,
 `venv/`, `uv.lock`, `Pipfile.lock`, `poetry.lock`, `*.egg-info/`, `build/`,
 `dist/`, and common tool caches (`.mypy_cache/`, `.pytest_cache/`,
-`.ruff_cache/`, `.tox/`, ...). Templates are repeatable and comma-separated
-values work too; they combine with `-x/--exclude` and `--exclude-pattern`.
+`.ruff_cache/`, `.tox/`, ...). Templates combine with `exclude` and
+`exclude_pattern`.
 
 Patterns use gitignore-style syntax: `*.pyc` matches at any depth, a trailing
 `/` matches directories only, patterns containing a `/` (e.g.
@@ -168,8 +312,7 @@ TEMPLATE = ExclusionTemplate(
 
 ## Database engines
 
-`schedule` and `restore_root` are job metadata and are not passed to an engine backend.
-Custom engines accepting arbitrary keyword arguments no longer receive `restore_root`.
+`active` and `restore_root` are job metadata and are not passed to an engine backend.
 
 Database engines are pluggable and live in per-database family packages
 (`bdbackup/mysql/` today; `bdbackup/postgres/` is planned). Each engine maps a
@@ -211,92 +354,69 @@ family (e.g. `mysql_cnf_file` for credential-safe defaults files) live in
 `bdbackup/mysql/helpers.py`. A new database family means creating
 `bdbackup/postgres/` and appending `"bdbackup.postgres"` to
 `bdbackup.engines.FAMILIES` — the single deliberate modification point.
+A dry run of a custom engine exits 2: only the built-in types describe their run.
 
-## mysqldump
+## mysqldump jobs
 
-Dump a single database:
+| Key | Description |
+|-----|-------------|
+| `out_dir` | Directory for the dump file (created if missing) |
+| `database` | Database to dump; omit it and add `--all-databases` to `options` to dump everything |
+| `user`, `password`, `host`, `port` | MySQL connection (defaults: `root`, none, `localhost`, `3306`) |
+| `options` | Additional mysqldump options, as an array of strings |
 
-```bash
-bdbackup mysqldump --database mydatabase -o /backup/mysql/dumps -u root -p
-```
-
-Dump all databases:
-
-```bash
-bdbackup mysqldump --full -o /backup/mysql/dumps -u root -p
-```
-
-Parallel dumps of multiple databases:
-
-```bash
-bdbackup mysqldump --database db1,db2,db3 -o /backup/mysql/dumps -u root -p --jobs 4
-```
-
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `--database` | Database name(s), comma-separated (ignored when `--full`) |
-| `-o, --out-dir` | Directory for the dump file |
-| `-u, --user` | MySQL user |
-| `-p, --password` | MySQL password; omit value to be prompted securely |
-| `-h, --host` | MySQL host |
-| `-P, --port` | MySQL port |
-| `--options` | Comma-separated mysqldump options |
-| `--full` | Add `--all-databases` and dump everything |
-| `-j, --jobs` | Parallel dumps when multiple databases are specified |
-| `--verify / --no-verify` | Verify the dump after creation (default: on) |
-
-Use a bare `-p` to enter a password securely. Passing `-p PASSWORD` puts it in
-bdbackup's own process arguments and potentially shell history. Child database
-processes receive only a temporary credentials-file path; its contents are
-quoted, its permissions are `0600`, and it is removed after the run.
+One job dumps one database or all of them; for several selected databases, define
+one job per database. Keep a config that holds a `password` readable only by the
+backup account (`chmod 600`). Child database processes receive only a temporary
+credentials-file path; its contents are quoted, its permissions are `0600`, and it
+is removed after the run.
 
 Mysqldump retains `--single-transaction`, `--routines`, `--events` and `--triggers`
-by default. `--options` adds options; explicit `--skip-*` flags can override
-applicable defaults. `--full` retains these defaults and adds `--all-databases`.
+by default. `options` adds options; explicit `--skip-*` flags can override
+applicable defaults. `--all-databases` retains these defaults.
 Single-transaction consistency applies to transactional tables; quiesce writes
 to nontransactional tables and avoid schema changes during a dump.
 
-## xtrabackup
+## xtrabackup jobs
 
-Full backup:
+| Key | Description |
+|-----|-------------|
+| `backup_root` | Backup root directory; dated subdirectories are created underneath |
+| `user`, `password` | MySQL user and password |
+| `binary` | `xtrabackup`, `mariabackup` or `mariadb-backup` |
+| `compress` | Compression algorithm (default: uncompressed) |
+| `compress_threads` | Compression threads (default: 4) |
+| `encrypt` | AES256 backup encryption (default: `false`; Percona only) |
+| `encrypt_key_file` | Required 32-byte key file when encrypting |
+| `parallel` | Number of copy threads (default: 1) |
+| `throttle` | Limit I/O to this many IOPS |
+| `retention_days` | Days of backups to keep (default: 5); `0` disables engine deletion |
 
-```bash
-bdbackup xtrabackup full --database production -r /backup/mysql -u xtrabackup -p
-```
-
-Incremental backup (chains to the latest successful full):
-
-```bash
-bdbackup xtrabackup incremental --database production -r /backup/mysql -u xtrabackup -p
-```
-
-Prune old backups by retention days:
-
-```bash
-bdbackup xtrabackup prune --database production -r /backup/mysql --retention 7
-```
+Take a full with `run -j JOB` and an incremental, which chains to the latest
+successful full, with `run -j JOB --incremental`.
 
 Prepare a full backup or an incremental recovery point into a new directory:
 
 ```bash
-bdbackup xtrabackup prepare /backup/mysql/production/2026-09-10/Full_ID \
-    -r /backup/mysql/production -d /restore/production -u xtrabackup -p
+bdbackup restore --backup /backup/mysql/production/2026-09-10/Full_ID \
+    --root /backup/mysql/production -d /restore/production
 ```
 
-Use the exact path printed by the backup command in place of `Full_ID`. Passing
+Use the exact path printed by the backup run in place of `Full_ID`. Passing
 an incremental path prepares its full and every prerequisite incremental up to
-that point. Preparation copies sources to private working directories,
+that point. Preparation needs no MySQL credentials. `--binary` selects
+`mariadb-backup` for MariaDB backups (default: `xtrabackup`), and
+`--encrypt-key-file` is required for encrypted backups. Preparation copies sources to private working directories,
 decompresses compressed copies, applies the increments in dependency order, and
 publishes the recovery directory only on success. The destination must be new
 and outside the backup root. Original backups remain available for new
-incrementals and repeated recovery attempts.
+incrementals and repeated recovery attempts. With `[history]` configured,
+`restore -c CONFIG --backup-id N` finds the root, binary and key itself.
 
 Use XtraBackup matching your MySQL/Percona server series (8.0 with 8.0, 8.4 with
 8.4); use `mariabackup` or `mariadb-backup` matching your MariaDB installation.
 MariaDB preparation omits XtraBackup's `--apply-log-only` option. Compression is
-**off by default**. For a compatible recent XtraBackup, select `--compress zstd`;
+**off by default**. For a compatible recent XtraBackup, set `compress = "zstd"`;
 MariaDB's deprecated built-in compression accepts only `quicklz` and requires
 `qpress` for decompression. Compatibility must be established with an actual
 recovery test for the exact server and backup binary versions in use.
@@ -305,27 +425,8 @@ New physical backups record parent/full identities and LSNs in `bdbackup.json`.
 Incrementals live under `DATE/Incremental/FULL_ID/UNIQUE_ID`, and cannot attach to
 another full taken on the same day. Older backups without this metadata require
 a new full before taking further incrementals; full backups can still be
-prepared as recovery copies. Retention removes complete dated chains, preserves
+prepared as recovery copies. Engine pruning removes complete dated chains, preserves
 the newest successful full's date, and refuses to prune without a valid full.
-
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `mode` | `full`, `incremental`, `prune`, or `prepare` |
-| `--database` | Database name (used for directory naming) |
-| `-r, --root` | Backup root directory |
-| `-u, --user` | MySQL user |
-| `-p, --password` | MySQL password; omit value to be prompted securely |
-| `-b, --binary` | `xtrabackup` or `mariabackup` |
-| `--compress` | Compression algorithm (default: uncompressed) |
-| `--compress-threads` | Compression threads (default: 4) |
-| `--encrypt / --no-encrypt` | AES256 backup encryption (default: off; Percona only) |
-| `--encrypt-key-file` | Required 32-byte key file when encrypting; also used by `prepare` |
-| `--parallel` | Number of copy threads (default: 1) |
-| `--throttle` | Limit I/O to this many IOPS |
-| `--retention` | Days of backups to keep (default: 5); `0` disables engine deletion |
-| `--verify / --no-verify` | Verify the backup after creation (default: on) |
 
 A process lock prevents two backup runs from corrupting the same backup root.
 Failed backups are written to a temporary directory first and cleaned up on
@@ -362,13 +463,10 @@ it makes its encrypted backups unrecoverable. Take a new full backup when changi
 keys or encryption settings; incrementals must use their parent's settings and
 key. Encryption is not supported by the mariabackup backend.
 
-Run the configured job normally, or use the direct command:
+Run the configured job normally:
 
 ```bash
-bdbackup run --config /opt/dbs/config.toml mysql-prod
-bdbackup --config /opt/dbs/config.toml xtrabackup full \
-  --database production --root /backup/mysql \
-  --encrypt --encrypt-key-file /etc/mysql/xtrabackup.key -u mysql -p
+bdbackup run -c /opt/dbs/config.toml -j mysql-prod
 ```
 
 History records `encrypted = 1` in SQLite's `backup_runs` table for encrypted
@@ -381,263 +479,14 @@ History restore uses the recorded key path. If the key has moved, provide its
 new location:
 
 ```bash
-bdbackup restore --config /opt/dbs/config.toml --backup-id 12 \
+bdbackup restore -c /opt/dbs/config.toml --backup-id 12 \
   --dst /restore/mysql-prod-12 --encrypt-key-file /secure/saved-xtrabackup.key --yes
 ```
 
 Recovery decrypts each full/incremental work copy, then decompresses and prepares
 it. Original backups remain encrypted; the recovery directory contains plaintext.
-For manual `xtrabackup prepare`, supply `--encrypt-key-file` as well.
+For `restore --backup`, supply `--encrypt-key-file` as well.
 See [Percona's encryption documentation](https://docs.percona.com/percona-xtrabackup/8.4/encrypt-backups.html).
-
-## Retention of flat files (`type = "retention"`)
-
-This section handles flat backup files written by other tools. For bdbackup's
-own backups, use `type = "gfs"` (see [Ledger and GFS](#ledger-and-gfs)), which
-moves backups between storage tiers using the history ledger.
-
-The `bdbackup retention` command applies a grandfather-father-son policy to
-a backup tree: keep **every** backup for the last N days, then **one per ISO
-week** for N weeks, then **one per calendar month** for N months. Tiers are
-sequential and never overlap, so the retained set is deterministic and easy to
-reason about.
-
-```bash
-# Dry run (default) -- lists what would be deleted, changes nothing
-bdbackup retention --full-dir /backup/mysql/production \
-    --incr-dir /backup/mysql/production/incr \
-    --log-dir /backup/mysql/production/log \
-    --daily 7 --weekly 4 --monthly 6 \
-    --incr-days 7 --log-days 30 \
-    --min-keep-fulls 2 --pick first
-
-# Actually delete
-bdbackup retention ... --apply
-```
-
-| Tier | Flag | Meaning |
-|------|------|---------|
-| Daily | `--daily N` | Keep every backup of the last N calendar days |
-| Weekly | `--weekly N` | Then one backup per ISO week, for N weeks |
-| Monthly | `--monthly N` | Then one backup per calendar month, for N months |
-| Incrementals | `--incr-days N` | Keep incrementals for N days, never past their full |
-| Logs | `--log-days N` | Keep log files for N days |
-| Safety | `--min-keep-fulls N` | Never leave fewer than N newest fulls |
-| Pick | `--pick first/last` | Which backup survives in a weekly/monthly bucket |
-
-**Chain safety:** this flat-file policy expects one chronological backup
-stream: each new full starts a chain, and subsequent increments continue that
-chain until the next full. A retained incremental pins its full and every
-preceding incremental in that chain, including prerequisites older than the age
-window. A missing full makes an incremental an orphan. If a full/incremental
-scan skips a file (for example while it is being written), expiration is deferred
-because its dependencies are uncertain. Keep all files for a stream together;
-arbitrary overlapping chains or missing intermediate backups require explicit
-external metadata and are not supported by this filename-based policy.
-
-This command handles flat backup files such as `full_*.mbi`, not the dated
-XtraBackup directory tree. Use `bdbackup xtrabackup prune` for physical backups.
-
-Only `--full-dir` is required. `--incr-dir` and `--log-dir` are optional.
-`--full-glob`, `--incr-glob`, and `--log-glob` default to `full_*.mbi`,
-`incr_*.mbi`, and `*.log`.
-
-## Config-driven jobs
-
-For scheduled or multi-job usage, define a TOML config file. Convention:
-keep all bdbackup settings under `~/.config/bdbackup/` (honours
-`$XDG_CONFIG_HOME` / `$BDBACKUP_CONFIG_DIR`) — `config.toml`, the
-`files.template` path lists, `templates/*.py` exclusion presets, and
-`engines/*.py` database engines.
-
-```toml
-# ~/.config/bdbackup/config.toml
-[files-daily]
-type = "file"
-template_filename = "~/.config/bdbackup/files.template"
-backup_dst = "/backup/files/daily"
-chdir = "/srv/www"   # source path: template/exclude entries resolve against it
-format = "tar.gz"  # tar.zst requires Python 3.14+
-exclude_pattern = ["*.log", "node_modules"]
-exclude_templates = ["python-dev"]
-
-[mysql-prod]
-type = "xtrabackup"
-backup_root = "/backup/mysql/production"
-user = "xtrabackup"
-retention_days = 7
-parallel = 2
-
-[mysqldump-all]
-type = "mysqldump"
-out_dir = "/backup/mysql/dumps"
-user = "backup"
-options = ["--single-transaction", "--all-databases"]
-
-[mysql-prod-retention]
-type = "retention"
-full_dir = "/backup/flat/full"
-incr_dir = "/backup/flat/incr"
-log_dir = "/backup/flat/log"
-daily = 7
-weekly = 4
-monthly = 6
-incr_days = 7
-log_days = 30
-min_keep_fulls = 2
-pick = "first"
-apply = false           # set true once the dry-run output looks right
-```
-
-Configuration paths expand `~`; relative config paths resolve against the
-config file's directory. Template entries and `exclude` entries resolve against
-`chdir` (or the process working directory if omitted). For a single-database
-mysqldump job, set `database = "mydatabase"`; for all databases include
-`--all-databases` in `options`.
-
-Except for the optional `[history]` settings, each top-level table is one job;
-its keys (except `type`, `schedule`, and `restore_root`) are passed
-to the backend constructor, so they use Python-style underscores
-(`exclude_templates`), not CLI dashes. See [config.toml.example](https://github.com/ayder/bdbackup/blob/main/config.toml.example)
-for a fully annotated config with every option explained.
-
-Run one job:
-
-```bash
-bdbackup run --config ~/.config/bdbackup/config.toml mysql-prod
-```
-
-Run every job:
-
-```bash
-bdbackup run --config ~/.config/bdbackup/config.toml --all
-```
-
-For an xtrabackup job, take an incremental using its own `backup_root`, credentials,
-binary, and encryption settings:
-
-```bash
-bdbackup run --config ~/.config/bdbackup/config.toml mysql-prod --incremental
-```
-
-`--full` is the default; an incremental requires a successful full in that job's
-root and chains to the latest successful incremental, if present. `--full` and
-`--incremental` together exit 2. Selecting any non-xtrabackup job with
-`--incremental` also exits 2 before any job runs. `--verify/--no-verify` applies to
-both backup kinds. Validation and cron recommendations ignore the selector.
-
-For example, schedule a weekly full on Sunday and incrementals on the other days:
-
-```cron
-0 2 * * 0 bdbackup --config /opt/dbs/config.toml run mysql-prod
-0 2 * * 1-6 bdbackup --config /opt/dbs/config.toml run mysql-prod --incremental
-```
-
-Pruning after each full deletes whole dated chains older than `retention_days`.
-Set `retention_days` longer than the interval between fulls to preserve the previous
-full's incrementals. `retention_days = 0` disables engine deletion for the job,
-both the automatic pruning after a full and `bdbackup xtrabackup prune`; use it
-when another tool rotates the backups. History now records configured physical backups as
-`xtrabackup-full` / `xtrabackup-incremental` (previously `xtrabackup`); update filters
-that use the old type. Existing history rows are unchanged.
-
-### Validate configuration and permissions
-
-Check all configured jobs without creating a backup or running retention:
-
-```bash
-bdbackup --config /opt/dbs/config.toml --validate
-# Or validate only one job:
-bdbackup run --config /opt/dbs/config.toml mysql-prod --validate
-```
-
-Run validation as the OS account that will run your cron jobs. It checks backend
-settings, required executables, destination access, SQLite/recovery directories,
-file-template sources, and encryption key requirements. Missing directories are
-reported with `mkdir -p` guidance and the required OS-user permissions. A missing
-directory that the backend can create under a writable parent is reported as
-creatable; validation does not create it.
-
-For MySQL jobs, the installed `mysql`/`mariadb` client authenticates using the job's
-credentials and reads `CURRENT_USER()`, server version, datadir and `SHOW GRANTS`.
-Passwords are passed through a temporary mode-0600 options file, removed afterward.
-No `CREATE USER` or `GRANT` is executed. Missing privileges produce SQL for an
-administrator, for example:
-
-```sql
-GRANT RELOAD, BACKUP_ADMIN, REPLICATION CLIENT, PROCESS, LOCK TABLES
-ON *.* TO 'xtrabackup_user'@'localhost';
-GRANT SELECT ON `performance_schema`.`log_status`
-TO 'xtrabackup_user'@'localhost';
-```
-
-The helper also checks the performance-schema tables used by current Percona
-XtraBackup and prints `CREATE TABLESPACE` separately as an optional privilege for
-importing individual tables. MariaDB Backup gets its own privilege recommendations.
-See [Percona privileges](https://docs.percona.com/percona-xtrabackup/8.4/privileges.html)
-and [MariaDB Backup privileges](https://mariadb.com/docs/server/server-usage/backup-and-restore/mariadb-backup/mariadb-backup-overview).
-
-Checks cover direct grants; role-derived privileges and partial revokes may need
-manual review. Physical datadir checks cover root-directory access, not every data
-file or external tablespace. Custom mysqldump options, routine visibility, GTID
-settings and exact server/binary version compatibility still need review.
-An unreachable database or missing client is a failed/incomplete check, not a pass.
-Retention validation checks settings and directory permissions without scanning
-for deletions, even when `apply = true`. Helpers do not add SQLite history rows.
-
-### Recommend cron entries
-
-Inspect the invoking OS account's `crontab -l` and print suggested entries:
-
-```bash
-bdbackup --config /opt/dbs/config.toml --cron
-bdbackup run --config /opt/dbs/config.toml mysql-prod --cron
-# Both helpers can be used together:
-bdbackup --config /opt/dbs/config.toml --validate --cron
-```
-
-Nothing is installed or edited. Defaults are daily backups starting at 02:00 and
-retention starting at 04:00, staggered by 15 minutes within each group. Override
-the time inside any job's existing TOML section:
-
-```toml
-[mysql-prod]
-type = "xtrabackup"
-backup_root = "/backup/mysql/production"
-schedule = "30 1 * * *"
-
-[mysql-prod-retention]
-type = "retention"
-full_dir = "/backup/flat/full"
-schedule = "0 5 * * 0"
-apply = false
-```
-
-`schedule` accepts five numeric cron fields with wildcards, lists, ranges and
-steps. It is job metadata, never passed to the backup backend. The recommendations
-use absolute executable/config paths, quote shell arguments, preserve the current
-working directory and suggest the current PATH for cron. Times use the cron
-daemon's timezone. Allow enough time for backups before retention; separate cron
-entries do not establish a dependency.
-
-Matching active `bdbackup run` entries for the same config/job (or `--all`) are
-reported without suggesting duplicates. Commented entries and other configs do
-not count. Shell wrappers such as `flock`, scripts, and system-wide cron files
-are not inspected; review those separately. If crontab cannot be read, suggested
-entries are still shown but the helper exits with status 1.
-
-XtraBackup job entries run full backups, including their built-in pruning.
-The helper recommends fulls only; add an incremental cron entry yourself, for example:
-
-```cron
-0 2 * * 1-6 bdbackup --config /opt/dbs/config.toml run mysql-prod --incremental
-```
-
-Adjust the recommended full entry to your intended full-backup schedule.
-
-Separate retention jobs remain for flat backup files; `apply = false` stays a dry
-run in cron too. Validation/cron helpers exit 0 when their checks pass, 1 for failed
-or incomplete checks, and 2 for invalid command/configuration syntax.
 
 ## Backup history and guided restore
 
@@ -656,24 +505,20 @@ disables history. File jobs automatically exclude this live database and its
 SQLite journal files; keep it outside backup inputs when possible. New history
 databases are created with permissions `0600`.
 
-`run --config` records every selected backup attempt. For direct commands,
-place `--config` before the command:
+`run` records every backup attempt of a configured job:
 
 ```bash
-bdbackup run --config config.toml files-daily
-bdbackup --config config.toml mysqldump --database app,analytics --jobs 2
-bdbackup history --config config.toml
-bdbackup history --config config.toml --job files-daily --successful
+bdbackup run -c config.toml -j files-daily
+bdbackup history -c config.toml
+bdbackup history -c config.toml --job files-daily --successful
 ```
 
 Each record contains an ID, job name, backup type, UTC start/completion times,
 status (`running`, `success`, or `failed`), and the successful artifact's absolute
-path and size. Direct file commands use the destination name as the job name;
-direct database commands use the database name. Parallel dumps get one record
-per database, including when another dump fails. Physical full and incremental
-commands record their respective types and the root/binary needed for preparation.
+path and size. Physical full and incremental runs record their respective types
+and the root/binary needed for preparation.
 Credentials and raw error messages are not stored; failed rows contain only the
-exception class. Retention, restore operations, and file dry runs are not backup
+exception class. Restores, validation, GFS runs and dry runs are not backup
 attempts and do not create rows. Direct Python backend calls are not automatically
 recorded; applications can wrap them with `History.run`.
 
@@ -697,14 +542,14 @@ cd /backup/mysql/production/2026-09-29/Full_<id> && find . -type f -print0 \
 Records taken before this release have no checksum. Record them explicitly:
 
 ```bash
-bdbackup history checksum --config config.toml
-bdbackup history checksum --config config.toml --job mysql-prod
+bdbackup history -c config.toml --create-checksum
+bdbackup history -c config.toml --create-checksum --job mysql-prod
 ```
 
 It prints `<id>: recorded`, `<id>: skipped: unavailable` for an artifact that is
 missing or was replaced, or `<id>: skipped: unexpected unit` for a physical backup
 outside its dated layout, and then exits 1. A checksum already recorded is never
-changed. The checksum lives in the `checksum` column of the `backup_runs` table.
+changed. `--create-checksum` cannot be combined with `--successful`. The checksum lives in the `checksum` column of the `backup_runs` table.
 
 History uses schema version 5. An existing database upgrades on the next write;
 older bdbackup versions refuse a version-5 database.
@@ -718,14 +563,14 @@ imported automatically.
 Select a successful backup interactively:
 
 ```bash
-bdbackup restore --config config.toml
-bdbackup restore --config config.toml --job files-daily
+bdbackup restore -c config.toml
+bdbackup restore -c config.toml --job files-daily
 ```
 
 Each backup job may set `restore_root = "/restore/mysql-prod"` to override
 `[history] restore_root` for its guided-restore suggestions. It must be a nonempty
 path string; `~` expands and relative paths resolve against the config file.
-Job-level `restore_root` requires `[history]` and is not allowed on retention jobs.
+Job-level `restore_root` requires `[history]`.
 Validation checks that each job's root is writable or can be created.
 Physical jobs usually need a separate root with room for the full and its
 incrementals, staged near the database datadir.
@@ -741,7 +586,7 @@ requires a new directory even when `--dst` is supplied. For automation, specify
 the exact backup ID and use `--yes`:
 
 ```bash
-bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
+bdbackup restore -c config.toml --backup-id 12 --dst /restore/job-12 --yes
 ```
 
 - File archives are extracted into the selected directory with the existing
@@ -774,8 +619,6 @@ backup per week, per month and per year.
 ```toml
 [gfs-main]
 type = "gfs"
-apply = false               # dry run unless true
-# schedule = "0 4 * * *"
 
 [[gfs-main.stage]]
 paths = ["/BACKUP"]         # engines write here
@@ -803,8 +646,9 @@ period = "yearly"
 keep = "7y"
 ```
 
-Run it with `bdbackup run --config config.toml gfs-main`. `--cron` schedules GFS
-jobs with retention at 04:00, after backups.
+Run it with `bdbackup run -c config.toml -j gfs-main`, after the backups (see
+Scheduling under [Config-driven jobs](#config-driven-jobs)). A run applies its plan
+unless `--dry-run` is given.
 
 **Stages and ages.** `keep` is an age counted from the backup day: `Nd` days,
 `Nw` weeks, `Nm` calendar months, `Ny` years. A backup belongs to the first stage
@@ -875,8 +719,7 @@ own: xtrabackup jobs set `retention_days = 0` and file jobs set
 `timestamp = true`. Configuration validation enforces both, rejects stage paths
 that overlap, and keeps the live history database out of stage paths.
 
-`apply = false` (the default) prints what would move or be deleted and changes
-nothing. Exit codes: 0 done, 1 a refusal or failure, 2 configuration error, 3
+`--dry-run` prints what would move or be deleted and changes nothing. Exit codes: 0 done, 1 a refusal or failure, 2 configuration error, 3
 another run of the same job is in progress, or the only unfinished units were
 deferred.
 
@@ -949,7 +792,7 @@ removed by hand:
 - A restore stops when the xtrabackup copy at the first path of a stage has
   damaged checkpoints or chain metadata; it does not move on to the next path.
   Prepare the copy at another path of that stage with
-  `bdbackup xtrabackup prepare -r <directory holding the copy> -d <new dir> <backup>`.
+  `bdbackup restore --backup <backup> --root <directory holding the copy> -d <new dir>`.
 
 ## Development
 

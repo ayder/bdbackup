@@ -1,9 +1,8 @@
 # bdbackup job configuration.
 #
-# Usage:  bdbackup run --config ~/.config/bdbackup/config.toml <job-name>
-#         bdbackup run --config ~/.config/bdbackup/config.toml --all
-#         bdbackup --config ~/.config/bdbackup/config.toml --validate
-#         bdbackup --config ~/.config/bdbackup/config.toml --cron
+# Usage:  bdbackup run -c ~/.config/bdbackup/config.toml -j <job-name> [--dry-run]
+#         bdbackup run -c ~/.config/bdbackup/config.toml -j <xtrabackup job> --incremental
+#         bdbackup run -c ~/.config/bdbackup/config.toml --validate [-j <job-name>]
 #
 # All bdbackup settings live under ~/.config/bdbackup/ (honours
 # $XDG_CONFIG_HOME and $BDBACKUP_CONFIG_DIR):
@@ -13,16 +12,15 @@
 #   engines/*.py         user-defined database engines (see README "Database engines")
 #
 # Except for [history], each top-level table is one job; its name is the table name and it must
-# set `type`: file | mysqldump | xtrabackup | retention, or any engine
+# set `type`: file | mysqldump | xtrabackup | gfs, or any engine
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
-# Optional schedule = "0 2 * * *" sets a five-field numeric cron recommendation.
-# --cron reads crontab -l and prints suggestions; it never installs entries.
-# Without schedule, backups start daily at 02:00 and retention at 04:00,
-# staggered by 15 minutes. --validate checks settings/access/grants without backups.
-# Other keys (except type and schedule) are passed to the backend/policy constructor
-# (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup /
-# bdbackup.retention.run_job), so key names use Python-style underscores
-# (e.g. exclude_templates), NOT the CLI's dashes (--exclude-template).
+# Any job may set active = false to pause it: `run -j` then refuses it (exit 2)
+# and --validate names it as not checked. Schedule jobs with your own crontab
+# lines (see the README, "Scheduling"). --validate checks settings/access/grants
+# without backups.
+# Other keys (except type, active and restore_root) are passed to the backend
+# constructor (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup),
+# so key names use Python-style underscores (e.g. exclude_templates).
 # Paths expand ~ and resolve relative to this config file; template/exclude
 # entries resolve relative to chdir (or the process working directory).
 # A key that doesn't match a constructor/parameter fails the job with a TypeError.
@@ -37,14 +35,11 @@
 database = "history.sqlite3"
 restore_root = "/restore/bdbackup"  # default: ./restores beside this config; jobs may override it
 
-# Configured jobs record automatically; direct commands opt in via:
-#   bdbackup --config config.toml file ...
-#   bdbackup --config config.toml mysqldump ...
-# Browse and recover successful backups:
-#   bdbackup history --config config.toml
-#   bdbackup history checksum --config config.toml   # checksum older records
-#   bdbackup restore --config config.toml
-#   bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
+# Every job run records automatically. Browse and recover successful backups:
+#   bdbackup history -c config.toml
+#   bdbackup history -c config.toml --create-checksum   # checksum older records
+#   bdbackup restore -c config.toml
+#   bdbackup restore -c config.toml --backup-id 12 --dst /restore/job-12 --yes
 
 # ---------------------------------------------------------------------------
 # File backup: tar archive built from a plain-text template of paths.
@@ -104,8 +99,8 @@ exclude_pattern = ["*.log", "node_modules"]
 exclude_templates = ["python-dev"]
 
 # ---------------------------------------------------------------------------
-# mysqldump: logical dump of one database (or all, when using --full on CLI;
-# config jobs select `database`, or --all-databases in options).
+# mysqldump: logical dump of one database (`database`), or of all databases
+# (--all-databases in options). Define one job per database to dump several.
 # ---------------------------------------------------------------------------
 [mysql-dump]
 type = "mysqldump"
@@ -114,17 +109,13 @@ type = "mysqldump"
 out_dir = "/backup/mysql/dumps"
 
 user = "backup"                  # MySQL user
-# password = "secret"            # prefer omitting; CLI can prompt securely
+# password = "secret"            # keep this file chmod 600 when it holds a password
 host = "localhost"
 port = 3306
 
-# mysqldump options as an array of strings (CLI takes them comma-separated).
 database = "mydatabase"
+# mysqldump options as an array of strings.
 options = []  # safe defaults include single-transaction, routines, events, triggers
-
-# Parallel multi-database dumps are available through the CLI. Each config
-# job selects one database, or --all-databases in options.
-jobs = 1
 
 # ---------------------------------------------------------------------------
 # xtrabackup/mariabackup: physical backups with retention-based pruning.
@@ -133,7 +124,6 @@ jobs = 1
 type = "xtrabackup"
 # Guided recovery staging root for this job; requires [history].
 # restore_root = "/restore/mysql-prod"
-# schedule = "0 2 * * *"         # optional override for --cron
 
 # Root directory for this job's backups; dated subdirectories are created
 # underneath.
@@ -181,42 +171,6 @@ encrypt = false
 # Start a new full backup when changing the key or enabling/disabling encryption.
 
 # ---------------------------------------------------------------------------
-# GFS retention policy for a backup tree (dry-run by default; set apply=true
-# to actually delete files). Incrementals are chain-safe: they never outlive
-# their parent full, and a full that still anchors a live incremental is kept.
-# This handles flat files written by other tools; bdbackup's own backups are
-# rotated by type = "gfs" below.
-# ---------------------------------------------------------------------------
-[mysql-prod-retention]
-type = "retention"
-# schedule = "0 4 * * *"         # optional override for --cron
-
-# Flat files from ONE chronological stream; not the XtraBackup directory layout.
-# Kept increments also pin their preceding increments and full backup.
-# Required. Directories containing full / incremental / log backups.
-full_dir = "/backup/flat/full"
-incr_dir = "/backup/flat/incr"   # optional; omit if none
-log_dir = "/backup/flat/log"     # optional; omit if none
-
-# GFS tier counts.
-daily = 7                # keep EVERY backup of the last 7 calendar days
-weekly = 4               # then one backup per ISO week, for 4 weeks
-monthly = 6              # then one backup per calendar month, for 6 months
-
-# How many days of incrementals to keep, how many days of logs, and which
-# backup in a weekly/monthly bucket survives.
-incr_days = 7
-log_days = 30
-pick = "first"           # "first" (oldest/stable) or "last" (newest)
-
-# Safety floor: never leave fewer than this many newest fulls, whatever the
-# tiers say. Useful after a clock skew, restore from tape, etc.
-min_keep_fulls = 2
-
-# CRITICAL: default is false (dry run). Inspect the output, then set true.
-apply = false
-
-# ---------------------------------------------------------------------------
 # GFS: move bdbackup's own backups through a chain of stage directories, using
 # only the [history] ledger. Requires [history]. Jobs writing into the first
 # stage must set retention_days = 0 (xtrabackup) or timestamp = true (file).
@@ -225,10 +179,10 @@ apply = false
 # <job>.ledger.sqlite3 (here gfs-main.ledger.sqlite3), a copy of the whole
 # history database that restore can use when only a stage survives.
 # ---------------------------------------------------------------------------
+# Run it after the backups: bdbackup run -c config.toml -j gfs-main
+# Add --dry-run to print what would change without changing anything.
 [gfs-main]
 type = "gfs"
-apply = false                    # dry run unless true: prints what would change
-# schedule = "0 4 * * *"         # optional override for --cron
 
 # Stages in chain order. keep is an age from the backup day (Nd, Nw, Nm, Ny)
 # and grows along the chain; period thins a stage to the newest backup of each
