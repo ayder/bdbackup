@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bdbackup"
-version = "0.6.3"
-description = "File and MySQL/MariaDB backups with verification, retention, and guided recovery"
+version = "0.7.0"
+description = "MySQL, MariaDB and file backups with mysqldump, Percona XtraBackup, MariaDB Backup and tar: verification, GFS rotation and guided restore"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -13,15 +13,23 @@ requires-python = ">=3.12"
 authors = [
     { name = "Sinan Alyuruk", email = "sinan@dbsmedya.com" },
 ]
-keywords = ["backup", "tar", "mysql", "xtrabackup", "mariabackup"]
+keywords = [
+    "backup", "restore", "mysql", "mariadb", "percona", "xtrabackup", "mariabackup",
+    "mariadb-backup", "mysqldump", "incremental-backup", "tar", "gfs",
+    "grandfather-father-son", "backup-rotation", "cli",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: System Administrators",
+    "Operating System :: MacOS",
     "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
     "Topic :: System :: Archiving :: Backup",
 ]
 
@@ -38,6 +46,7 @@ bdbackup = "bdbackup.cli:main"
 [project.urls]
 Homepage = "https://github.com/ayder/bdbackup"
 Repository = "https://github.com/ayder/bdbackup"
+Documentation = "https://github.com/ayder/bdbackup/blob/master/README.md"
 Issues = "https://github.com/ayder/bdbackup/issues"
 
 [tool.hatch.build.targets.wheel]
@@ -48,6 +57,7 @@ include = [
     "/bdbackup",
     "/tests",
     "/README.md",
+    "/docs",
     "/LICENSE",
     "/config.toml.example",
     "/template.txt",
