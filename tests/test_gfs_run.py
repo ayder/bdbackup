@@ -302,7 +302,7 @@ def test_failed_path_leaves_no_copy(env):
     assert a.exists()
     assert env.query("SELECT count(*) FROM gfs_locations WHERE stage_path != ?",
                      str(env.abs("BACKUP")))[0][0] == 0
-    assert env.query("SELECT count(*) FROM gfs_steps WHERE outcome='failed'")[0][0] == 1
+    assert env.query("SELECT count(*) FROM gfs_steps WHERE outcome='failed'")[0][0] == 2
     second = env.run_cli()
     assert second.exit_code == 0, second.output
     assert (env.root / "NFS/daily/files/a.tar.gz").exists()
@@ -327,6 +327,50 @@ def test_checksum_mismatch_refused_until_accepted(env):
     code, output = env.run_api(datetime(2026, 10, 2, 12))
     assert code == 0, output
     assert (env.root / "NFS/daily/files/a.tar.gz").read_bytes() == b"changed on disk"
+
+
+TWO_DAILY_PATHS = [(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
+                   (["NFS/weekly"], "weekly", "8w")]
+
+
+class _FailingCopy(actions.LocalTransport):
+    def copy(self, source, temp, on_file):
+        raise OSError("injected copy failure")
+
+
+def test_steps_record_paths_and_failure_reason(env):
+    env.write(TWO_DAILY_PATHS)
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    config = Config(env.config_path)
+    lines = []
+    code = runner.run_job(config, config.get("gfs-main"), transport=_FailingCopy(),
+                          out=lines.append)
+    assert code == 1, lines
+    finals = [str(env.abs(f"{stage}/files/a.tar.gz")) for stage in ("NFS/daily", "NFS/daily2")]
+    assert env.query("SELECT action, source, destination, reason FROM gfs_steps"
+                     " WHERE outcome='failed' ORDER BY id") == [
+        ("move", str(a.resolve()), final, "injected copy failure") for final in finals
+    ]
+    code, output = env.run_api(datetime.now())
+    assert code == 0, output
+    assert env.query("SELECT action, source, destination FROM gfs_steps"
+                     " WHERE outcome='ok' ORDER BY id") == [
+        ("move", str(a.resolve()), final) for final in finals
+    ]
+
+
+def test_delete_step_names_every_location(env):
+    env.write(TWO_DAILY_PATHS)
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_api(datetime.now())[0] == 0
+    code, output = env.run_api(datetime.now() + timedelta(days=60))  # a is expired
+    assert code == 0, output
+    assert env.query("SELECT source, destination FROM gfs_steps WHERE action='delete'"
+                     " AND outcome='ok' ORDER BY id") == [
+        (str(env.abs(f"{stage}/files/a.tar.gz")), None) for stage in ("NFS/daily", "NFS/daily2")
+    ]
 
 
 def test_unexpected_entry_refused(env):
