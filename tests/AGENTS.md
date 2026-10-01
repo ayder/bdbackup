@@ -120,4 +120,4 @@ here and commits it with the candidate before calling the gate; the gate agent n
 
 | Baseline | Kind | Current value | Runner | Measured at |
 |---|---|---|---|---|
-| Unit test count | inventory | 345 passed | `.venv/bin/python -m pytest -q` | `7aa35a8` |
+| Unit test count | inventory | 345 passed | `.venv/bin/python -m pytest -q` | `23b3d99` |
