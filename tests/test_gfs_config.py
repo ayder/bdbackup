@@ -1,5 +1,6 @@
 """GFS job configuration: stage parsing, the §3.1 rules and --validate."""
 
+import os
 
 import pytest
 from click.testing import CliRunner
@@ -7,6 +8,7 @@ from click.testing import CliRunner
 from bdbackup.cli import main
 from bdbackup.config import Config
 from bdbackup.gfs.stages import Keep, Stage
+from bdbackup.validation import os_user
 
 STAGES = [
     ('["BACKUP"]', "daily", '"5d"'),
@@ -137,11 +139,28 @@ def test_gfs_config_rule_violations_exit_2(gfs_tree, case):
 
 def test_gfs_validate_reports_stage_markers(gfs_tree):
     (gfs_tree / "NFS/weekly/.bdbackup-destination").unlink()
-    result = invoke("run", "--validate", "--config", write_config(gfs_tree))
+    path = write_config(gfs_tree)
+    result = invoke("run", "--validate", "--config", path)
     root = gfs_tree.resolve()
+    lines = result.output.splitlines()
     assert result.exit_code == 1, result.output
-    assert f"[OK] Stage path {root / 'NFS/daily'}: writable, marker present" in result.output
-    assert (f"[FAIL] Stage path {root / 'NFS/weekly'}: .bdbackup-destination missing"
-            in result.output)
+    assert (f"[OK] Stage path {root / 'NFS/daily'}: writable, marker present and writable"
+            in lines), result.output
+    assert (f"[FAIL] Stage path {root / 'NFS/weekly'}: .bdbackup-destination missing; "
+            f"run bdbackup run -c {path.resolve()} -j gfs-main --initialize-structure"
+            in lines), result.output
     assert f"Stage path {root / 'BACKUP'}" not in result.output
+
+
+def test_validate_marker_not_writable(gfs_tree):
+    assert os.geteuid() != 0, "permission tests need a non-root user"
+    marker = gfs_tree / "NFS/weekly/.bdbackup-destination"
+    marker.chmod(0o444)
+    try:
+        result = invoke("run", "--validate", "--config", write_config(gfs_tree))
+    finally:
+        marker.chmod(0o644)
+    assert result.exit_code == 1, result.output
+    assert (f"[FAIL] Stage path {gfs_tree.resolve() / 'NFS/weekly'}: .bdbackup-destination "
+            f"not writable by OS user {os_user()}" in result.output.splitlines()), result.output
 

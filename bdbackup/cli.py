@@ -16,6 +16,7 @@ from bdbackup.config import Config, ConfigError, Job, build_backend
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs import runner as gfs_runner
 from bdbackup.gfs import store as gfs_store
+from bdbackup.gfs import structure as gfs_structure
 from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
@@ -144,6 +145,8 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
 @click.option("--validate", "validate_only", is_flag=True,
               help="Check settings, filesystem access and MySQL grants of every job, or of "
                    "--job; run nothing.")
+@click.option("--initialize-structure", "initialize", is_flag=True,
+              help="Create the stage directories and destination markers of a gfs job.")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -154,6 +157,7 @@ def run(
     verify: bool,
     dry_run: bool,
     validate_only: bool,
+    initialize: bool,
 ) -> int:
     """Run one configured job, or validate the configuration."""
     verify_given = ctx.get_parameter_source("verify") is not ParameterSource.DEFAULT
@@ -176,6 +180,8 @@ def run(
             raise click.UsageError(str(exc)) from exc
         if not job.active:
             raise click.UsageError(f"Job {job.name!r} is inactive (active = false)")
+    if initialize:
+        ctx.exit(gfs_structure.initialize(config, job, click.echo))
     if validate_only:
         jobs = [job] if job else list(config.jobs.values())
         if not jobs:
