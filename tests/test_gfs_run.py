@@ -341,6 +341,19 @@ def test_unexpected_entry_refused(env):
     assert tree(unit) == before
 
 
+def test_symlink_inside_member_refused(env):
+    unit = env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+    full_name = next(p.name for p in unit.iterdir() if p.name.startswith("Full_2"))
+    (unit / full_name / "evil").symlink_to("/etc/passwd")
+    before = tree(unit)
+    result = env.run_cli()
+    assert result.exit_code == 1, result.output
+    assert f"refused: unexpected entry {full_name}/evil" in result.output
+    assert tree(unit) == before
+    assert not (env.root / "NFS/daily/mysql").exists()
+
+
 def test_unrecorded_files_untouched(env):
     env.file_unit("b.tar.gz", days_ago=0)
     old = env.root / "BACKUP/files/old.tar.gz"
