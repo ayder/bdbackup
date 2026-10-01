@@ -848,9 +848,10 @@ a temporary name, checks every checksum while reading the source, and removes
 the original only after every copy is in place and recorded; a failed copy
 removes its temporary copies and the next run retries. Before a move,
 every copy of the unit is checked, not only the one copied, and
-copies keep the permission bits of every file and directory. When a
-move was recorded but its old copy was not yet removed, the next run removes it
-only after the new copies verify. Copies hold no backup lock,
+copies keep the permission bits of every file and directory. If the
+ledger lists a unit in two stages (left by an earlier version or a hand edit),
+the next run removes the earlier copy only after the later copies verify.
+Copies hold no backup lock,
 so a slow NFS copy never blocks a backup; if an xtrabackup root is locked when
 GFS commits, the unit is reported `deferred: locked` and retried next run. GFS
 only touches backups recorded in the ledger. It refuses, and reports:
@@ -923,10 +924,14 @@ removed by hand:
 - A delete failed part way. The next run reports `refused: missing location …`
   for a copy already removed. Delete its row with
   `sqlite3 <history database> "DELETE FROM gfs_locations WHERE path = '<path>'"`.
+  If that was the unit's last row, also mark the unit deleted, or later runs
+  report `refused: stage not configured`:
+  `sqlite3 <history database> "UPDATE gfs_units SET deleted_at = datetime('now') WHERE id = <unit_id>"`
+  (the `unit_id` of the row you deleted).
 - A restore stops when the xtrabackup copy at the first path of a stage has
   damaged checkpoints or chain metadata; it does not move on to the next path.
-  Prepare the copy at another path with `bdbackup xtrabackup prepare`, giving
-  that copy's parent directory as `--root`.
+  Prepare the copy at another path of that stage with
+  `bdbackup xtrabackup prepare -r <directory holding the copy> -d <new dir> <backup>`.
 
 ## Development
 
