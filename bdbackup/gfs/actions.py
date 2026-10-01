@@ -59,27 +59,35 @@ class LocalTransport:
         return digest.hexdigest()
 
     def copy(self, source: Path, temp: Path, on_file: Callable[[str, str], None]) -> None:
-        """Copy a file or tree; report each regular file's relative path and SHA-256."""
+        """Copy a file or tree; report each regular file's relative path and SHA-256.
+
+        Directories are created private and receive the source's permission bits once their
+        contents are copied, bottom-up, so a read-only source directory never blocks the copy.
+        """
         if stat.S_ISREG(source.lstat().st_mode):
             on_file(".", self._copy_file(source, temp))
             return
-        temp.mkdir()
+        temp.mkdir(mode=0o700)
+        directories: list[tuple[Path, Path]] = []
         for directory, names, files in os.walk(source):
             here = Path(directory)
             target_dir = temp / here.relative_to(source)
+            directories.append((here, target_dir))
             for name in sorted(names + files):
                 entry, target = here / name, target_dir / name
                 mode = entry.lstat().st_mode
                 if stat.S_ISLNK(mode):
                     os.symlink(os.readlink(entry), target)
                 elif stat.S_ISDIR(mode):
-                    target.mkdir()
+                    target.mkdir(mode=0o700)
                 elif stat.S_ISREG(mode):
                     relative = entry.relative_to(source).as_posix()
                     on_file(relative, self._copy_file(entry, target))
                 else:
                     raise Refusal(f"unexpected entry {entry.relative_to(source).as_posix()}")
             _fsync_dir(target_dir)
+        for here, target_dir in reversed(directories):
+            os.chmod(target_dir, stat.S_IMODE(here.lstat().st_mode))
 
     def rename(self, temp: Path, final: Path) -> None:
         if os.path.lexists(final):
