@@ -531,6 +531,41 @@ def test_copy_holds_no_engine_lock_and_commit_defers(env):
     assert not unit.exists()
 
 
+def test_gfs_run_is_recorded(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    result = env.run_cli()
+    assert result.exit_code == 0, result.output
+    assert env.query(
+        "SELECT gfs_job, status, exit_code, moved, deleted, held, deferred, refused, failed,"
+        " unmanaged, started_at IS NOT NULL, finished_at IS NOT NULL FROM gfs_runs"
+    ) == [("gfs-main", "completed", 0, 1, 0, 0, 0, 0, 0, 0, 1, 1)]
+    run_ids = {row[0] for row in env.query("SELECT run_id FROM gfs_steps")}
+    assert run_ids == {env.query("SELECT id FROM gfs_runs")[0][0]}
+
+
+def test_gfs_run_crash_is_recorded_failed(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    config = Config(env.config_path)
+    with patch("bdbackup.gfs.runner.decide", side_effect=RuntimeError("injected")):
+        with pytest.raises(RuntimeError, match="injected"):
+            runner.run_job(config, config.get("gfs-main"), out=lambda _line: None)
+    assert env.query("SELECT status, finished_at IS NOT NULL FROM gfs_runs") == [("failed", 1)]
+
+
+def test_gfs_run_snapshot_failure_sets_exit_code(env):
+    (env.root / "NFS/weekly/.bdbackup-destination").unlink()
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    result = env.run_cli()
+    assert result.exit_code == 1, result.output
+    assert env.query("SELECT status, exit_code, failed FROM gfs_runs") == [("completed", 1, 1)]
+    snapshot = env.root / "NFS/daily/gfs-main.ledger.sqlite3"
+    with closing(sqlite3.connect(snapshot)) as db:
+        assert db.execute("SELECT status FROM gfs_runs").fetchall() == [("completed",)]
+
+
 def test_second_run_exits_3(env):
     env.file_unit("a.tar.gz", days_ago=7)
     env.file_unit("b.tar.gz", days_ago=0)

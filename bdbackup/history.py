@@ -165,6 +165,28 @@ class History:
                             managed INTEGER NOT NULL CHECK(managed IN (0, 1))
                         )"""
                     )
+                    # One row per applying GFS run, and the run each step belongs to (r8 R1).
+                    connection.execute(
+                        """CREATE TABLE gfs_runs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            gfs_job TEXT NOT NULL,
+                            started_at TEXT NOT NULL,
+                            finished_at TEXT,
+                            status TEXT NOT NULL
+                                CHECK(status IN ('running', 'completed', 'failed')),
+                            exit_code INTEGER,
+                            moved INTEGER,
+                            deleted INTEGER,
+                            held INTEGER,
+                            deferred INTEGER,
+                            refused INTEGER,
+                            failed INTEGER,
+                            unmanaged INTEGER
+                        )"""
+                    )
+                    connection.execute(
+                        "ALTER TABLE gfs_steps ADD COLUMN run_id INTEGER REFERENCES gfs_runs(id)"
+                    )
                     # Units recorded before this table managed every record of the unit.
                     connection.execute(
                         """INSERT INTO gfs_members (record_id, managed)

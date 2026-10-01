@@ -254,7 +254,7 @@ def test_old_history_reads_without_mutation_and_migrates_on_write(tmp_path):
     with closing(sqlite3.connect(path)) as db:
         for column in ("encrypted", "unit", "checksum"):
             db.execute(f"ALTER TABLE backup_runs DROP COLUMN {column}")
-        for table in ("gfs_members", "gfs_steps", "gfs_locations", "gfs_units"):
+        for table in ("gfs_members", "gfs_steps", "gfs_runs", "gfs_locations", "gfs_units"):
             db.execute(f"DROP TABLE {table}")
         db.execute("PRAGMA user_version=1")
         db.commit()

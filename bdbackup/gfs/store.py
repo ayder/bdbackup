@@ -211,9 +211,23 @@ def record_delete(history: History, unit_id: int) -> None:
         db.execute("UPDATE gfs_units SET deleted_at=? WHERE id=?", (_now(), unit_id))
 
 
+def begin_run(history: History, gfs_job: str) -> int:
+    """Record an applying run as ``running``; return its id (spec 2 r8 R1)."""
+    return 0
+
+
+def finish_run(history: History, run_id: int, exit_code: int,
+               counts: Mapping[str, int]) -> None:
+    """Mark a run ``completed`` with its exit code and Summary counts."""
+
+
+def fail_run(history: History, run_id: int) -> None:
+    """Mark a run ``failed``: something raised out of it."""
+
+
 def record_step(history: History, gfs_job: str, unit_id: int | None, action: str,
                 source: str | None, destination: str | None, outcome: str,
-                reason: str | None) -> None:
+                reason: str | None, run_id: int | None = None) -> None:
     with history._connect(create=True) as db:
         db.execute(
             "INSERT INTO gfs_steps (run_at, gfs_job, unit_id, action, source, destination,"
