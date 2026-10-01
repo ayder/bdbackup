@@ -52,7 +52,7 @@ nothing else.
 
 | Baseline | Kind | Current value | Runner | Measured at |
 |---|---|---|---|---|
-| Unit test count | inventory | 321 passed | `.venv/bin/python -m pytest -q` | `5d6d203` |
+| Unit test count | inventory | 343 passed | `.venv/bin/python -m pytest -q` | `4f1bad9` |
 
 The coordinator updates this table after the runner reports; the gate agent never edits it.
 
