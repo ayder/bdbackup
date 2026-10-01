@@ -89,7 +89,7 @@ class History:
                 if create:
                     connection.execute("BEGIN IMMEDIATE")
                 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-                if schema not in (0, 1, 2, 3, 4) or (not create and schema == 0):
+                if schema not in (0, 1, 2, 3, 4, 5) or (not create and schema == 0):
                     raise HistoryError(f"Unsupported history schema version: {schema}")
                 if create and schema == 0:
                     connection.execute(
@@ -155,6 +155,46 @@ class History:
                         )"""
                     )
                     connection.execute("PRAGMA user_version = 4")
+                if create and schema in (0, 1, 2, 3, 4):
+                    # Restore and snapshots (spec 2 PR 3): the identity of each member at a
+                    # copied location, and each record's S2 judgment when GFS first saw it.
+                    connection.execute("ALTER TABLE gfs_locations ADD COLUMN identities TEXT")
+                    connection.execute(
+                        """CREATE TABLE gfs_members (
+                            record_id INTEGER PRIMARY KEY REFERENCES backup_runs(id),
+                            managed INTEGER NOT NULL CHECK(managed IN (0, 1))
+                        )"""
+                    )
+                    # One row per applying GFS run, and the run each step belongs to (r8 R1).
+                    connection.execute(
+                        """CREATE TABLE gfs_runs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            gfs_job TEXT NOT NULL,
+                            started_at TEXT NOT NULL,
+                            finished_at TEXT,
+                            status TEXT NOT NULL
+                                CHECK(status IN ('running', 'completed', 'failed')),
+                            exit_code INTEGER,
+                            moved INTEGER,
+                            deleted INTEGER,
+                            held INTEGER,
+                            deferred INTEGER,
+                            refused INTEGER,
+                            failed INTEGER,
+                            unmanaged INTEGER
+                        )"""
+                    )
+                    connection.execute(
+                        "ALTER TABLE gfs_steps ADD COLUMN run_id INTEGER REFERENCES gfs_runs(id)"
+                    )
+                    # Units recorded before this table managed every record of the unit.
+                    connection.execute(
+                        """INSERT INTO gfs_members (record_id, managed)
+                           SELECT backup_runs.id, 1 FROM backup_runs
+                           JOIN gfs_units ON gfs_units.unit = backup_runs.unit
+                           WHERE backup_runs.status = 'success'"""
+                    )
+                    connection.execute("PRAGMA user_version = 5")
                 yield connection
         except (OSError, sqlite3.Error) as exc:
             raise HistoryError(f"Cannot access history database {path}: {exc}") from exc

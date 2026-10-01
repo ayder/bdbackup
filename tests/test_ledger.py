@@ -177,7 +177,7 @@ def test_schema_2_database_upgrades_and_stays_readable(tmp_path):
     new_artifact.write_bytes(b"new")
     history.run("job", "file", lambda: BackupResult(new_artifact, success=True), {"kind": "file"})
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 5
     new, old = history.records()
     assert old.unit is None and old.checksum is None
     assert new.unit == str(new_artifact.resolve())

@@ -31,6 +31,7 @@ class Refusal(Exception):
 class Transport(Protocol):
     def copy(self, source: Path, temp: Path, on_file: Callable[[str, str], None]) -> None: ...
     def rename(self, temp: Path, final: Path) -> None: ...
+    def replace(self, temp: Path, final: Path) -> None: ...
     def remove(self, path: Path) -> None: ...
     def exists(self, path: Path) -> bool: ...
 
@@ -58,32 +59,45 @@ class LocalTransport:
         return digest.hexdigest()
 
     def copy(self, source: Path, temp: Path, on_file: Callable[[str, str], None]) -> None:
-        """Copy a file or tree; report each regular file's relative path and SHA-256."""
+        """Copy a file or tree; report each regular file's relative path and SHA-256.
+
+        Directories are created private and receive the source's permission bits once their
+        contents are copied, bottom-up, so a read-only source directory never blocks the copy.
+        """
         if stat.S_ISREG(source.lstat().st_mode):
             on_file(".", self._copy_file(source, temp))
             return
-        temp.mkdir()
+        temp.mkdir(mode=0o700)
+        directories: list[tuple[Path, Path]] = []
         for directory, names, files in os.walk(source):
             here = Path(directory)
             target_dir = temp / here.relative_to(source)
+            directories.append((here, target_dir))
             for name in sorted(names + files):
                 entry, target = here / name, target_dir / name
                 mode = entry.lstat().st_mode
                 if stat.S_ISLNK(mode):
                     os.symlink(os.readlink(entry), target)
                 elif stat.S_ISDIR(mode):
-                    target.mkdir()
+                    target.mkdir(mode=0o700)
                 elif stat.S_ISREG(mode):
                     relative = entry.relative_to(source).as_posix()
                     on_file(relative, self._copy_file(entry, target))
                 else:
                     raise Refusal(f"unexpected entry {entry.relative_to(source).as_posix()}")
             _fsync_dir(target_dir)
+        for here, target_dir in reversed(directories):
+            os.chmod(target_dir, stat.S_IMODE(here.lstat().st_mode))
 
     def rename(self, temp: Path, final: Path) -> None:
         if os.path.lexists(final):
             raise Refusal(f"final name exists: {final}")
         os.rename(temp, final)
+        _fsync_dir(final.parent)
+
+    def replace(self, temp: Path, final: Path) -> None:
+        """Rename over an existing final name; only ledger snapshots are replaced."""
+        os.replace(temp, final)
         _fsync_dir(final.parent)
 
     def remove(self, path: Path) -> None:
@@ -103,7 +117,10 @@ def _member_paths(unit: ManagedUnit) -> list[str]:
 
 
 def check_contents(unit: ManagedUnit, at: Path) -> None:
-    """A unit holds its members and its engine's markers, nothing else (spec 2 D12)."""
+    """A unit holds its members and its engine's markers, nothing else (spec 2 D12).
+
+    Inside a member only regular files and directories are allowed (spec 2 §2).
+    """
     if not os.path.lexists(at):
         raise Refusal(f"missing location {at}")
     if unit.kind != "xtrabackup":
@@ -118,6 +135,9 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
             entry = here / name
             relative = entry.relative_to(at).as_posix()
             if any(relative == m or relative.startswith(m + "/") for m in members):
+                mode = entry.lstat().st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    raise Refusal(f"unexpected entry {relative}")
                 continue
             parts = relative.split("/")
             if relative == ".full_success" and entry.is_file() and not entry.is_symlink():
@@ -130,8 +150,6 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
             ):
                 continue
             raise Refusal(f"unexpected entry {relative}")
-        names[:] = [n for n in names
-                    if (here / n).relative_to(at).as_posix() not in members]
 
 
 def verify(unit: ManagedUnit, at: Path) -> None:

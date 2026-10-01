@@ -221,6 +221,9 @@ apply = false
 # only the [history] ledger. Requires [history]. Jobs writing into the first
 # stage must set retention_days = 0 (xtrabackup) or timestamp = true (file).
 # Every later stage path must contain an empty .bdbackup-destination file.
+# After each applying run, every later stage path also receives
+# <job>.ledger.sqlite3 (here gfs-main.ledger.sqlite3), a copy of the whole
+# history database that restore can use when only a stage survives.
 # ---------------------------------------------------------------------------
 [gfs-main]
 type = "gfs"

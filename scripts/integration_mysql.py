@@ -5,18 +5,63 @@ Requires Docker and a local server image. Never attaches to existing databases.
 """
 
 import gzip
+import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+from click.testing import CliRunner
+
+from bdbackup.cli import main as cli
+from bdbackup.history import History, HistorySettings
 from bdbackup.mysql import MySQLBackup
+
+
+def move_and_restore_dump(work, password):
+    """Spec 2 §6: GFS moves a mysqldump unit to a weekly stage, and ``bdbackup restore``
+    recovers it from there. Returns the recovered SQL file."""
+    history = History(HistorySettings(work / "history.sqlite3", work / "restores"))
+    hot = MySQLBackup(work / "gfs-hot" / "audit", user="backup", password=password)
+    for _ in range(2):
+        history.run("audit", "mysqldump", lambda: hot.backup("audit_one"), {"kind": "mysqldump"})
+    newest, first = history.records()[:2]
+    two_weeks_ago = (datetime.now(UTC) - timedelta(days=14)).isoformat()
+    with closing(sqlite3.connect(work / "history.sqlite3")) as db, db:
+        db.execute("UPDATE backup_runs SET completed_at=? WHERE id=?", (two_weeks_ago, first.id))
+    weekly = work / "gfs-weekly"
+    weekly.mkdir()
+    (weekly / ".bdbackup-destination").touch()
+    cfg = work / "gfs.toml"
+    cfg.write_text(
+        f"[history]\ndatabase = {json.dumps(str(work / 'history.sqlite3'))}\n"
+        f"restore_root = {json.dumps(str(work / 'restores'))}\n"
+        '[gfs-main]\ntype = "gfs"\napply = true\n'
+        f"[[gfs-main.stage]]\npaths = [{json.dumps(str(work / 'gfs-hot'))}]\n"
+        'period = "daily"\nkeep = "1d"\n'
+        f"[[gfs-main.stage]]\npaths = [{json.dumps(str(weekly))}]\n"
+        'period = "weekly"\nkeep = "8w"\n'
+    )
+    run = CliRunner().invoke(cli, ["run", "--config", str(cfg), "gfs-main"])
+    moved = weekly / "audit" / Path(first.path).name
+    if run.exit_code or not moved.is_file():
+        raise RuntimeError(f"GFS did not move the dump (exit {run.exit_code}): {run.output}")
+    recovery = work / "sql-recovery"
+    result = CliRunner().invoke(cli, ["restore", "--config", str(cfg), "--backup-id",
+                                      str(first.id), "--yes", "--dst", str(recovery)])
+    if result.exit_code:
+        raise RuntimeError(f"restore of the moved dump exited {result.exit_code}: "
+                           f"{result.output} {result.exception!r}")
+    return recovery / "backup.sql"
 
 
 def main(image="mysql:8.4"):
@@ -141,6 +186,18 @@ def main(image="mysql:8.4"):
             }
             if not all(checks.values()):
                 raise RuntimeError(f"Recovery failed: {checks}")
+            with (
+                patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}),
+                patch.object(tempfile, "tempdir", str(work)),
+            ):
+                recovered = move_and_restore_dump(work, password)
+            sql("DROP DATABASE audit_one;")
+            command("exec", "-i", name, "mysql", "-uroot", input=recovered.read_bytes())
+            if (sql("SELECT payload FROM audit_one.data WHERE id=1") != "saved"
+                    or sql("CALL audit_one.echo_value()") != "42"):
+                raise RuntimeError("Recovery of the moved dump failed")
+            print("GFS moved a mysqldump unit to the weekly stage and it restored from there",
+                  flush=True)
             print(
                 f"MySQL {version}: parallel dumps, full dump, data/routine/event/trigger "
                 "recovery passed",

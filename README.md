@@ -706,8 +706,8 @@ missing or was replaced, or `<id>: skipped: unexpected unit` for a physical back
 outside its dated layout, and then exits 1. A checksum already recorded is never
 changed. The checksum lives in the `checksum` column of the `backup_runs` table.
 
-History uses schema version 3. An existing database upgrades on the next write;
-older bdbackup versions refuse a version-3 database.
+History uses schema version 5. An existing database upgrades on the next write;
+older bdbackup versions refuse a version-5 database.
 
 History is written before work starts, and success only after the backup and its
 requested verification finish. If history cannot be written, the command fails;
@@ -756,10 +756,12 @@ bdbackup restore --config config.toml --backup-id 12 --dst /restore/job-12 --yes
 
 Deleted artifacts remain in history as unavailable. File identity, size, and
 modification time detect replaced archives, so older rows for a reused filename
-are not offered as older recovery points. Availability uses these file checks;
-the recorded checksum is not yet checked by restore, which still validates the
-actual archive or physical dependency chain. History stores references to artifacts and does not preserve
-an archive that a later backup replaces.
+are not offered as older recovery points. Availability uses these file checks.
+Restore checks the recorded checksum of every file it uses for backups that GFS
+manages (see [Ledger and GFS](#ledger-and-gfs)); for other backups it
+validates the actual archive or physical dependency chain. History stores
+references to artifacts and does not preserve an archive that a later backup
+replaces.
 
 ## Ledger and GFS
 
@@ -843,8 +845,13 @@ the first stage, so the next incremental finds its full.
 `.bdbackup-destination`; an unmounted mount point is an empty local directory
 without it, and GFS writes nothing there (`--validate` reports it). GFS copies to
 a temporary name, checks every checksum while reading the source, and removes
-the original only after every copy is in place and recorded; a failed attempt
-removes all of its copies and the next run retries. Copies hold no backup lock,
+the original only after every copy is in place and recorded; a failed copy
+removes its temporary copies and the next run retries. Before a move,
+every copy of the unit is checked, not only the one copied, and
+copies keep the permission bits of every file and directory. If the
+ledger lists a unit in two stages (left by an earlier version or a hand edit),
+the next run removes the earlier copy only after the later copies verify.
+Copies hold no backup lock,
 so a slow NFS copy never blocks a backup; if an xtrabackup root is locked when
 GFS commits, the unit is reported `deferred: locked` and retried next run. GFS
 only touches backups recorded in the ledger. It refuses, and reports:
@@ -854,10 +861,13 @@ only touches backups recorded in the ledger. It refuses, and reports:
   new value with `sqlite3`; the next run acts on it. A backup that changed
   before GFS first saw it is never managed.
 - `refused: unexpected entry …`: a unit holds something that is not one of its
-  recorded backups or engine markers, such as a leftover `.tmp` directory.
+  recorded backups or engine markers, such as a leftover `.tmp` directory, or a
+  symlink or special file inside a backup.
 - `refused: stage not configured`: the unit lives under a stage no longer in the
   configuration. Removing a stage never deletes its backups; restore the stage
-  or remove them yourself.
+  or remove them yourself. Changing the first stage's path keeps managing units
+  already moved to later stages; units left under the
+  old first-stage path are no longer managed.
 - `refused: destination not ready …`: a stage path lacks its marker.
 
 Backup jobs writing into the first stage must not delete or overwrite on their
@@ -870,9 +880,76 @@ nothing. Exit codes: 0 done, 1 a refusal or failure, 2 configuration error, 3
 another run of the same job is in progress, or the only unfinished units were
 deferred.
 
-Restoring a unit GFS has moved, and copies of the ledger in every stage, arrive
-with the next change of this release; until then restore works for units still
-in the first stage.
+**Unmanaged backups.** A backup that was unavailable when GFS first saw it (for
+example an older run of a file job without `timestamp`, whose archive a later
+run replaced) stays unmanaged on every later run: GFS never moves or deletes it,
+and the report counts it in `unmanaged`.
+
+**Report.** Each run lists every unit it acted on, held, deferred or refused,
+then a `Summary:` line with counts and bytes per action. One line per stage
+follows, such as `Stage /NFS/daily: 15 units (3200000000 bytes)`, counting where
+the units are when the run ends (where they would be, in a dry run), and then
+the ledger copies written.
+
+**Step log.** Every step is also recorded in the `gfs_steps` table of the history
+database, one row per path, with its source, destination, outcome
+and reason. A failed step keeps the error message.
+
+**Run log.** Every applying run records one row in the `gfs_runs` table:
+the GFS job, start and finish time, status, exit code and the Summary counts.
+The status is `running` while the run works, `completed` once it reaches its report
+(whatever the exit code), and `failed` if the run itself crashed. A row left
+`running` shows a run that was cut off; check that run's steps for leftovers
+(Known limits below). Each `gfs_steps` row names its run in `run_id`. A dry run
+records nothing.
+
+**Running backups.** While a job has a backup in state `running` in the
+ledger, GFS leaves every backup of that job where it is, whatever its age, and
+reports each one as
+`deferred: backup running (record <id>, started <time>)`.
+Other jobs proceed as usual, and a run whose only unfinished work is these
+deferrals exits 3. A backup killed before it finished (`kill -9`, a power loss)
+leaves its row `running`, and that job stays deferred until you fix the row. After
+checking that no backup of that job is running, mark it failed:
+`sqlite3 <history database> "UPDATE backup_runs SET status = 'failed' WHERE id = <id>"`.
+
+**Restoring moved backups.** `bdbackup restore` and `bdbackup history` find a
+backup where GFS put it. `history` shows a copy that was removed or replaced as
+`unavailable`. Before restoring, every backup file used is checked against its
+ledger checksum; with several paths in a stage, the first path that verifies is
+used, and the `Backup:` line names it. An xtrabackup chain is prepared from the
+stage directory holding it, which keeps the layout of the first stage.
+
+**Ledger copies.** After every applying run, each path of every stage after the
+first holds `<gfs job>.ledger.sqlite3`, a consistent copy of the whole history
+database, written under a temporary name and renamed into place. A path without
+its marker gets none, and the run exits 1. To restore with only a stage left,
+copy that file somewhere outside the stages, point `[history] database` at the
+copy, and run `bdbackup restore`. Paths in the ledger are absolute, so the
+stages must be mounted at the same paths as when the copy was written.
+
+**Known limits.** GFS does not yet keep a journal of a move or delete while it
+runs, so a few failures leave work for the operator. The report and the step log
+name the paths involved, and each leftover is
+removed by hand:
+
+- A move was recorded, but removing the old copy failed. The old copy stays on
+  disk, no longer in the ledger, and GFS never touches it again. Delete it.
+- A move failed, or the process stopped, after some new copies were renamed into
+  place but before the move was recorded. The next run reports
+  `refused: final name exists: <path>`. Delete that copy; the next run moves the
+  unit again.
+- A delete failed part way. The next run reports `refused: missing location …`
+  for a copy already removed. Delete its row with
+  `sqlite3 <history database> "DELETE FROM gfs_locations WHERE path = '<path>'"`.
+  If that was the unit's last row, also mark the unit deleted, or later runs
+  report `refused: stage not configured`:
+  `sqlite3 <history database> "UPDATE gfs_units SET deleted_at = datetime('now') WHERE id = <unit_id>"`
+  (the `unit_id` of the row you deleted).
+- A restore stops when the xtrabackup copy at the first path of a stage has
+  damaged checkpoints or chain metadata; it does not move on to the next path.
+  Prepare the copy at another path of that stage with
+  `bdbackup xtrabackup prepare -r <directory holding the copy> -d <new dir> <backup>`.
 
 ## Development
 

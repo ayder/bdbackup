@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -335,6 +336,8 @@ class XtraBackup:
         self,
         target: str | Path,
         destination: str | Path,
+        *,
+        check: Callable[[Sequence[Path]], None] | None = None,
     ) -> Path:
         """Prepare a separate full recovery copy, following an incremental's parent chain."""
         source = Path(target).expanduser().resolve()
@@ -358,6 +361,9 @@ class XtraBackup:
                 sources = [source]
             else:
                 raise BackupError("Source has already been prepared; use an original backup")
+            if check is not None:
+                # Under the root lock and before anything is written (spec 2 §3.3, D7).
+                check(sources)
             dest.parent.mkdir(parents=True, exist_ok=True)
             with (
                 process_lock(dest.with_name(dest.name + ".lock")),
