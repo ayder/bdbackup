@@ -354,6 +354,29 @@ def test_symlink_inside_member_refused(env):
     assert not (env.root / "NFS/daily/mysql").exists()
 
 
+def _directory_modes(root: Path) -> dict[str, int]:
+    return {p.relative_to(root).as_posix(): p.stat().st_mode & 0o7777
+            for p in [root, *root.rglob("*")] if p.is_dir() and not p.is_symlink()}
+
+
+def test_move_keeps_directory_modes(env):
+    unit = env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+    full_name = next(p.name for p in unit.iterdir() if p.name.startswith("Full_2"))
+    unit.chmod(0o750)
+    (unit / full_name).chmod(0o700)
+    (unit / "Incremental").chmod(0o710)
+    before = _directory_modes(unit)
+    umask = os.umask(0o022)
+    try:
+        result = env.run_cli()
+    finally:
+        os.umask(umask)
+    assert result.exit_code == 0, result.output
+    moved = env.root / "NFS/daily" / unit.relative_to(env.root / "BACKUP")
+    assert _directory_modes(moved) == before
+
+
 def test_unrecorded_files_untouched(env):
     env.file_unit("b.tar.gz", days_ago=0)
     old = env.root / "BACKUP/files/old.tar.gz"
