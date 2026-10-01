@@ -109,7 +109,10 @@ def _member_paths(unit: ManagedUnit) -> list[str]:
 
 
 def check_contents(unit: ManagedUnit, at: Path) -> None:
-    """A unit holds its members and its engine's markers, nothing else (spec 2 D12)."""
+    """A unit holds its members and its engine's markers, nothing else (spec 2 D12).
+
+    Inside a member only regular files and directories are allowed (spec 2 §2).
+    """
     if not os.path.lexists(at):
         raise Refusal(f"missing location {at}")
     if unit.kind != "xtrabackup":
@@ -124,6 +127,9 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
             entry = here / name
             relative = entry.relative_to(at).as_posix()
             if any(relative == m or relative.startswith(m + "/") for m in members):
+                mode = entry.lstat().st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    raise Refusal(f"unexpected entry {relative}")
                 continue
             parts = relative.split("/")
             if relative == ".full_success" and entry.is_file() and not entry.is_symlink():
@@ -136,8 +142,6 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
             ):
                 continue
             raise Refusal(f"unexpected entry {relative}")
-        names[:] = [n for n in names
-                    if (here / n).relative_to(at).as_posix() not in members]
 
 
 def verify(unit: ManagedUnit, at: Path) -> None:
