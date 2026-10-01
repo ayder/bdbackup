@@ -845,8 +845,12 @@ the first stage, so the next incremental finds its full.
 `.bdbackup-destination`; an unmounted mount point is an empty local directory
 without it, and GFS writes nothing there (`--validate` reports it). GFS copies to
 a temporary name, checks every checksum while reading the source, and removes
-the original only after every copy is in place and recorded; a failed attempt
-removes all of its copies and the next run retries. Copies hold no backup lock,
+the original only after every copy is in place and recorded; a failed copy
+removes its temporary copies and the next run retries. Before a move,
+every copy of the unit is checked, not only the one copied, and
+copies keep the permission bits of every file and directory. When a
+move was recorded but its old copy was not yet removed, the next run removes it
+only after the new copies verify. Copies hold no backup lock,
 so a slow NFS copy never blocks a backup; if an xtrabackup root is locked when
 GFS commits, the unit is reported `deferred: locked` and retried next run. GFS
 only touches backups recorded in the ledger. It refuses, and reports:
@@ -856,10 +860,13 @@ only touches backups recorded in the ledger. It refuses, and reports:
   new value with `sqlite3`; the next run acts on it. A backup that changed
   before GFS first saw it is never managed.
 - `refused: unexpected entry …`: a unit holds something that is not one of its
-  recorded backups or engine markers, such as a leftover `.tmp` directory.
+  recorded backups or engine markers, such as a leftover `.tmp` directory, or a
+  symlink or special file inside a backup.
 - `refused: stage not configured`: the unit lives under a stage no longer in the
   configuration. Removing a stage never deletes its backups; restore the stage
-  or remove them yourself.
+  or remove them yourself. Changing the first stage's path keeps managing units
+  already moved to later stages; units left under the
+  old first-stage path are no longer managed.
 - `refused: destination not ready …`: a stage path lacks its marker.
 
 Backup jobs writing into the first stage must not delete or overwrite on their
@@ -883,6 +890,10 @@ follows, such as `Stage /NFS/daily: 15 units (3200000000 bytes)`, counting where
 the units are when the run ends (where they would be, in a dry run), and then
 the ledger copies written.
 
+**Step log.** Every step is also recorded in the `gfs_steps` table of the history
+database, one row per path, with its source, destination, outcome
+and reason. A failed step keeps the error message.
+
 **Restoring moved backups.** `bdbackup restore` and `bdbackup history` find a
 backup where GFS put it. `history` shows a copy that was removed or replaced as
 `unavailable`. Before restoring, every backup file used is checked against its
@@ -897,6 +908,25 @@ its marker gets none, and the run exits 1. To restore with only a stage left,
 copy that file somewhere outside the stages, point `[history] database` at the
 copy, and run `bdbackup restore`. Paths in the ledger are absolute, so the
 stages must be mounted at the same paths as when the copy was written.
+
+**Known limits.** GFS does not yet keep a journal of a move or delete while it
+runs, so a few failures leave work for the operator. The report and the step log
+name the paths involved, and each leftover is
+removed by hand:
+
+- A move was recorded, but removing the old copy failed. The old copy stays on
+  disk, no longer in the ledger, and GFS never touches it again. Delete it.
+- A move failed, or the process stopped, after some new copies were renamed into
+  place but before the move was recorded. The next run reports
+  `refused: final name exists: <path>`. Delete that copy; the next run moves the
+  unit again.
+- A delete failed part way. The next run reports `refused: missing location …`
+  for a copy already removed. Delete its row with
+  `sqlite3 <history database> "DELETE FROM gfs_locations WHERE path = '<path>'"`.
+- A restore stops when the xtrabackup copy at the first path of a stage has
+  damaged checkpoints or chain metadata; it does not move on to the next path.
+  Prepare the copy at another path with `bdbackup xtrabackup prepare`, giving
+  that copy's parent directory as `--root`.
 
 ## Development
 
