@@ -37,6 +37,9 @@ virtual environment, or with pipx or uv, link it:
 sudo ln -s "$(command -v bdbackup)" /usr/local/bin/bdbackup
 ```
 
+The link's target and the environment behind it must be readable by `mysql`. One
+under `/root` or a home directory usually is not, so install it under `/opt`.
+
 The units read `/etc/bdbackup/config.toml`. It holds passwords, and `mysql` must
 be able to read it:
 
@@ -45,11 +48,20 @@ sudo chown root:mysql /etc/bdbackup/config.toml
 sudo chmod 640 /etc/bdbackup/config.toml
 ```
 
-Give `mysql` the `backup_root`, the directory of the history database and any
-encryption key file, then check its access:
+Give `mysql` the `backup_root`, the directory of the history database, the
+recovery root and any encryption key file. If cron ran this job as root, change
+the owner of everything already in `backup_root`, including its backups and lock
+file. `--validate` does not look inside it, and a `mysql` run fails on what it
+cannot read:
 
 ```bash
-sudo -u mysql bdbackup run -c /etc/bdbackup/config.toml --validate -j mysql-prod
+sudo chown -R mysql:mysql /backup/mysql/production
+```
+
+Then check its access:
+
+```bash
+sudo -u mysql /usr/local/bin/bdbackup run -c /etc/bdbackup/config.toml --validate -j mysql-prod
 ```
 
 For another config path or account, set `Environment=BDBACKUP_CONFIG=...`, `User=`
