@@ -156,3 +156,9 @@ See [Percona's encryption documentation](https://docs.percona.com/percona-xtraba
 XtraBackup/MariaDB backups produce a prepared recovery directory, including
 prerequisite increments. The destination must be outside the backup root.
 Server ownership, copy-back, and startup remain administrator actions.
+
+## Scheduling
+
+Run xtrabackup jobs from [cron](../README.md#scheduling-with-cron) or from
+[systemd timers](README_SYSTEMD.md), which add per-job limits and stop the backup
+tool if bdbackup dies.
