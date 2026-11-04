@@ -1,1 +1,10 @@
 [Unit]
+Description=Schedule of bdbackup full backup of job %i
+Documentation=https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md
+
+[Timer]
+Unit=bdbackup@%i.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

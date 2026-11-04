@@ -62,6 +62,7 @@ include = [
     "/config.toml.example",
     "/template.txt",
     "/scripts",
+    "/contrib",
 ]
 
 [tool.ruff]

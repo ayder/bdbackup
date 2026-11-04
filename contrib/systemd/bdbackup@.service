@@ -1,1 +1,11 @@
 [Unit]
+Description=bdbackup full backup of job %i
+Documentation=https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md
+
+[Service]
+Type=oneshot
+User=mysql
+Group=mysql
+KillMode=control-group
+Environment=BDBACKUP_CONFIG=/etc/bdbackup/config.toml
+ExecStart=bdbackup run -c ${BDBACKUP_CONFIG} -j %i
