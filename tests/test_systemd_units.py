@@ -96,6 +96,10 @@ def test_sdist_carries_the_units():
         "MemoryHigh=",  # the first limit to set
         "cgroup v2",
         "Never run one job from both",
+        "chown -R",  # root-made backups and lock file block a mysql run; --validate misses them
+        "sudo -u mysql /usr/local/bin/bdbackup",  # sudo's secure_path may omit /usr/local/bin
+        "under `/opt`",  # a venv under /root or a home fails with 203/EXEC despite the link
+        "recovery root",  # --validate fails until mysql can write it
     ],
 )
 def test_systemd_document_states_what_an_operator_trips_on(fact):
