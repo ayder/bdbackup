@@ -84,3 +84,24 @@ def test_exec_start_is_a_command_the_cli_accepts(tmp_path, name, exit_code, outp
 def test_sdist_carries_the_units():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     assert "/contrib" in project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        "ln -s",  # the binary link: without it the unit fails with 203/EXEC
+        "chmod 640",  # the config holds passwords and mysql must read it
+        "OnCalendar=",  # the schedule comes before enable
+        "--validate",  # proves the mysql account's access before a first run
+        "MemoryHigh=",  # the first limit to set
+        "cgroup v2",
+        "Never run one job from both",
+    ],
+)
+def test_systemd_document_states_what_an_operator_trips_on(fact):
+    assert fact in (ROOT / "docs" / "README_SYSTEMD.md").read_text()
+
+
+@pytest.mark.parametrize("document", ["README.md", "CLAUDE.md"])
+def test_systemd_document_is_linked(document):
+    assert "README_SYSTEMD.md" in (ROOT / document).read_text()
