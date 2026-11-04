@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bdbackup"
-version = "0.7.0"
+version = "0.7.1"
 description = "MySQL, MariaDB and file backups with mysqldump, Percona XtraBackup, MariaDB Backup and tar: verification, GFS rotation and guided restore"
 readme = "README.md"
 license = "MIT"

@@ -39,6 +39,7 @@ run from cron.
 | [MySQL and MariaDB physical backups with Percona XtraBackup and MariaDB Backup](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) | xtrabackup jobs, full and incremental backups, encryption, preparing a recovery copy, engine pruning |
 | [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, preparing stage directories, safety rules, run and step logs, ledger copies |
 | [Custom backup engines (plugins)](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) | the engine registry and writing your own engine |
+| [Running xtrabackup jobs with systemd timers](https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md) | service and timer templates, the mysql account, schedules, CPU, I/O and memory limits |
 | [Annotated configuration](https://github.com/ayder/bdbackup/blob/master/config.toml.example) | every config key with a comment |
 
 ## Support and safety
@@ -204,6 +205,10 @@ the backups:
 Times use the cron daemon's timezone, and separate lines do not wait for each
 other: leave enough time for backups before GFS. Add `--dry-run` to the GFS line
 until its report looks right.
+
+xtrabackup jobs can run from systemd timers instead, which also stop the backup
+tool if bdbackup dies and add per-job limits: see
+[Running xtrabackup jobs with systemd timers](https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md).
 
 ### Validate configuration and permissions
 

@@ -16,8 +16,9 @@
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
 # Any job may set active = false to pause it: `run -j` then refuses it (exit 2)
 # and --validate names it as not checked. Schedule jobs with your own crontab
-# lines (see the README, "Scheduling with cron"). --validate checks
-# settings/access/grants without backups.
+# lines (see the README, "Scheduling with cron"); xtrabackup jobs can use systemd
+# timers instead (docs/README_SYSTEMD.md). --validate checks settings/access/grants
+# without backups.
 # Other keys (except type, active and restore_root) are passed to the backend
 # constructor (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup),
 # so key names use Python-style underscores (e.g. exclude_templates).
