@@ -426,3 +426,32 @@ def test_cleanup_ignores_other_stanza_temps(tmp_path):
     assert not main_db_live.exists()
     assert main_live.exists()
     assert [m.name for m in members(main_db.unit_path(NEWEST))] == expected_names("main-db")
+
+
+def test_close_error_removes_temp(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    engine = make_engine(tmp_path, repo)
+    real_fsync, real_close = os.fsync, os.close
+    synced = []
+
+    def fsync(fd):
+        real_fsync(fd)
+        synced.append(fd)
+
+    def close(fd):
+        # The temp file's descriptor, after its fsync: released, then EIO, as NFS does on Linux.
+        if synced and fd == synced[0]:
+            synced.clear()
+            real_close(fd)
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "close", close)
+
+    with pytest.raises(BackupError) as caught:
+        engine.export(full())
+
+    assert os.strerror(errno.EIO) in str(caught.value)
+    assert os.strerror(errno.EBADF) not in str(caught.value)
+    assert list(engine.out_dir.iterdir()) == []
