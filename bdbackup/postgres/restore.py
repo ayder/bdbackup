@@ -14,7 +14,7 @@ import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
-from bdbackup.postgres.repository import LABEL, RepositoryError, parse_info_file
+from bdbackup.postgres.repository import LABEL, parse_info_file
 
 # What keeps the restoring host's own pgbackrest.conf, and any stanza it defines, out of the
 # restore. The integration test (spec 7) decides the final form; change only this constant.
@@ -43,11 +43,12 @@ def describe_unit(root: Path) -> UnitFacts | None:
     directory there named like a full backup label, and ``archive/<stanza>/archive.info``. The
     stanza and the label are the directory names; the PostgreSQL version and the page-error
     flag come from ``backup.info``. Anything unreadable or unexpected means "not a unit": this
-    never raises.
+    never raises. The tree can come out of any tar, so nothing in it may stop a restore that
+    has already extracted.
     """
     try:
         return _describe(Path(root))
-    except (OSError, ValueError, RepositoryError):
+    except Exception:
         return None
 
 

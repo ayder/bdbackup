@@ -107,6 +107,9 @@ def parse_info_file(text: str) -> dict[str, dict[str, object]]:
             current[key] = json.loads(value)
         except ValueError as exc:
             raise RepositoryError(f"info file line {number} has a value that is not JSON") from exc
+        except RecursionError as exc:
+            # Deeply nested JSON: an info file can come out of any tar, so this is not a bug.
+            raise RepositoryError(f"info file line {number} has a value nested too deeply") from exc
     return sections
 
 
