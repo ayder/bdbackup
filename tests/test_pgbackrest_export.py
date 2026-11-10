@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import gc
 import hashlib
 import io
 import os
@@ -336,6 +337,9 @@ def test_input_change_fails(tmp_path, monkeypatch):
     assert list(engine.out_dir.iterdir()) == []
 
 
+# The failed tar stream flushes its buffer again when it is collected; that write must not
+# reach the closed descriptor (another file may reuse its number), so it must not raise.
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 def test_write_error_leaves_no_unit(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     # Enough data for several writes, so the failure comes with a partial temp file on disk.
@@ -358,6 +362,7 @@ def test_write_error_leaves_no_unit(tmp_path, monkeypatch):
 
     with pytest.raises(BackupError, match=os.strerror(errno.ENOSPC)):
         store.run("pg", "pgbackrest-full", lambda: engine.export(full()), {"label": NEWEST})
+    gc.collect()
 
     # A partly written temporary file was on disk when the write failed, and is gone now.
     [(name, size)] = at_failure
