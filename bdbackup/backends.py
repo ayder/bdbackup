@@ -15,6 +15,7 @@ class BackupResult:
     path: Path
     size_bytes: int = 0
     success: bool = False
+    checksum: str | None = None  # SHA-256 an engine computed while writing; history keeps it
 
 
 class BackupError(Exception):
