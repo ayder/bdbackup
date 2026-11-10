@@ -379,6 +379,9 @@ class _Run:
             f"({t.deleted_bytes} bytes), held {t.held}, deferred {t.deferred}, "
             f"refused {t.refused}, failed {t.failed}, unmanaged {unmanaged}"
         )
+        if modes_refused := getattr(self.transport, "modes_refused", 0):
+            self.out(f"permission bits not kept on {modes_refused} entries: "
+                     "the destination refused chmod")
         for index, stage in enumerate(self.stages):
             sizes = [size for at, size in self.where.values() if at == index]
             units = "unit" if len(sizes) == 1 else "units"

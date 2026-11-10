@@ -134,6 +134,14 @@ every copy of the unit is checked, not only the one copied, and
 copies keep the permission bits of every file and directory. If the
 ledger lists a unit in two stages (for example after a hand edit),
 the next run removes the earlier copy only after the later copies verify.
+
+On a share that maps every user to one account (an NFS export that squashes
+all users to `nobody`, for example), the share can refuse the `chmod` that gives
+a copy its permission bits. GFS then keeps the copy with whatever bits the share
+assigned and goes on; the run prints
+`permission bits not kept on <n> entries: the destination refused chmod` after
+its summary. Any other error from `chmod` still fails the copy.
+
 Copies hold no backup lock,
 so a slow NFS copy never blocks a backup; if an xtrabackup root is locked when
 GFS commits, the unit is reported `deferred: locked` and retried next run. GFS
