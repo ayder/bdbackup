@@ -16,6 +16,7 @@ from bdbackup.backends import BackupError, BackupResult
 from bdbackup.cli import main
 from bdbackup.config import Config, ConfigError
 from bdbackup.history import History, HistoryError, HistorySettings
+from bdbackup.ledger import checksum
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.recovery import restore_record, suggested_destination
 
@@ -406,3 +407,28 @@ def test_restore_root_misplaced_or_invalid_is_config_error(config_file, case):
         assert result.exit_code == 2, result.output
         assert "restore_root" in result.output
         assert "daily" in result.output
+
+
+def test_run_records_supplied_checksum_without_hashing(tmp_path):
+    artifact = tmp_path / "archive"
+    artifact.write_bytes(b"abc")
+    history = History(HistorySettings(tmp_path / "history.db", tmp_path / "restore"))
+    supplied = "ab" * 32
+
+    def must_not_hash(path):
+        raise AssertionError(f"History.run hashed {path} although the engine supplied a checksum")
+
+    with patch("bdbackup.history.checksum", side_effect=must_not_hash):
+        history.run("job", "file", lambda: BackupResult(artifact, 3, True, checksum=supplied))
+    record, = history.records()
+    assert record.status == "success"
+    assert record.checksum == supplied
+
+
+def test_run_hashes_when_no_checksum_supplied(tmp_path):
+    artifact = tmp_path / "archive"
+    artifact.write_bytes(b"abc")
+    history = History(HistorySettings(tmp_path / "history.db", tmp_path / "restore"))
+    history.run("job", "file", lambda: BackupResult(artifact, 3, True))
+    record, = history.records()
+    assert record.checksum == checksum(artifact)
