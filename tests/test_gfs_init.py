@@ -25,7 +25,7 @@ def invoke(*args):
 
 
 class Layout:
-    def __init__(self, root, stages=STAGES, job="", extra=""):
+    def __init__(self, root, stages=STAGES, job="", extra="", tail=""):
         self.root = root.resolve()
         (self.root / "NFS").mkdir()
         text = f'[history]\ndatabase="state/h.sqlite3"\n{extra}[gfs-main]\ntype="gfs"\n{job}\n'
@@ -33,7 +33,7 @@ class Layout:
             text += (f'[[gfs-main.stage]]\npaths = ["{path}"]\nperiod = "{period}"\n'
                      f'keep = "{keep}"\n')
         self.config = self.root / "config.toml"
-        self.config.write_text(text)
+        self.config.write_text(text + tail)
 
     def path(self, relative):
         return self.root / relative
@@ -73,6 +73,40 @@ def test_initialize_creates_stages_and_markers(layout):
         assert written.utcoffset() == UTC.utcoffset(None)
     assert not layout.path("state/h.sqlite3").exists()
     assert not layout.path("state").exists()
+
+
+PG_JOB = (
+    '[pg]\ntype="pgbackrest"\nstanza="main"\nrepo_path="repo"\nout_dir="BACKUP/pg"\n'
+)
+OTHER_GFS = (
+    '[gfs-other]\ntype="gfs"\n[[gfs-other.stage]]\npaths=["OTHER"]\nperiod="daily"\n'
+    'keep="5d"\n'
+)
+
+
+def test_initialize_marks_fed_first_stage(tmp_path):
+    layout = Layout(tmp_path, tail=PG_JOB)
+    result = layout.initialize()
+    lines = result.output.splitlines()
+    assert result.exit_code == 0, result.output
+    assert f"{layout.path('BACKUP')}: created, marker written" in lines, result.output
+    content = tomllib.loads(layout.marker("BACKUP").read_text())
+    assert content["stage"] == 1
+    assert content["gfs_job"] == "gfs-main"
+    assert content["bdbackup_version"] == bdbackup.__version__
+    for relative, stage in (("NFS/daily", 2), ("NFS/weekly", 3)):
+        assert tomllib.loads(layout.marker(relative).read_text())["stage"] == stage
+
+
+def test_initialize_leaves_unfed_first_stage(tmp_path):
+    # pg feeds gfs-main's first stage; gfs-other's first stage has no pgbackrest job.
+    layout = Layout(tmp_path, tail=OTHER_GFS + PG_JOB)
+    result = invoke("run", "-c", layout.config, "-j", "gfs-other", "--initialize-structure")
+    lines = result.output.splitlines()
+    assert result.exit_code == 0, result.output
+    assert f"{layout.path('OTHER')}: created" in lines, result.output
+    assert not layout.marker("OTHER").exists()
+    assert not layout.path("BACKUP").exists()
 
 
 def test_initialize_twice_rewrites_marker_in_place(layout):

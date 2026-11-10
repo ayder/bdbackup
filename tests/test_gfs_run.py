@@ -75,6 +75,14 @@ class Env:
                      f"keep = \"{keep}\"\n")
         self.config_path.write_text(text)
 
+    def feed_first_stage(self):
+        """Add a pgbackrest job writing into the first stage; the config is rewritten once."""
+        self.config_path.write_text(
+            self.config_path.read_text()
+            + '[pg]\ntype = "pgbackrest"\nstanza = "main"\nrepo_path = "repo"\n'
+              'out_dir = "BACKUP/pg"\n'
+        )
+
     @property
     def database(self):
         return Config(self.config_path).history.database
@@ -969,6 +977,49 @@ def test_snapshot_missing_marker_fails_run(env):
     assert (env.root / "NFS/daily/gfs-main.ledger.sqlite3").is_file()
     assert not [p for p in (env.root / "NFS/weekly").rglob("*") if p.is_file()]
     assert f"failed snapshot {env.abs('NFS/weekly')}: destination not ready" in result.output
+    assert "failed 1" in result.output, result.output
+
+
+def single_stage_env(tmp_path, *, fed, marker):
+    env = Env(tmp_path)
+    env.write([(["BACKUP"], "daily", "5d")])
+    if fed:
+        env.feed_first_stage()
+    if marker:
+        (env.root / "BACKUP/.bdbackup-destination").touch()
+    env.file_unit("a", days_ago=0)
+    return env
+
+
+def test_snapshot_reaches_marked_fed_first_stage(tmp_path):
+    env = single_stage_env(tmp_path, fed=True, marker=True)
+    result = env.run_cli()
+    snapshot = env.abs("BACKUP") / "gfs-main.ledger.sqlite3"
+    assert result.exit_code == 0, result.output
+    assert snapshot.is_file(), result.output
+    assert ledger_rows(snapshot) == ledger_rows(env.database)
+    assert snapshot.stat().st_mode & 0o777 == 0o600
+    assert f"snapshot {snapshot}" in result.output.splitlines(), result.output
+    assert not [p for p in env.abs("BACKUP").rglob("*") if ".gfs-tmp-" in p.name]
+    assert not Path(f"{env.database}.gfs-gfs-main.snapshot").exists()
+
+
+def test_snapshot_skips_unfed_first_stage(tmp_path):
+    env = single_stage_env(tmp_path, fed=False, marker=False)
+    result = env.run_cli()
+    assert result.exit_code == 0, result.output
+    assert not (env.abs("BACKUP") / "gfs-main.ledger.sqlite3").exists()
+    assert not [line for line in result.output.splitlines()
+                if line.startswith(("snapshot ", "failed snapshot ", "no ledger"))], result.output
+
+
+def test_snapshot_fed_first_stage_without_marker(tmp_path):
+    env = single_stage_env(tmp_path, fed=True, marker=False)
+    result = env.run_cli()
+    assert result.exit_code == 1, result.output
+    assert not (env.abs("BACKUP") / "gfs-main.ledger.sqlite3").exists()
+    assert (f"failed snapshot {env.abs('BACKUP')}: destination not ready"
+            in result.output.splitlines()), result.output
     assert "failed 1" in result.output, result.output
 
 

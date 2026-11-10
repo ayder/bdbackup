@@ -134,6 +134,20 @@ def test_config_rejects_repo_inside_stage(tmp_path, repo_path):
     assert str(refused.value) == "Job 'pg': repo_path must be outside every gfs stage path"
 
 
+@pytest.mark.parametrize(
+    "repo_path",
+    [
+        pytest.param("NFS", id="repo-above-a-later-stage"),
+        pytest.param("NFS/../NFS", id="repo-with-dotdot-above-a-later-stage"),
+    ],
+)
+def test_config_rejects_stage_inside_repo(tmp_path, repo_path):
+    with pytest.raises(ConfigError) as refused:
+        Config(write_config(tmp_path, out_dir="STAGE1/pg", repo_path=repo_path))
+
+    assert str(refused.value) == "Job 'pg': a gfs stage path must be outside repo_path"
+
+
 def test_config_accepts_repo_beside_the_stages(tmp_path):
     job = Config(write_config(tmp_path, repo_path="STAGE1-repo")).jobs["pg"]
 
@@ -215,6 +229,13 @@ def test_pgbackrest_first_stage_and_fed_first_stages(tmp_path):
 
     assert first == tmp_path.resolve() / "STAGE1"
     assert fed_first_stages(config.jobs) == {first}
+
+
+def test_fed_first_stages_counts_inactive_job(tmp_path):
+    config = Config(write_config(tmp_path, extra="active = false\n"))
+
+    assert config.jobs["pg"].active is False
+    assert fed_first_stages(config.jobs) == {tmp_path.resolve() / "STAGE1"}
 
 
 def test_fed_first_stages_is_empty_without_a_pgbackrest_job(tmp_path):

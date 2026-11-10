@@ -111,6 +111,32 @@ def test_validate_skips_inactive_jobs(file_config):
     assert "Job 'paused' (file): inactive (active = false), not checked" in result.output
 
 
+def test_validate_reports_fed_first_stage_marker(tmp_path):
+    env = Env(tmp_path)
+    env.write([(["BACKUP"], "daily", "5d")])
+    env.feed_first_stage()
+    stage = env.abs("BACKUP")
+    missing = invoke("run", "-c", env.config_path, "-j", "gfs-main", "--validate")
+    assert missing.exit_code == 1, missing.output
+    assert (f"[FAIL] Stage path {stage}: .bdbackup-destination missing; run bdbackup run -c "
+            f"{env.config_path.resolve()} -j gfs-main --initialize-structure"
+            in missing.output.splitlines()), missing.output
+    prepared = invoke("run", "-c", env.config_path, "-j", "gfs-main", "--initialize-structure")
+    assert prepared.exit_code == 0, prepared.output
+    present = invoke("run", "-c", env.config_path, "-j", "gfs-main", "--validate")
+    assert present.exit_code == 0, present.output
+    assert (f"[OK] Stage path {stage}: writable, marker present and writable"
+            in present.output.splitlines()), present.output
+
+
+def test_validate_ignores_unfed_first_stage(tmp_path):
+    env = Env(tmp_path)
+    env.write([(["BACKUP"], "daily", "5d")])
+    result = invoke("run", "-c", env.config_path, "-j", "gfs-main", "--validate")
+    assert result.exit_code == 0, result.output
+    assert "Stage path" not in result.output, result.output
+
+
 @pytest.mark.parametrize("flag", ["--full", "--incremental", "--verify", "--no-verify",
                                   "--dry-run"],
                          ids=["full", "incremental", "verify", "no-verify", "dry-run"])
