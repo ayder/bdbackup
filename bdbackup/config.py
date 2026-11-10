@@ -149,7 +149,28 @@ class Config:
                 job.params["first_stage"] = pgbackrest_first_stage(job, self.jobs)
             except ValueError as exc:
                 raise ConfigError(f"Job {name!r}: {exc}") from exc
+            self._check_pgbackrest_layout(name, job)
             job.params["lock_file"] = Path(f"{self.history.database}.pgbackrest-{name}.lock")
+
+    def _check_pgbackrest_layout(self, name: str, job: Job) -> None:
+        """Keep the repository apart from the units and from every gfs stage.
+
+        bdbackup never writes under ``repo_path``; the units and the gfs rotation do.
+        """
+        if "repo_path" not in job.params:
+            return  # the engine refuses the job when it is built
+        repo = Path(job.params["repo_path"]).expanduser().resolve()
+        out_dir = Path(job.params["out_dir"]).expanduser().resolve()
+        if out_dir.is_relative_to(repo):
+            raise ConfigError(f"Job {name!r}: out_dir must be outside repo_path")
+        for other in self.jobs.values():
+            if other.type != "gfs":
+                continue
+            for stage in other.params["stage"]:
+                if any(repo.is_relative_to(path) for path in stage.paths):
+                    raise ConfigError(
+                        f"Job {name!r}: repo_path must be outside every gfs stage path"
+                    )
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:

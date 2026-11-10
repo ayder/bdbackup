@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
 from bdbackup.templates import TemplateError
+from bdbackup.utils import process_lock
 from bdbackup.validation import validate_config
 
 # Exit-code contract: 0 ok, 1 backup/verify failure, 2 usage (Click's usage error), 3 locked.
@@ -94,9 +96,12 @@ def _now() -> datetime:
 
 
 def _handle_errors(func, *args, **kwargs) -> int:
-    """Wrap a command body in the exit-code contract."""
+    """Wrap a command body in the exit-code contract.
+
+    Returns the body's own exit code when it returns one, else ``EXIT_OK``.
+    """
     try:
-        func(*args, **kwargs)
+        code = func(*args, **kwargs)
     except (click.ClickException, click.Abort):
         raise
     except BlockingIOError as exc:
@@ -113,7 +118,7 @@ def _handle_errors(func, *args, **kwargs) -> int:
     except Exception as exc:  # pragma: no cover - safety net
         logging.getLogger("bdbackup.cli").exception("Unexpected error: %s", exc)
         click.get_current_context().exit(EXIT_BACKUP_FAILED)
-    return EXIT_OK
+    return code if isinstance(code, int) else EXIT_OK
 
 
 def _dry_run(config: Config, job: Job, incremental: bool) -> None:
@@ -134,6 +139,51 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
         raise click.UsageError(f"--dry-run is not supported for job type {job.type!r}")
 
 
+def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) -> int:
+    """Export the newest pgBackRest full of the job's stanza as one tar; return the exit code.
+
+    A real run holds the job lock from before the full is chosen until the export is verified.
+    A dry run takes no lock and writes nothing. When there is no new full nothing is recorded.
+    """
+    engine = build_backend(job)
+    engine.refuse_root()
+    with nullcontext() if dry_run else process_lock(engine.lock_file):
+        choice = engine.choose(History(config.history), job.name)
+        full = choice.full
+        if full.page_errors:
+            click.echo(
+                f"WARNING: full {full.label} has page checksum errors; it is exported, "
+                "and restoring it needs checksum-page-error=n"
+            )
+        if not choice.new:
+            hours = max(0, int((_now() - full.stop).total_seconds() // 3600))
+            message = f"no new full: newest {full.label}, {hours} hours old"
+            limit = engine.max_full_age_hours
+            if limit is not None and hours > limit:
+                click.echo(f"{message} (older than max_full_age_hours = {limit})")
+                return EXIT_BACKUP_FAILED
+            click.echo(message)
+            return EXIT_OK
+        if dry_run:
+            engine.require_marker()
+            click.echo(
+                f"Dry run; would export {full.label} ({full.repo_bytes} bytes) "
+                f"of stanza {engine.stanza} to {engine.unit_path(full.label)}"
+            )
+            return EXIT_OK
+
+        def action():
+            result = engine.export(full)
+            if verify:
+                engine.verify(result)
+            return result
+
+        info = engine.restore_info(full, engine.version())
+        result = _tracked_backup(config, job.name, "pgbackrest-full", action, info)
+    click.echo(f"Job {job.name}: {result.path}")
+    return EXIT_OK
+
+
 @main.command(name="run")
 @config_option(required=True)
 @click.option("-j", "--job", "job_name", help="Run this configured job.")
@@ -147,7 +197,7 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
     help="Verify the backup after creation.",
 )
 @click.option("--dry-run", is_flag=True,
-              help="Report what the job would do; run no tool and change nothing.")
+              help="Report what the job would do; run no backup tool and change nothing.")
 @click.option("--validate", "validate_only", is_flag=True,
               help="Check settings, filesystem access and MySQL grants of every job, or of "
                    "--job; run nothing.")
@@ -214,6 +264,8 @@ def run(
     if job.type == "gfs":
         code = gfs_runner.run_job(config, job, out=click.echo, dry_run=dry_run)
         ctx.exit(code if code in (EXIT_OK, EXIT_LOCKED) else EXIT_BACKUP_FAILED)
+    if job.type == "pgbackrest":
+        ctx.exit(_handle_errors(_run_pgbackrest, config, job, verify=verify, dry_run=dry_run))
     if dry_run:
         return _handle_errors(_dry_run, config, job, incremental)
     info = {}
