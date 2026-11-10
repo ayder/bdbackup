@@ -154,6 +154,7 @@ def _line(name: str, replacement: str):
         pytest.param(lambda text: "this is not an info file\n", id="no-sections"),
         pytest.param(_line("db-version", "db-version=16 not json"), id="value-not-json"),
         pytest.param(_line("db-version", ""), id="no-db-version"),
+        pytest.param(lambda text: text.replace('"16"', "[" * 200000), id="json-nested-too-deep"),
         pytest.param(_line("db-version", "db-version=16"), id="db-version-not-a-string"),
         pytest.param(lambda text: text.replace("[db]", "[db-gone]"), id="no-db-section"),
         pytest.param(lambda text: text.replace(NEWEST, "20200101-000000F"), id="label-not-listed"),

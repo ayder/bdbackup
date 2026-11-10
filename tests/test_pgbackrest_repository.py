@@ -189,6 +189,14 @@ def test_parse_info_file_refuses_malformed_text(text):
         parse_info_file(text)
 
 
+def test_parse_info_file_refuses_json_nested_too_deep():
+    # json.loads raises RecursionError, not ValueError, for this; an info file can come from a tar.
+    with pytest.raises(RepositoryError) as caught:
+        parse_info_file("[s]\nkey=" + "[" * 200000 + "\n")
+
+    assert "[[" not in str(caught.value)
+
+
 def test_parse_info_file_reads_what_the_fake_writes(tmp_path):
     repo = make_repo(tmp_path, fulls=((OLDER, True, False), (FULL, True, True)))
 
