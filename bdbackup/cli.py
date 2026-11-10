@@ -19,6 +19,7 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.gfs import runner as gfs_runner
 from bdbackup.gfs import store as gfs_store
 from bdbackup.gfs import structure as gfs_structure
+from bdbackup.gfs.stages import fed_first_stages
 from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
@@ -247,7 +248,8 @@ def run(
     if initialize:
         if job.type != "gfs":
             raise click.UsageError(f"--initialize-structure applies only to gfs jobs: {job.name}")
-        ctx.exit(gfs_structure.initialize(job, click.echo))
+        fed = job.params["stage"][0].paths[0] in fed_first_stages(config.jobs)
+        ctx.exit(gfs_structure.initialize(job, click.echo, fed))
     if validate_only:
         jobs = [job] if job else list(config.jobs.values())
         if not jobs:

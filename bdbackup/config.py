@@ -171,6 +171,8 @@ class Config:
                     raise ConfigError(
                         f"Job {name!r}: repo_path must be outside every gfs stage path"
                     )
+                if any(path.is_relative_to(repo) for path in stage.paths):
+                    raise ConfigError(f"Job {name!r}: a gfs stage path must be outside repo_path")
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:
