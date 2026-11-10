@@ -31,11 +31,11 @@ directory.
 | Key | Required | Description |
 |-----|----------|-------------|
 | `stanza` | yes | The pgBackRest stanza. One job exports one stanza. |
-| `repo` | no (default `1`) | The index of the local POSIX repository in the host's `pgbackrest.conf`. Every pgBackRest command the job runs gets `--repo=<repo>`, so `info` lists only that repository's backups, even when the host also configures another repository such as S3. |
-| `repo_path` | yes | The repository root (what pgBackRest calls `repo<repo>-path`). The job reads `backup/<stanza>/` and `archive/<stanza>/` there and passes it as `--repo<repo>-path` to every pgBackRest command, so it always reads the repository it copies. Relative paths resolve against the config file. |
+| `repo` | no (default `1`) | The index of the local POSIX repository in the host's `pgbackrest.conf`. The `info` command the job runs gets `--repo=<repo>`, so it lists only that repository's backups, even when the host also configures another repository such as S3. |
+| `repo_path` | yes | The repository root (what pgBackRest calls `repo<repo>-path`). The job reads `backup/<stanza>/` and `archive/<stanza>/` there and passes it as `--repo<repo>-path` to the `info` command, so `info` and the job read the same repository. Relative paths resolve against the config file. |
 | `out_dir` | yes | Where the tar is written. It must be the first stage path of a GFS job in the same config, or a directory below it. |
 | `binary` | no (default `pgbackrest`) | The pgBackRest executable. |
-| `config_file` | no | Passed as `--config` to the pgBackRest commands the job runs. When it is not set, pgBackRest's default applies. |
+| `config_file` | no | Passed as `--config` to the `info` command the job runs. When it is not set, pgBackRest's default applies. (`pgbackrest version` runs without any of these options.) |
 | `max_full_age_hours` | no (default off) | A positive whole number. See [When there is no new full](#when-there-is-no-new-full). |
 
 A pgbackrest job needs a `[history]` section; without one the config is rejected
@@ -139,8 +139,8 @@ and needs none.
 
 Before the job creates any directory or file, it requires `<first stage>/.bdbackup-destination`
 to be a regular file. If the share is not mounted, its mount point is an empty local
-directory without the marker, and the run fails with exit 1 and writes nothing to the root
-filesystem:
+directory without the marker. The run fails with exit 1 and creates no directory or file
+at or below the stage (a real run still records a `failed` row in the history database):
 
 ```
 /mnt/backup/pg: .bdbackup-destination missing; run --initialize-structure for its gfs job
@@ -216,8 +216,9 @@ than that many hours old, the same message gets a suffix and the run exits 1 ins
 no new full: newest 20261109-010203F, 32 hours old (older than max_full_age_hours = 30)
 ```
 
-The age check applies whether or not that label was exported before. It does not apply
-when a new full is exported. For nightly fulls, pick a limit a few hours over 24.
+The age check applies only when the newest full was already exported (no new full). When
+a new full is exported, it does not apply. For nightly fulls, pick a limit a few hours over
+24.
 
 ## Page checksum errors
 
@@ -347,8 +348,9 @@ disable them first.
 
 ## Encrypted repositories
 
-A repository whose `backup.info` names a cipher is refused in this release. No passphrase or
-cipher option is read, stored or printed. The run fails with exit 1 and no history row:
+A repository for which `pgbackrest info` reports a cipher is refused in this release. No
+passphrase or cipher option is read, stored or printed. The run fails with exit 1 and no
+history row:
 
 ```
 encrypted repositories are not supported in 0.7.3

@@ -181,8 +181,8 @@ follows the rules of a later stage:
 
 - It needs the `.bdbackup-destination` marker. `--initialize-structure` writes it
   (stage 1), `--validate` of the GFS job and of the pgbackrest job reports it, and
-  the pgbackrest job fails before it creates any directory or file when the marker
-  is missing, so an unmounted share is never written to.
+  the pgbackrest job fails before it creates any directory or file at or below the
+  stage when the marker is missing, so an unmounted share is never written to.
 - It receives the ledger copy (see Ledger copies), under the same marker
   condition.
 

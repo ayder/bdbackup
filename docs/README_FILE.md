@@ -59,6 +59,10 @@ Restore any file archive, with or without history:
 bdbackup restore --archive /backup/files/daily.tar -d /restore/here
 ```
 
+When the archive is a pgBackRest export, `restore --archive` also prints the pgBackRest
+restore command; see
+[When the repository host is lost](README_PGBACKREST.md#when-the-repository-host-is-lost).
+
 ## Exclusion templates
 
 `exclude_templates` applies named bundles of gitignore-style exclusion
