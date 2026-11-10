@@ -902,6 +902,24 @@ def test_preflight_output_directory_looks_no_further_up_than_the_first_stage(tmp
     ]
 
 
+def test_preflight_stage_that_cannot_be_searched_is_a_fail_not_an_exception(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+    stage.chmod(0o000)
+
+    try:
+        lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+    finally:
+        stage.chmod(0o755)
+
+    marker, out_dir = failures(lines)
+    assert marker[1].startswith(f"{stage}: ")
+    assert MARKER in marker[1]
+    assert out_dir == (
+        "FAIL",
+        f"Output directory: {stage / 'pg'} does not exist and {stage} is not a writable directory",
+    )
+
+
 # ---- run --validate -------------------------------------------------------------------------
 
 VALIDATE_CONFIG = """[history]

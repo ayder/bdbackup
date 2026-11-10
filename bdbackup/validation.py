@@ -326,6 +326,10 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
                 first = job.params["stage"][0].paths[0]
                 _gfs(report, job, config.path, first in fed_first_stages(config.jobs))
                 continue
+            if job.type == "pgbackrest":
+                for status, message in build_backend(job).preflight():
+                    report.add(status, message)
+                continue
             if job.type not in {"file", "xtrabackup", "mysqldump"}:
                 report.add("FAIL", f"Preflight checks are not implemented for engine {job.type!r}.")
                 continue

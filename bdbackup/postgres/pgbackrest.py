@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import tarfile
@@ -23,10 +24,12 @@ from bdbackup.engines import EngineInfo
 from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History
 from bdbackup.postgres.repository import (
+    ENCRYPTED,
     LABEL,
     FullBackup,
     archive_copy,
     full_entries,
+    is_encrypted,
     newest_full,
     parse_info_file,
     read_info_pair,
@@ -188,8 +191,107 @@ class PgBackRest:
             )
 
     def preflight(self) -> list[tuple[str, str]]:
-        """The checks of ``run --validate``, as ``("OK" | "FAIL", message)`` lines."""
-        return []
+        """The checks of ``run --validate`` as ``("OK" | "FAIL", message)`` lines, in order.
+
+        Nothing is written and no lock is taken. A failing check is one FAIL line, never an
+        exception, and the checks after it still run, except that the encryption and
+        repository directory checks are skipped when ``info`` does not list the stanza.
+        """
+        lines = [self._binary_line(), self._version_line(), self._root_line()]
+        stanza_line, entry = self._stanza_line()
+        lines.append(stanza_line)
+        if entry is not None:
+            lines.append(self._encryption_line(entry))
+            lines.extend(self._repository_directory_lines())
+        lines.append(self._marker_line())
+        lines.append(self._out_dir_line())
+        return lines
+
+    @staticmethod
+    def _attempt(name: str, call):
+        """``(result, None)``, or ``(None, why)`` when the pgBackRest command ``name`` fails."""
+        try:
+            return call(), None
+        except BackupError as exc:
+            return None, str(exc)
+        except OSError as exc:  # the binary is missing or cannot be run
+            return None, f"pgbackrest {name} failed: {exc.strerror or exc}"
+
+    def _binary_line(self) -> tuple[str, str]:
+        found = shutil.which(self.binary)
+        if found:
+            return "OK", f"Executable: {found}"
+        return "FAIL", f"Required executable {self.binary!r} is missing or not executable in PATH."
+
+    def _version_line(self) -> tuple[str, str]:
+        version, why = self._attempt("version", self.version)
+        if why is not None:
+            return "FAIL", why
+        note = ""
+        if version not in TESTED_VERSIONS:
+            note = f" (not a tested version: {', '.join(TESTED_VERSIONS)})"
+        return "OK", f"pgBackRest {version}{note}"
+
+    def _root_line(self) -> tuple[str, str]:
+        try:
+            self.refuse_root()
+        except BackupError as exc:
+            return "FAIL", str(exc)
+        return "OK", "not running as root"
+
+    def _stanza_line(self) -> tuple[tuple[str, str], dict | None]:
+        """The line for the info command, and the stanza's entry when it lists one."""
+        document, why = self._attempt("info", self.info)
+        if why is not None:
+            return ("FAIL", why), None
+        entry = next((stanza for stanza in document if stanza.get("name") == self.stanza), None)
+        if entry is None:
+            return ("FAIL", f"stanza {self.stanza!r} is not in the pgbackrest info output"), None
+        return ("OK", f"stanza {self.stanza} is listed by pgbackrest info"), entry
+
+    @staticmethod
+    def _encryption_line(entry: dict) -> tuple[str, str]:
+        if is_encrypted(entry):
+            return "FAIL", ENCRYPTED
+        return "OK", "repository is not encrypted"
+
+    def _repository_directory_lines(self) -> list[tuple[str, str]]:
+        lines = []
+        for part in ("backup", "archive"):
+            path = self.repo_path / part / self.stanza
+            if _usable_dir(path, os.R_OK | os.X_OK):
+                lines.append(("OK", f"{path}: readable and searchable"))
+            else:
+                lines.append(("FAIL", f"{path}: not a readable and searchable directory"))
+        return lines
+
+    def _marker_line(self) -> tuple[str, str]:
+        try:
+            self.require_marker()
+        except BackupError as exc:
+            return "FAIL", str(exc)
+        except OSError as exc:  # Python 3.12 raises when the stage cannot be searched
+            return "FAIL", f"{self.first_stage}: cannot check for {MARKER}: {exc.strerror or exc}"
+        return "OK", f"{self.first_stage}: {MARKER} present"
+
+    def _out_dir_line(self) -> tuple[str, str]:
+        """``out_dir`` must be writable, or must be creatable under its nearest existing parent.
+
+        The search for that parent stops at the first stage, so an unmounted share is never
+        satisfied by a writable directory above it.
+        """
+        target = self.out_dir
+        while not os.path.exists(target) and target != self.first_stage and target != target.parent:
+            target = target.parent
+        writable = _usable_dir(target, os.W_OK | os.X_OK)
+        subject = f"Output directory: {self.out_dir}"
+        if target == self.out_dir:
+            if writable:
+                return "OK", f"{subject} is writable"
+            return "FAIL", f"{subject} is not a writable directory"
+        if writable:
+            return "OK", f"{subject} does not exist; {target} is writable, so it can be created"
+        return "FAIL", f"{subject} does not exist and {target} is not a writable directory"
 
     def export(self, full: FullBackup) -> BackupResult:
         """Write ``full`` as one tar in ``out_dir``, hashing its bytes as they are written.
@@ -320,6 +422,15 @@ class PgBackRest:
 
 
 _CHUNK = 1024 * 1024  # tar stream buffer: fewer, larger reads and writes over NFS
+
+
+def _usable_dir(path: Path, mode: int) -> bool:
+    """Whether ``path`` is a directory the effective user may access with ``mode``.
+
+    ``os.path`` answers False when a parent cannot be searched; ``Path.is_dir`` and
+    ``Path.exists`` raise PermissionError there on Python 3.12.
+    """
+    return os.path.isdir(path) and os.access(path, mode, effective_ids=True)
 
 
 def _changed(path: Path, before: os.stat_result) -> bool:

@@ -45,6 +45,11 @@ class InfoPair:
     copy_stat: os.stat_result
 
 
+def is_encrypted(entry: dict) -> bool:
+    """Whether a stanza of the ``info --output=json`` document names a cipher on any repository."""
+    return any(repo.get("cipher", "none") != "none" for repo in entry.get("repo", []))
+
+
 def newest_full(info: list[dict], stanza: str) -> FullBackup | None:
     """The newest full backup of ``stanza`` in the parsed ``info --output=json`` document.
 
@@ -55,7 +60,7 @@ def newest_full(info: list[dict], stanza: str) -> FullBackup | None:
     entry = next((item for item in info if item.get("name") == stanza), None)
     if entry is None:
         raise RepositoryError(f"stanza {stanza!r} is not in the pgbackrest info output")
-    if any(repo.get("cipher", "none") != "none" for repo in entry.get("repo", [])):
+    if is_encrypted(entry):
         raise RepositoryError(ENCRYPTED)
     fulls = [backup for backup in entry.get("backup", []) if backup.get("type") == "full"]
     if not fulls:
