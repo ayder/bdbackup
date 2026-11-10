@@ -212,8 +212,9 @@ class PgBackRest:
         try:
             names = self._write_tar(writer, full.label)
             os.fsync(fd)
-            os.close(fd)
-            fd = None
+            # Cleared before the close: a failed close has still released the descriptor.
+            closing, fd = fd, None
+            os.close(closing)
             os.rename(temp, final)
         except BaseException:
             # A failed tar stream flushes its buffer again when it is collected; that write
