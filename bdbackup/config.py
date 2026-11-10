@@ -9,7 +9,7 @@ from typing import Any
 
 from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
-from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job
+from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
 
 
@@ -108,6 +108,8 @@ class Config:
                 "out_dir",
                 "backup_root",
                 "encrypt_key_file",
+                "repo_path",
+                "config_file",
             ):
                 if key in params:
                     try:
@@ -124,6 +126,30 @@ class Config:
                 check_gfs_config(self.jobs, self.history)
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
+        self._check_pgbackrest()
+
+    def _check_pgbackrest(self) -> None:
+        """Rules for pgbackrest jobs; they follow ``check_gfs_config``, which reads the stages."""
+        for name, job in self.jobs.items():
+            if job.type != "pgbackrest":
+                continue
+            if self.history is None:
+                raise ConfigError(f"Job {name!r}: pgbackrest jobs require a [history] section")
+            for key in ("first_stage", "lock_file"):
+                if key in job.params:
+                    raise ConfigError(f"Job {name!r}: {key} is set by bdbackup, not in the config")
+            for key, rule in (
+                ("repo", "a whole number of 1 or more"),
+                ("max_full_age_hours", "a positive whole number"),
+            ):
+                value = job.params.get(key, 1)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ConfigError(f"Job {name!r}: {key} must be {rule}")
+            try:
+                job.params["first_stage"] = pgbackrest_first_stage(job, self.jobs)
+            except ValueError as exc:
+                raise ConfigError(f"Job {name!r}: {exc}") from exc
+            job.params["lock_file"] = Path(f"{self.history.database}.pgbackrest-{name}.lock")
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:
