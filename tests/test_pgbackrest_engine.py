@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from click.testing import CliRunner
 
 from bdbackup.backends import BackupError, BackupResult
+from bdbackup.cli import main
 from bdbackup.config import Config, ConfigError, build_backend
 from bdbackup.engines import _reset_for_tests, get_engine, list_engines
-from bdbackup.gfs.stages import fed_first_stages, pgbackrest_first_stage
+from bdbackup.gfs.stages import MARKER, fed_first_stages, pgbackrest_first_stage
 from bdbackup.history import History, HistorySettings
 from bdbackup.postgres import PgBackRest
-from bdbackup.postgres.pgbackrest import ENGINE, Choice
+from bdbackup.postgres.pgbackrest import ENGINE, TESTED_VERSIONS, Choice
 from bdbackup.postgres.repository import FullBackup, RepositoryError
 from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo
 
@@ -574,3 +578,415 @@ def test_choose_refuses_a_missing_archive_copy_even_when_the_label_was_exported(
 
     with pytest.raises(BackupError, match="without archive-copy"):
         choose(tmp_path, history, fulls=((NEWEST, False, False),))
+
+
+# ---- preflight, for run --validate ----------------------------------------------------------
+
+BINARY = "/usr/bin/pgbackrest"
+NO_SUCH_FILE = FileNotFoundError(2, "No such file or directory", "pgbackrest")
+
+
+def preflight_site(tmp_path, *, marker=True, repo_args=None, **overrides):
+    """A repository and a first stage with an engine over them; returns (engine, stage)."""
+    repo = make_repo(tmp_path, **(repo_args or {}))
+    stage = tmp_path / "stage1"
+    stage.mkdir()
+    if marker:
+        (stage / MARKER).write_text("")
+    return make_engine(tmp_path, repo_path=repo, **overrides), stage
+
+
+def scripted(info, version="2.58.0"):
+    """A stand-in for ``subprocess.run`` that answers from fixed values, not from a repository.
+
+    A string is what the command prints (for ``version``, the version number) and an exception
+    is raised. Every command it receives is appended to ``run.calls``.
+    """
+
+    def run(cmd, **kwargs):
+        run.calls.append(list(cmd))
+        command = next(arg for arg in cmd[1:] if not arg.startswith("-"))
+        answer = version if command == "version" else info
+        if isinstance(answer, Exception):
+            raise answer
+        stdout = f"pgBackRest {answer}\n" if command == "version" else answer
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    run.calls = []
+    return run
+
+
+def preflight(engine, run, *, which=BINARY, euid=1000):
+    with (
+        patch(RUN, run),
+        patch("shutil.which", return_value=which),
+        patch("os.geteuid", return_value=euid),
+    ):
+        return engine.preflight()
+
+
+def failures(lines):
+    return [line for line in lines if line[0] == "FAIL"]
+
+
+def test_preflight_passes_on_a_good_site(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+    run = fake_pgbackrest(engine.repo_path)
+
+    lines = preflight(engine, run)
+
+    assert lines == [
+        ("OK", f"Executable: {BINARY}"),
+        ("OK", "pgBackRest 2.58.0"),
+        ("OK", "not running as root"),
+        ("OK", "stanza main is listed by pgbackrest info"),
+        ("OK", "repository is not encrypted"),
+        ("OK", f"{tmp_path / 'repo' / 'backup' / 'main'}: readable and searchable"),
+        ("OK", f"{tmp_path / 'repo' / 'archive' / 'main'}: readable and searchable"),
+        ("OK", f"{stage}: {MARKER} present"),
+        (
+            "OK",
+            f"Output directory: {stage / 'pg'} does not exist; "
+            f"{stage} is writable, so it can be created",
+        ),
+    ]
+    assert run.calls == [["pgbackrest", "version"], engine.command("info", "--output=json")]
+    assert not engine.out_dir.exists()
+
+
+def test_preflight_passes_on_a_stanza_without_a_full(tmp_path):
+    engine, _ = preflight_site(tmp_path, repo_args={"fulls": ()})
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+
+    assert failures(lines) == []
+    assert ("OK", "stanza main is listed by pgbackrest info") in lines
+    assert ("OK", "repository is not encrypted") in lines
+
+
+def test_preflight_binary_not_on_path(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+
+    lines = preflight(engine, scripted(NO_SUCH_FILE, NO_SUCH_FILE), which=None)
+
+    assert failures(lines) == [
+        ("FAIL", "Required executable 'pgbackrest' is missing or not executable in PATH."),
+        ("FAIL", "pgbackrest version failed: No such file or directory"),
+        ("FAIL", "pgbackrest info failed: No such file or directory"),
+    ]
+    assert ("OK", "not running as root") in lines
+    assert ("OK", f"{stage}: {MARKER} present") in lines
+    assert len(lines) == 6  # checks 5 and 6 are skipped, 3, 7 and 8 still run
+
+
+def test_preflight_version_command_fails(tmp_path):
+    engine, _ = preflight_site(tmp_path)
+    failed = subprocess.CalledProcessError(
+        1, ["pgbackrest", "version"], output="", stderr="P00   INFO: x\nP00  ERROR: [025]: bad\n"
+    )
+    info = json.dumps(info_json(engine.repo_path, "main"))
+
+    lines = preflight(engine, scripted(info, version=failed))
+
+    assert failures(lines) == [("FAIL", "pgbackrest version failed: P00  ERROR: [025]: bad")]
+    assert ("OK", "stanza main is listed by pgbackrest info") in lines
+
+
+@pytest.mark.parametrize("version", TESTED_VERSIONS)
+def test_validate_tested_version_is_ok_without_a_note(tmp_path, version):
+    engine, _ = preflight_site(tmp_path)
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path, version=version))
+
+    assert lines[1] == ("OK", f"pgBackRest {version}")
+
+
+def test_tested_versions():
+    assert TESTED_VERSIONS == ("2.58.0", "2.60.0")
+
+
+def test_validate_untested_version_is_ok_with_note(tmp_path):
+    engine, _ = preflight_site(tmp_path)
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path, version="2.59.0"))
+
+    assert lines[1] == (
+        "OK",
+        "pgBackRest 2.59.0 (not a tested version: 2.58.0, 2.60.0)",
+    )
+    assert failures(lines) == []
+
+
+def test_preflight_refuses_root_and_runs_the_other_checks(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path), euid=0)
+
+    assert failures(lines) == [
+        (
+            "FAIL",
+            "pgbackrest jobs do not run as root; run as the OS user that owns the repository",
+        )
+    ]
+    assert ("OK", "stanza main is listed by pgbackrest info") in lines
+    assert ("OK", f"{stage}: {MARKER} present") in lines
+
+
+def test_preflight_info_command_fails(tmp_path):
+    engine, _ = preflight_site(tmp_path)
+    failed = subprocess.CalledProcessError(
+        55, ["pgbackrest"], output="", stderr="P00  ERROR: [055]: unable to open file\n"
+    )
+
+    lines = preflight(engine, scripted(failed))
+
+    assert failures(lines) == [
+        ("FAIL", "pgbackrest info failed: P00  ERROR: [055]: unable to open file")
+    ]
+
+
+def test_preflight_info_output_is_not_a_stanza_list(tmp_path):
+    engine, _ = preflight_site(tmp_path)
+
+    lines = preflight(engine, scripted("not json"))
+
+    assert failures(lines) == [
+        ("FAIL", "pgbackrest info did not print a JSON list of stanzas")
+    ]
+
+
+def test_preflight_stanza_not_listed(tmp_path):
+    engine, _ = preflight_site(tmp_path, stanza="other")
+    info = json.dumps(info_json(engine.repo_path, "main"))
+
+    lines = preflight(engine, scripted(info))
+
+    assert failures(lines) == [("FAIL", "stanza 'other' is not in the pgbackrest info output")]
+    assert not any("encrypted" in message or "readable" in message for _, message in lines)
+
+
+def test_preflight_skips_encryption_and_directories_when_info_fails(tmp_path):
+    # The repository is encrypted and its archive directory is gone: both would fail if checked.
+    engine, stage = preflight_site(tmp_path, repo_args={"cipher": True})
+    shutil.rmtree(engine.repo_path / "archive" / "main")
+    failed = subprocess.CalledProcessError(55, ["pgbackrest"], output="", stderr="ERROR: x\n")
+
+    lines = preflight(engine, scripted(failed))
+
+    assert lines == [
+        ("OK", f"Executable: {BINARY}"),
+        ("OK", "pgBackRest 2.58.0"),
+        ("OK", "not running as root"),
+        ("FAIL", "pgbackrest info failed: ERROR: x"),
+        ("OK", f"{stage}: {MARKER} present"),
+        (
+            "OK",
+            f"Output directory: {stage / 'pg'} does not exist; "
+            f"{stage} is writable, so it can be created",
+        ),
+    ]
+
+
+def test_preflight_refuses_an_encrypted_repository_and_checks_the_directories(tmp_path):
+    engine, _ = preflight_site(tmp_path, repo_args={"cipher": True})
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+
+    assert failures(lines) == [("FAIL", "encrypted repositories are not supported in 0.7.3")]
+    assert ("OK", f"{tmp_path / 'repo' / 'backup' / 'main'}: readable and searchable") in lines
+
+
+@pytest.mark.parametrize("damage", ["missing", "no-search", "no-read"])
+@pytest.mark.parametrize("part", ["backup", "archive"])
+def test_preflight_repository_directories(tmp_path, part, damage):
+    engine, _ = preflight_site(tmp_path)
+    directory = engine.repo_path / part / "main"
+    info = json.dumps(info_json(engine.repo_path, "main"))  # read before the damage
+    if damage == "missing":
+        shutil.rmtree(directory)
+    else:
+        directory.chmod({"no-search": 0o644, "no-read": 0o311}[damage])
+
+    try:
+        lines = preflight(engine, scripted(info))
+    finally:
+        if directory.exists():
+            directory.chmod(0o755)
+
+    assert failures(lines) == [("FAIL", f"{directory}: not a readable and searchable directory")]
+
+
+def test_preflight_marker_missing(tmp_path):
+    engine, stage = preflight_site(tmp_path, marker=False)
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+
+    assert failures(lines) == [
+        (
+            "FAIL",
+            f"{stage}: {MARKER} missing; run --initialize-structure for its gfs job",
+        )
+    ]
+
+
+def test_preflight_output_directory_exists_and_is_writable(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+    engine.out_dir.mkdir()
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+
+    assert lines[-1] == ("OK", f"Output directory: {stage / 'pg'} is writable")
+    assert failures(lines) == []
+
+
+def test_preflight_output_directory_nearest_existing_parent(tmp_path):
+    engine, stage = preflight_site(tmp_path, out_dir=tmp_path / "stage1" / "a" / "b")
+    (stage / "a").mkdir()
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+
+    assert lines[-1] == (
+        "OK",
+        f"Output directory: {stage / 'a' / 'b'} does not exist; "
+        f"{stage / 'a'} is writable, so it can be created",
+    )
+    assert not engine.out_dir.exists()
+
+
+def test_preflight_output_directory_not_writable(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+    engine.out_dir.mkdir()
+    engine.out_dir.chmod(0o555)
+
+    try:
+        lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+    finally:
+        engine.out_dir.chmod(0o755)
+
+    assert failures(lines) == [
+        ("FAIL", f"Output directory: {stage / 'pg'} is not a writable directory")
+    ]
+
+
+def test_preflight_output_directory_parent_not_writable(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+    stage.chmod(0o555)
+
+    try:
+        lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+    finally:
+        stage.chmod(0o755)
+
+    assert failures(lines) == [
+        (
+            "FAIL",
+            f"Output directory: {stage / 'pg'} does not exist "
+            f"and {stage} is not a writable directory",
+        )
+    ]
+
+
+def test_preflight_output_directory_looks_no_further_up_than_the_first_stage(tmp_path):
+    engine, stage = preflight_site(tmp_path)
+    shutil.rmtree(stage)  # tmp_path is writable, but the share is not mounted
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+
+    assert failures(lines) == [
+        ("FAIL", f"{stage}: {MARKER} missing; run --initialize-structure for its gfs job"),
+        (
+            "FAIL",
+            f"Output directory: {stage / 'pg'} does not exist "
+            f"and {stage} is not a writable directory",
+        ),
+    ]
+
+
+# ---- run --validate -------------------------------------------------------------------------
+
+VALIDATE_CONFIG = """[history]
+database = "state/history.sqlite3"
+
+[gfs-main]
+type = "gfs"
+[[gfs-main.stage]]
+paths = ["STAGE1"]
+period = "daily"
+keep = "5d"
+
+[pg]
+type = "pgbackrest"
+stanza = "main"
+repo_path = "repo"
+out_dir = "STAGE1/pg"
+"""
+
+
+def validate_site(tmp_path, *, marker=True, extra=""):
+    repo = make_repo(tmp_path)
+    stage = tmp_path / "STAGE1"
+    stage.mkdir()
+    if marker:
+        (stage / MARKER).write_text("")
+    config = tmp_path / "config.toml"
+    config.write_text(VALIDATE_CONFIG + extra)
+    return config, repo.resolve(), stage.resolve()
+
+
+def validate(config, repo):
+    with patch(RUN, fake_pgbackrest(repo)), patch("shutil.which", return_value=BINARY):
+        return CliRunner().invoke(main, ["run", "-c", str(config), "-j", "pg", "--validate"])
+
+
+def test_validate_command_reports_each_check(tmp_path):
+    config, repo, stage = validate_site(tmp_path)
+
+    result = validate(config, repo)
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    for expected in (
+        f"[OK] Executable: {BINARY}",
+        "[OK] pgBackRest 2.58.0",
+        "[OK] not running as root",
+        "[OK] stanza main is listed by pgbackrest info",
+        "[OK] repository is not encrypted",
+        f"[OK] {repo / 'backup' / 'main'}: readable and searchable",
+        f"[OK] {repo / 'archive' / 'main'}: readable and searchable",
+        f"[OK] {stage}: {MARKER} present",
+        f"[OK] Output directory: {stage / 'pg'} does not exist; "
+        f"{stage} is writable, so it can be created",
+    ):
+        assert expected in lines, result.output
+    assert "not implemented" not in result.output
+    assert "Validation passed." in lines
+
+
+def test_validate_command_fails_on_a_missing_marker(tmp_path):
+    config, repo, stage = validate_site(tmp_path, marker=False)
+
+    result = validate(config, repo)
+
+    assert result.exit_code == 1, result.output
+    assert (
+        f"[FAIL] {stage}: {MARKER} missing; run --initialize-structure for its gfs job"
+        in result.output.splitlines()
+    )
+    assert "Validation failed; see requirements above." in result.output
+
+
+def test_validate_command_missing_binary_is_a_fail_line_not_a_traceback(tmp_path):
+    config, _, _ = validate_site(tmp_path, extra='binary = "bdbackup-no-such-pgbackrest"\n')
+
+    result = CliRunner().invoke(main, ["run", "-c", str(config), "-j", "pg", "--validate"])
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    lines = result.output.splitlines()
+    assert (
+        "[FAIL] Required executable 'bdbackup-no-such-pgbackrest' is missing "
+        "or not executable in PATH."
+    ) in lines
+    assert "[FAIL] pgbackrest version failed: No such file or directory" in lines
+    assert "[FAIL] pgbackrest info failed: No such file or directory" in lines
+    assert "Traceback" not in result.output

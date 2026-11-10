@@ -32,6 +32,8 @@ from bdbackup.postgres.repository import (
     read_info_pair,
 )
 
+TESTED_VERSIONS = ("2.58.0", "2.60.0")
+
 
 @dataclass(frozen=True)
 class Choice:
@@ -184,6 +186,10 @@ class PgBackRest:
                 f"{self.first_stage}: {MARKER} missing; "
                 "run --initialize-structure for its gfs job"
             )
+
+    def preflight(self) -> list[tuple[str, str]]:
+        """The checks of ``run --validate``, as ``("OK" | "FAIL", message)`` lines."""
+        return []
 
     def export(self, full: FullBackup) -> BackupResult:
         """Write ``full`` as one tar in ``out_dir``, hashing its bytes as they are written.
