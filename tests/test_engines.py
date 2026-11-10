@@ -16,6 +16,7 @@ from bdbackup.engines import (
     register_engine,
 )
 from bdbackup.mysql import MySQLBackup, XtraBackup
+from bdbackup.postgres import PgBackRest
 
 
 @pytest.fixture(autouse=True)
@@ -34,14 +35,16 @@ class FakeBackend:
 
 def test_builtin_engines_registered():
     engines = list_engines()
-    assert set(engines) == {"mysqldump", "xtrabackup"}
+    assert set(engines) == {"mysqldump", "xtrabackup", "pgbackrest"}
     assert engines["mysqldump"].backend is MySQLBackup
     assert engines["xtrabackup"].backend is XtraBackup
     assert engines["xtrabackup"].family == "mysql"
+    assert engines["pgbackrest"].backend is PgBackRest
+    assert engines["pgbackrest"].family == "postgres"
 
 
 def test_supported_types_are_file_gfs_and_engines():
-    assert supported_types() == {"file", "gfs", "mysqldump", "xtrabackup"}
+    assert supported_types() == {"file", "gfs", "mysqldump", "xtrabackup", "pgbackrest"}
 
 
 def test_unknown_engine_error_lists_available():

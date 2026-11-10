@@ -169,3 +169,11 @@ def check_gfs_config(jobs: Mapping[str, Job], history: HistorySettings | None) -
                 raise ValueError(
                     f"Job {other.name!r} writes into first stage {first}: set timestamp = true"
                 )
+
+
+def pgbackrest_first_stage(job: Job, jobs: Mapping[str, Job]) -> Path:
+    raise NotImplementedError
+
+
+def fed_first_stages(jobs: Mapping[str, Job]) -> set[Path]:
+    raise NotImplementedError
