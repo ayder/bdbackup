@@ -22,6 +22,7 @@ from bdbackup.gfs import structure as gfs_structure
 from bdbackup.gfs.stages import fed_first_stages
 from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
+from bdbackup.postgres.restore import describe_unit, restore_lines
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
 from bdbackup.templates import TemplateError
 from bdbackup.utils import process_lock
@@ -330,6 +331,14 @@ def _restore_mode(config_path, backup_id, job, yes, dst, archive, backup, root, 
     return "archive" if archive is not None else "backup"
 
 
+def _echo_restore_command(directory: Path) -> None:
+    """Print the pgbackrest restore command if ``directory`` holds an extracted pgBackRest unit."""
+    facts = describe_unit(directory)
+    if facts is not None:
+        for line in restore_lines(facts, directory.expanduser().absolute()):
+            click.echo(line)
+
+
 @main.command()
 @config_option()
 @click.option("--backup-id", type=click.IntRange(min=1), help="Successful backup ID from history.")
@@ -371,6 +380,7 @@ def restore(
         if mode == "archive":
             FileBackup.restore_archive(archive, dst)
             click.echo(f"Restored to: {dst}")
+            _echo_restore_command(dst)
             return
         if mode == "backup":
             xb = XtraBackup(backup_root=root, binary=binary or "xtrabackup",
@@ -442,6 +452,8 @@ def restore(
             click.echo(f"Prepared recovery directory: {restored}")
         else:
             click.echo(f"Restored to: {restored}")
+        if record.backup_type == "pgbackrest-full":
+            _echo_restore_command(restored)
 
     return _handle_errors(_run)
 
