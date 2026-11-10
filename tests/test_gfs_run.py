@@ -1,8 +1,10 @@
 """GFS runs against temporary stage directories and a real SQLite history database."""
 
+import errno
 import hashlib
 import io
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -421,6 +423,53 @@ def test_move_keeps_directory_modes(env):
     assert result.exit_code == 0, result.output
     moved = env.root / "NFS/daily" / unit.relative_to(env.root / "BACKUP")
     assert _directory_modes(moved) == before
+
+
+def _squashed(error):
+    """What a share that maps every user to one account answers to chmod; EPERM and EACCES
+    arrive as ``PermissionError``."""
+    return OSError(error, "squashed")
+
+
+def test_copy_survives_eperm_from_chmod(env):
+    unit = env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+    before = tree(unit)
+    with patch("bdbackup.gfs.actions.os.chmod", side_effect=_squashed(errno.EPERM)), \
+            patch("bdbackup.gfs.actions.shutil.copymode", side_effect=_squashed(errno.EPERM)):
+        code, output = env.run_api(datetime.now())
+    assert code == 0, output
+    assert env.query("SELECT moved, failed FROM gfs_runs") == [(1, 0)]
+    moved = env.root / "NFS/daily" / unit.relative_to(env.root / "BACKUP")
+    assert tree(moved) == before
+    assert not unit.exists()
+    assert (env.root / "NFS/daily/gfs-main.ledger.sqlite3").is_file()
+    assert re.search(r"^permission bits not kept on [1-9]\d* entries: "
+                     r"the destination refused chmod$", output, re.MULTILINE), output
+
+
+@pytest.mark.parametrize("error", [errno.EIO, errno.EACCES], ids=["EIO", "EACCES"])
+@pytest.mark.parametrize("call", ["os.chmod", "shutil.copymode"])
+def test_copy_fails_on_other_chmod_errors(env, call, error):
+    unit = env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+    before = tree(unit)
+    with patch(f"bdbackup.gfs.actions.{call}", side_effect=_squashed(error)):
+        code, output = env.run_api(datetime.now())
+    assert code == 1, output
+    assert "squashed" in output
+    assert "permission bits not kept" not in output
+    assert env.query("SELECT moved FROM gfs_runs") == [(0,)]
+    assert tree(unit) == before
+    assert not stage_files(env, "NFS/daily")
+
+
+def test_report_has_no_chmod_line_when_modes_kept(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    code, output = env.run_api(datetime.now())
+    assert code == 0, output
+    assert "permission bits not kept" not in output
 
 
 def test_unrecorded_files_untouched(env):
