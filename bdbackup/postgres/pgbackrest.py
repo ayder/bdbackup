@@ -12,7 +12,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from bdbackup.backends import BackupError
+from bdbackup.backends import BackupError, BackupResult
 from bdbackup.engines import EngineInfo
 from bdbackup.history import History
 from bdbackup.postgres.repository import (
@@ -158,6 +158,34 @@ class PgBackRest:
     def unit_path(self, label: str) -> Path:
         """Where the export of ``label`` is published."""
         return self.out_dir / f"{self.stanza}-{label}.tar"
+
+    def refuse_root(self) -> None:
+        raise NotImplementedError
+
+    def require_marker(self) -> None:
+        raise NotImplementedError
+
+    def export(self, full: FullBackup) -> BackupResult:
+        raise NotImplementedError
+
+    def verify(self, result: BackupResult) -> BackupResult:
+        raise NotImplementedError
+
+    def backup(self, name: str | None = None) -> BackupResult:
+        raise NotImplementedError
+
+    def prune(self) -> list[Path]:
+        raise NotImplementedError
+
+
+class _HashingWriter:
+    def write(self, data) -> int:
+        raise NotImplementedError
+
+
+class _HashingReader:
+    def read(self, size: int = -1) -> bytes:
+        raise NotImplementedError
 
 
 ENGINE = EngineInfo(
