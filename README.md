@@ -2,12 +2,13 @@
 
 **Backups by design.**
 
-bdbackup is a command-line backup tool and Python library for MySQL, MariaDB and
-files on Linux and macOS. It takes MySQL and MariaDB backups with mysqldump,
-Percona XtraBackup and MariaDB Backup (full and incremental physical backups,
-compressed and optionally encrypted), archives files and directories as tar,
-tar.gz or tar.zst, and rotates the results across storage stages with GFS
-(grandfather-father-son) retention. Every backup is verified before it is
+bdbackup is a command-line backup tool and Python library for MySQL, MariaDB,
+PostgreSQL (pgBackRest) and files on Linux and macOS. It takes MySQL and MariaDB
+backups with mysqldump, Percona XtraBackup and MariaDB Backup (full and
+incremental physical backups, compressed and optionally encrypted), exports
+pgBackRest fulls, archives files and directories as tar, tar.gz or tar.zst, and
+rotates the results across storage stages with GFS (grandfather-father-son)
+retention. Every backup is verified before it is
 published and recorded with a SHA-256 checksum in an SQLite backup history, from
 which a guided restore prepares a recovery copy. Jobs live in one TOML file and
 run from cron.
@@ -19,6 +20,8 @@ run from cron.
   encrypted with Percona, prepared for recovery with `restore --backup`.
 - [MySQL and MariaDB logical backups](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md) with mysqldump,
   gzip-compressed, one database or all.
+- [PostgreSQL pgBackRest backups](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md): the newest
+  full of a stanza exported as one tar into a GFS stage, restorable on its own.
 - [File and directory backups](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md) as tar archives, with
   gitignore-style exclusion templates.
 - [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md): daily,
@@ -37,6 +40,7 @@ run from cron.
 | [File and directory backups with tar](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md) | file jobs, template files, exclusion templates, restoring an archive |
 | [MySQL and MariaDB logical backups with mysqldump](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md) | mysqldump jobs, credentials, default options |
 | [MySQL and MariaDB physical backups with Percona XtraBackup and MariaDB Backup](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) | xtrabackup jobs, full and incremental backups, encryption, preparing a recovery copy, engine pruning |
+| [PostgreSQL pgBackRest backups: nightly fulls exported to a GFS stage](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md) | pgbackrest jobs, taking fulls with archive-copy, the first stage, no new full and `max_full_age_hours`, restore and the printed pgBackRest command, the repository host lost, known limits |
 | [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, preparing stage directories, safety rules, run and step logs, ledger copies |
 | [Custom backup engines (plugins)](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) | the engine registry and writing your own engine |
 | [Running xtrabackup jobs with systemd timers](https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md) | service and timer templates, the mysql account, schedules, CPU, I/O and memory limits |
@@ -170,10 +174,12 @@ An xtrabackup job also takes `--incremental`; see
 
 `--dry-run` reports what a job would do: it runs no backup tool, writes no
 backup and records no history; a GFS dry run creates only its job's lock file
-beside the history database. What each job type reports is described with it:
+beside the history database. The one exception is a pgbackrest job, which runs
+the read-only `pgbackrest info`. What each job type reports is described with it:
 [file jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md#dry-run),
 [mysqldump jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md#dry-run),
-[xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#dry-run) and
+[xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#dry-run),
+[pgbackrest jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md#dry-run-and-validation) and
 [GFS jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md#dry-run).
 
 A dry run exits 1 where the real run would fail before writing anything (an
@@ -251,7 +257,8 @@ Checks cover direct grants; role-derived privileges and partial revokes may need
 manual review. Physical datadir checks cover root-directory access, not every data
 file or external tablespace. Custom mysqldump options, routine visibility, GTID
 settings and exact server/binary version compatibility still need review.
-For a GFS job, every stage path after the first must exist and be writable, and
+For a GFS job, every stage path after the first (and the first, when a pgbackrest
+job writes into it) must exist and be writable, and
 its `.bdbackup-destination` marker must be present and writable; a missing
 marker's line names the `--initialize-structure` command that creates it.
 An unreachable database or missing client is a failed/incomplete check, not a pass.
@@ -362,7 +369,8 @@ bdbackup restore -c config.toml --backup-id 12 --dst /restore/job-12 --yes
 What a restore produces depends on the job type; see
 [file jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md#history-restore),
 [mysqldump jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md#history-restore),
-[xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#history-restore) and
+[xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#history-restore),
+[pgbackrest jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md#restore) and
 [custom engines](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md#history-restore).
 
 Deleted artifacts remain in history as unavailable. File identity, size, and

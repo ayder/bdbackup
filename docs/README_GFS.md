@@ -83,7 +83,7 @@ With the configuration above on Tuesday 2026-09-29 and one backup per day:
 
 ## Units and paths
 
-GFS moves a unit as one piece: an archive or dump file, or
+GFS moves a unit as one piece: an archive, dump or pgBackRest export file, or
 an xtrabackup dated directory with its full and every incremental (and its
 `Full_Latest` and `.full_success` markers). A unit keeps its path relative to
 the first stage, so `/BACKUP/mysql/prod/2026-09-29` becomes
@@ -99,11 +99,14 @@ bdbackup run -c config.toml -j gfs-main --initialize-structure
 ```
 
 For each stage path, in order, it reports `<path>: created` or `<path>: exists`,
-and for every stage after the first adds `, marker written`. A stage path is
+and for every stage after the first adds `, marker written`. The first stage gets
+its marker too when a [pgbackrest job](README_PGBACKREST.md) writes into it
+(see below). A stage path is
 created only when its parent directory already exists, and only its last
 component; otherwise it fails with `parent does not exist`. Every path must be
 writable by the OS user running the command. Into each path after the first stage
-it writes `.bdbackup-destination`, holding the bdbackup version, the GFS job, the
+(and into the first stage, when a pgbackrest job writes into it) it writes
+`.bdbackup-destination`, holding the bdbackup version, the GFS job, the
 stage number and the time, rewriting an existing marker in place. A failure
 prints `FAIL <path>: <reason>` and the other paths are still prepared. It exits
 0 when every path is ready, 1 when one failed, and 2 for a usage or configuration
@@ -165,6 +168,26 @@ Backup jobs writing into the first stage must not delete or overwrite on their
 own: xtrabackup jobs set `retention_days = 0` and file jobs set
 `timestamp = true`. Configuration validation enforces both, rejects stage paths
 that overlap, and keeps the live history database out of stage paths.
+A [pgbackrest job](README_PGBACKREST.md) deletes and overwrites nothing on its own
+(each tar's name carries its backup label), so it needs no such setting.
+
+## A first stage fed by a pgbackrest job
+
+A `pgbackrest` job writes its tars into the first stage of a GFS job: its
+`out_dir` must be that path or a directory below it, and the config is rejected
+otherwise. A GFS job with a single stage is valid, so a first stage on an NFS
+share can age its tars alone, for example with `keep = "14d"`. Such a first stage
+follows the rules of a later stage:
+
+- It needs the `.bdbackup-destination` marker. `--initialize-structure` writes it
+  (stage 1), `--validate` of the GFS job and of the pgbackrest job reports it, and
+  the pgbackrest job fails before it creates any directory or file when the marker
+  is missing, so an unmounted share is never written to.
+- It receives the ledger copy (see Ledger copies), under the same marker
+  condition.
+
+A first stage that no pgbackrest job writes into behaves as before: it has no
+marker and no ledger copy.
 
 ## Dry run
 
@@ -231,7 +254,8 @@ stage directory holding it, which keeps the layout of the first stage.
 
 After every run without `--dry-run`, each path of every stage after the
 first holds `<gfs job>.ledger.sqlite3`, a consistent copy of the whole history
-database, written under a temporary name and renamed into place. A path without
+database, written under a temporary name and renamed into place. So does the
+first stage, when a pgbackrest job writes into it. A path without
 its marker gets none, and the run exits 1. To restore with only a stage left,
 copy that file somewhere outside the stages, point `[history] database` at the
 copy, and run `bdbackup restore`. Paths in the ledger are absolute, so the
@@ -261,3 +285,20 @@ removed by hand:
   damaged checkpoints or chain metadata; it does not move on to the next path.
   Prepare the copy at another path of that stage with
   `bdbackup restore --backup <backup> --root <directory holding the copy> -d <new dir>`.
+
+A remount can also make units on an NFS share look unavailable. Their recorded
+identity includes the device number (`st_dev`), which NFS assigns at mount time,
+so a remount or a reboot can change it. This affects every NFS stage, not only
+pgbackrest tars. It is documented, not fixed:
+
+- `bdbackup history` shows the units on the share as `unavailable`, and history
+  restore refuses them. Restore a tar with `bdbackup restore --archive` and an
+  xtrabackup directory with `bdbackup restore --backup`; for a pgBackRest tar,
+  `--archive` also prints the restore command (see
+  [the pgbackrest document](README_PGBACKREST.md#when-the-repository-host-is-lost)).
+- If the remount falls between a backup job writing a unit into the first stage
+  and the next GFS run, GFS sees the unit as unavailable when it first judges it
+  and treats it as unmanaged for good (see Unmanaged backups). It never moves or
+  prunes it; delete it by hand.
+- Units GFS already manages keep being moved and pruned after a remount. Before it
+  moves or deletes a unit, GFS verifies it by checksum, not by identity.

@@ -12,7 +12,7 @@
 #   engines/*.py         user-defined database engines (see docs/README_ENGINES.md)
 #
 # Except for [history], each top-level table is one job; its name is the table name and it must
-# set `type`: file | mysqldump | xtrabackup | gfs, or any engine
+# set `type`: file | mysqldump | xtrabackup | pgbackrest | gfs, or any engine
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
 # Any job may set active = false to pause it: `run -j` then refuses it (exit 2)
 # and --validate names it as not checked. Schedule jobs with your own crontab
@@ -20,8 +20,9 @@
 # timers instead (docs/README_SYSTEMD.md). --validate checks settings/access/grants
 # without backups.
 # Other keys (except type, active and restore_root) are passed to the backend
-# constructor (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup),
-# so key names use Python-style underscores (e.g. exclude_templates).
+# constructor (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup /
+# bdbackup.postgres.PgBackRest), so key names use Python-style underscores
+# (e.g. exclude_templates).
 # Paths expand ~ and resolve relative to this config file; template/exclude
 # entries resolve relative to chdir (or the process working directory).
 # A key the backend does not accept fails the job (exit 1); --validate reports
@@ -175,13 +176,16 @@ encrypt = false
 # ---------------------------------------------------------------------------
 # GFS: move bdbackup's own backups through a chain of stage directories, using
 # only the [history] ledger. Requires [history]. Jobs writing into the first
-# stage must set retention_days = 0 (xtrabackup) or timestamp = true (file).
-# Every later stage path must contain a .bdbackup-destination marker. Create
+# stage must set retention_days = 0 (xtrabackup) or timestamp = true (file);
+# a pgbackrest job needs no such setting.
+# Every later stage path (and the first one, when a pgbackrest job writes into
+# it) must contain a .bdbackup-destination marker. Create
 # the stage directories and markers with:
 #   bdbackup run -c config.toml -j gfs-main --initialize-structure
 # After each run without --dry-run, every later stage path also receives
 # <job>.ledger.sqlite3 (here gfs-main.ledger.sqlite3), a copy of the whole
-# history database that restore can use when only a stage survives.
+# history database that restore can use when only a stage survives. The first
+# stage gets that copy too when a pgbackrest job writes into it.
 # ---------------------------------------------------------------------------
 # Run it after the backups: bdbackup run -c config.toml -j gfs-main
 # Add --dry-run to print what would change without moving or deleting anything.
@@ -215,3 +219,64 @@ keep = "12m"
 paths = ["/NFS/yearly", "/DD/yearly"]   # every path gets a copy
 period = "yearly"
 keep = "7y"
+
+# ---------------------------------------------------------------------------
+# pgBackRest: export the newest full backup of one stanza as a single tar into
+# the first stage of a GFS job (docs/README_PGBACKREST.md). One job per stanza.
+# The example is commented out: it needs a pgBackRest repository, and its own
+# GFS job below, whose stage paths must not overlap those of gfs-main.
+#
+# bdbackup does not take the full. Your cron keeps running pgbackrest, and the
+# full must be taken with archive-copy, or the tar cannot restore on its own:
+#   pgbackrest --stanza=main --type=full --archive-copy backup
+# or, in pgbackrest.conf:
+#   [global:backup]
+#   archive-copy=y
+# Requires [history]. Run as the OS user that owns the repository, never as root.
+# Encrypted repositories are refused.
+# ---------------------------------------------------------------------------
+# [pg-main]
+# type = "pgbackrest"
+#
+# The pgBackRest stanza to export (required).
+# stanza = "main"
+#
+# Index of the local POSIX repository in pgbackrest.conf (default: 1). Every
+# pgBackRest command gets --repo=<repo>, so info lists only that repository's
+# backups even when the host also has, for example, an S3 repository.
+# repo = 1
+#
+# The repository root, what pgBackRest calls repo<repo>-path (required). The job
+# reads backup/<stanza>/ and archive/<stanza>/ there and passes the path to every
+# pgBackRest command; it never writes, renames, deletes or locks anything under it.
+# repo_path = "/var/lib/pgbackrest"
+#
+# Where the tar <stanza>-<label>.tar is written (required). It must be the first
+# stage path of a GFS job in this file, or a directory below it, and outside
+# repo_path. The job refuses to write until that stage has its marker.
+# out_dir = "/mnt/backup/pg/main"
+#
+# The pgBackRest executable (default: "pgbackrest").
+# binary = "pgbackrest"
+#
+# Passed as --config to the pgBackRest commands the job runs; when it is not
+# set, pgBackRest's default applies.
+# config_file = "/etc/pgbackrest/pgbackrest.conf"
+#
+# A positive whole number (default: off). When there is no new full and the
+# newest full is older than this many hours, the run exits 1 instead of 0, so a
+# nightly full that keeps failing does not go unnoticed.
+# max_full_age_hours = 30
+
+# A single-stage GFS job ages the tars: 14 days on the share, then deleted. The
+# newest tar of each job always stays. Prepare the stage once, while the share is
+# mounted (it writes the marker into the first stage):
+#   bdbackup run -c config.toml -j pg-gfs --initialize-structure
+# Then run, after pg-main has exported: bdbackup run -c config.toml -j pg-gfs
+# [pg-gfs]
+# type = "gfs"
+#
+# [[pg-gfs.stage]]
+# paths = ["/mnt/backup/pg"]
+# period = "daily"
+# keep = "14d"
