@@ -61,11 +61,13 @@ keep = "8w"
 """
 
 
-def write_config(tmp_path, *, history=True, gfs=True, out_dir="STAGE1/pg/main", extra=""):
+def write_config(
+    tmp_path, *, history=True, gfs=True, out_dir="STAGE1/pg/main", repo_path="repo", extra=""
+):
     text = '[history]\ndatabase = "state/history.sqlite3"\n' if history else ""
     text += GFS if gfs else ""
     text += (
-        '[pg]\ntype = "pgbackrest"\nstanza = "main"\nrepo_path = "repo"\n'
+        f'[pg]\ntype = "pgbackrest"\nstanza = "main"\nrepo_path = "{repo_path}"\n'
         f'out_dir = "{out_dir}"\n{extra}'
     )
     path = tmp_path / "config.toml"
@@ -98,6 +100,44 @@ def test_config_requires_first_stage(tmp_path, gfs, out_dir, message):
         Config(write_config(tmp_path, gfs=gfs, out_dir=out_dir))
 
     assert "Job 'pg'" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "repo_path",
+    [
+        pytest.param(".", id="repo-above-out-dir"),
+        pytest.param("STAGE1/pg/main", id="repo-equal-to-out-dir"),
+        pytest.param("STAGE1", id="repo-equal-to-the-first-stage"),
+        pytest.param("STAGE1/pg/../pg", id="repo-with-dotdot-holding-out-dir"),
+    ],
+)
+def test_config_rejects_out_dir_inside_repo(tmp_path, repo_path):
+    with pytest.raises(ConfigError) as refused:
+        Config(write_config(tmp_path, repo_path=repo_path))
+
+    assert str(refused.value) == "Job 'pg': out_dir must be outside repo_path"
+
+
+@pytest.mark.parametrize(
+    "repo_path",
+    [
+        pytest.param("STAGE1/repo", id="repo-in-the-first-stage"),
+        pytest.param("NFS/weekly", id="repo-equal-to-a-later-stage"),
+        pytest.param("NFS/weekly/repo", id="repo-in-a-later-stage"),
+        pytest.param("STAGE1/../STAGE1/repo", id="repo-with-dotdot-in-the-first-stage"),
+    ],
+)
+def test_config_rejects_repo_inside_stage(tmp_path, repo_path):
+    with pytest.raises(ConfigError) as refused:
+        Config(write_config(tmp_path, out_dir="STAGE1/pg", repo_path=repo_path))
+
+    assert str(refused.value) == "Job 'pg': repo_path must be outside every gfs stage path"
+
+
+def test_config_accepts_repo_beside_the_stages(tmp_path):
+    job = Config(write_config(tmp_path, repo_path="STAGE1-repo")).jobs["pg"]
+
+    assert job.params["repo_path"] == tmp_path.resolve() / "STAGE1-repo"
 
 
 @pytest.mark.parametrize("out_dir", ["STAGE1", "STAGE1/pg/main"])

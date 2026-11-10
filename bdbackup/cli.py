@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -85,6 +86,11 @@ def _protect_history(backend, config):
         if backend.tar_filename.resolve() in excluded:
             raise BackupError("Archive destination conflicts with the history database")
         backend.exclude.update(excluded)
+
+
+def _now() -> datetime:
+    """The current time, UTC-aware; a function so tests can set the clock."""
+    return datetime.now(UTC)
 
 
 def _handle_errors(func, *args, **kwargs) -> int:
