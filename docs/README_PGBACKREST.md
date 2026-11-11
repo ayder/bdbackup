@@ -291,6 +291,7 @@ printf '\n%s\n%s\n' "archive_mode = 'off'" "archive_command = ''" >> <PGDATA>/po
 
 Check it with the PostgreSQL 16 server binary, without starting the server; it must print off:
 postgres -D <PGDATA> -C archive_mode
+If it reports no postgresql.conf, the configuration was kept outside the data directory: see docs/README_PGBACKREST.md.
 
 Start the copy directly with pg_ctl as the cluster owner, never through a cluster manager or service unit that holds the production configuration:
 pg_ctl -D <PGDATA> -o "-c listen_addresses=localhost -c port=<free port>" start
@@ -320,9 +321,9 @@ that restores:
 - `--repo1-path` is the extracted directory, so the restore reads nothing else.
 - `--type=none` writes no recovery target. The cluster comes up at the end of the backup
   and stays on the production timeline.
-- There is no `--archive-mode=off`. Under `--type=none` pgBackRest writes no recovery
-  settings by design, so the option has no effect there: the restored cluster would start
-  with the production `archive_mode`. The printed step appends `archive_mode = 'off'` and
+- There is no `--archive-mode=off`. Under `--type=none` pgBackRest wrote no recovery
+  settings in the container test, on 2.58.0 and 2.60.0, so the option had no effect there:
+  the restored cluster started with the production `archive_mode`. The printed step appends `archive_mode = 'off'` and
   `archive_command = ''` to `<PGDATA>/postgresql.auto.conf` instead.
 - `--log-level-file=off` keeps pgBackRest from writing to a log directory that the cluster
   owner may not be able to write.
@@ -345,19 +346,49 @@ time:
    forces `archive_mode` on at start, the copy still archives nothing.
 2. `postgres -D <PGDATA> -C archive_mode` reads the configuration without starting the
    server and must print `off`. Use the server binary of the PostgreSQL major version the
-   output names; on Debian and Ubuntu it is in `/usr/lib/postgresql/<major>/bin`.
+   output names; on Debian and Ubuntu it is in `/usr/lib/postgresql/<major>/bin`. If it
+   reports `could not access the server configuration file "<PGDATA>/postgresql.conf"`, see
+   [Configuration kept outside the data directory](#configuration-kept-outside-the-data-directory).
 3. Start the copy directly with `pg_ctl`, on `localhost` and a free port. Never start it
    through a cluster manager or a service unit that holds the production configuration.
 
 - `backup_label` is in `<PGDATA>` after the restore and is needed on the first start. Do
   not remove it.
-- An install that keeps `postgresql.conf` outside the data directory restores a tree with no
-  `postgresql.conf`. `postgresql.auto.conf` is always in the data directory and always read,
-  so the step is the same.
+- An install that keeps its configuration outside the data directory, such as the Debian
+  and Ubuntu layout under `/etc/postgresql/<major>/main`, needs the extra step below before
+  the printed ones.
 - If writes hang on the copy because production uses synchronous replication, set
   `synchronous_standby_names = ''` the same way, in `postgresql.auto.conf` before the start.
 - The copy stays on the production timeline and writes no history file. Never give it the
   production repository, and never use it as a replication source or target for production.
+
+### Configuration kept outside the data directory
+
+pgBackRest backs up only the data directory. An install that keeps its configuration
+elsewhere (Debian and Ubuntu keep it in `/etc/postgresql/<major>/main`) restores no
+`postgresql.conf`, no `pg_hba.conf`, and no `pg_ident.conf` if that lives outside too.
+Without `postgresql.conf`, both `postgres -C` and `pg_ctl start` fail with
+`could not access the server configuration file "<PGDATA>/postgresql.conf": No such file or directory`.
+
+Before the printed `printf` step, as the cluster owner, create an empty `postgresql.conf`
+and `pg_ident.conf` and a `pg_hba.conf` that allows local connections only:
+
+```bash
+: > <PGDATA>/postgresql.conf
+: > <PGDATA>/pg_ident.conf
+printf 'local all all peer\n' > <PGDATA>/pg_hba.conf
+chmod 600 <PGDATA>/postgresql.conf <PGDATA>/pg_ident.conf <PGDATA>/pg_hba.conf
+```
+
+Then run the printed steps as they are: the `printf` line, the `postgres -C` check (it must
+print `off`) and the `pg_ctl` start. `postgresql.auto.conf` is always in the data directory,
+so the archive settings land there either way. Add any other setting the copy needs, such as
+`shared_preload_libraries`, to `<PGDATA>/postgresql.conf` by hand.
+
+Never point `config_file` (in `postgresql.conf`, or `-c config_file=` on the command line) or
+`-c hba_file=` / `-c ident_file=` at the production configuration. The production
+`postgresql.conf` names the production `data_directory`, so the copy would start on the
+production data, and the production `pg_hba.conf` lets the network in.
 
 ### When the repository host is lost
 

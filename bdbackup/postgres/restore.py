@@ -114,6 +114,8 @@ def restore_lines(facts: UnitFacts, repo_dir: Path) -> list[str]:
         f"Check it with the PostgreSQL {facts.pg_version} server binary, without starting the "
         "server; it must print off:",
         f"postgres -D {PGDATA} -C archive_mode",
+        "If it reports no postgresql.conf, the configuration was kept outside the data "
+        "directory: see docs/README_PGBACKREST.md.",
         "",
         "Start the copy directly with pg_ctl as the cluster owner, never through a cluster "
         "manager or service unit that holds the production configuration:",
