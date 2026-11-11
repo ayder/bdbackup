@@ -284,14 +284,17 @@ class PgBackRest:
         """``out_dir`` must be writable, or must be creatable under its nearest existing parent.
 
         The search for that parent stops at the first stage, so an unmounted share is never
-        satisfied by a writable directory above it.
+        satisfied by a writable directory above it. It compares resolved paths, so an
+        ``out_dir`` configured through a symlink still meets the first stage.
         """
-        target = self.out_dir
-        while not os.path.exists(target) and target != self.first_stage and target != target.parent:
+        out_dir = self.out_dir.resolve()
+        stop = self.first_stage.resolve()
+        target = out_dir
+        while not os.path.exists(target) and target != stop and target != target.parent:
             target = target.parent
         writable = _usable_dir(target, os.W_OK | os.X_OK)
         subject = f"Output directory: {self.out_dir}"
-        if target == self.out_dir:
+        if target == out_dir:
             if writable:
                 return "OK", f"{subject} is writable"
             return "FAIL", f"{subject} is not a writable directory"
