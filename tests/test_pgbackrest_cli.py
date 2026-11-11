@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -14,12 +15,11 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from bdbackup.backends import BackupError
 from bdbackup.cli import main
 from bdbackup.engines import _reset_for_tests
 from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History, HistorySettings
-from bdbackup.postgres import PgBackRest
+from bdbackup.postgres import PgBackRest, pgbackrest
 from bdbackup.utils import process_lock
 from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo
 
@@ -125,7 +125,9 @@ def lock_is_held(lock_file: Path) -> bool:
 def test_run_exports_and_records(tmp_path):
     site = make_site(tmp_path)
 
-    with patch.object(PgBackRest, "verify", autospec=True, side_effect=PgBackRest.verify) as spy:
+    with patch.object(
+        PgBackRest, "_read_back", autospec=True, side_effect=PgBackRest._read_back
+    ) as spy:
         result = site.run()
 
     assert result.exit_code == 0, result.output
@@ -327,24 +329,24 @@ def test_locked_exits_3(tmp_path):
     assert not site.out_dir.exists()
 
 
-def test_the_lock_is_held_from_choosing_to_verifying_and_then_released(tmp_path):
+def test_the_lock_is_held_from_choosing_to_the_read_back_and_then_released(tmp_path):
     site = make_site(tmp_path)
     seen = []
 
     def watch(name):
         original = getattr(PgBackRest, name)
 
-        def wrapper(engine, *args):
+        def wrapper(*args, **kwargs):
             seen.append((name, lock_is_held(site.lock_file)))
-            return original(engine, *args)
+            return original(*args, **kwargs)
 
         return patch.object(PgBackRest, name, autospec=True, side_effect=wrapper)
 
-    with watch("choose"), watch("export"), watch("verify"):
+    with watch("choose"), watch("export"), watch("_read_back"):
         result = site.run()
 
     assert result.exit_code == 0, result.output
-    assert seen == [("choose", True), ("export", True), ("verify", True)]
+    assert seen == [("choose", True), ("export", True), ("_read_back", True)]
     assert not lock_is_held(site.lock_file)
 
 
@@ -408,7 +410,7 @@ def test_dry_run_marker_missing_fails(tmp_path, caplog):
 def test_no_verify_skips_readback(tmp_path):
     site = make_site(tmp_path)
 
-    with patch.object(PgBackRest, "verify", autospec=True) as verify:
+    with patch.object(PgBackRest, "_read_back", autospec=True) as verify:
         result = site.run("--no-verify")
 
     assert result.exit_code == 0, result.output
@@ -418,15 +420,25 @@ def test_no_verify_skips_readback(tmp_path):
     assert row.checksum == hashlib.sha256(site.unit.read_bytes()).hexdigest()
 
 
-def test_a_failed_verification_leaves_a_failed_row_and_exit_1(tmp_path):
+def test_a_failed_read_back_publishes_nothing_and_the_next_run_exports_the_full(
+    tmp_path, monkeypatch
+):
     site = make_site(tmp_path)
+    original = pgbackrest._HashingReader.read
 
-    with patch.object(
-        PgBackRest, "verify", autospec=True, side_effect=BackupError("verification failed")
-    ) as verify:
-        result = site.run()
+    def eio(self, *args):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
 
-    assert result.exit_code == 1
-    verify.assert_called_once()
-    assert site.unit.is_file()  # exported before the read-back found fault
-    assert [row.status for row in site.rows()] == ["failed"]
+    monkeypatch.setattr(pgbackrest._HashingReader, "read", eio)
+    failed = site.run()
+
+    assert failed.exit_code == 1, failed.output
+    assert list(site.out_dir.iterdir()) == []  # nothing under the final name, no temp file
+    assert [row.status for row in site.rows()] == ["failed"]  # no successful row
+
+    monkeypatch.setattr(pgbackrest._HashingReader, "read", original)
+    retry = site.run()
+
+    assert retry.exit_code == 0, retry.output
+    assert f"Job pg: {site.unit}" in retry.output
+    assert [row.status for row in site.rows()] == ["success", "failed"]

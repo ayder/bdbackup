@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from bdbackup import ledger
-from bdbackup.backends import BackupError, BackupResult
+from bdbackup.backends import BackupError
 from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History, HistorySettings
 from bdbackup.postgres import pgbackrest
@@ -152,7 +152,6 @@ def test_symlinked_repo_path_members(tmp_path):
     names = [m.name for m in members(result.path)]
     assert names == expected_names()
     assert all(name.startswith(("backup/main/", "archive/main/")) for name in names)
-    engine.verify(result)
 
 
 def test_repo_untouched(tmp_path):
@@ -160,20 +159,46 @@ def test_repo_untouched(tmp_path):
     engine = make_engine(tmp_path, repo)
     before = tree(repo)
 
-    engine.verify(engine.export(full()))
+    engine.export(full(), verify=True)
 
     assert tree(repo) == before
 
 
-# ---- verify ---------------------------------------------------------------------------------
+# ---- verify, before the rename -------------------------------------------------------------
 
 
-def test_verify_reads_once_and_matches(tmp_path, monkeypatch):
+def is_temp(path: Path) -> bool:
+    return ".tar.tmp-" in Path(path).name
+
+
+def watch_files(monkeypatch, *, before_read_back=None):
+    """Record the engine's opens and renames, in order; optionally damage the temp file first.
+
+    ``before_read_back(path)`` runs when the engine opens its temporary file for reading.
+    """
+    events = []
+
+    def tracking_open(file, *args, **kwargs):
+        if is_temp(file) and before_read_back is not None:
+            before_read_back(Path(file))
+        events.append(("open", Path(file), *args))
+        return open(file, *args, **kwargs)
+
+    real_rename = os.rename
+
+    def tracking_rename(src, dst, *args, **kwargs):
+        events.append(("rename", Path(src), Path(dst)))
+        return real_rename(src, dst, *args, **kwargs)
+
+    # Shadows the builtin inside the engine module only: every file the engine opens.
+    monkeypatch.setattr(pgbackrest, "open", tracking_open, raising=False)
+    monkeypatch.setattr(pgbackrest.os, "rename", tracking_rename)
+    return events
+
+
+def test_export_reads_the_temp_back_once_before_the_rename(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     engine = make_engine(tmp_path, repo)
-    result = engine.export(full())
-    size = result.path.stat().st_size
-
     counted = []
     original = pgbackrest._HashingReader.read
 
@@ -182,62 +207,99 @@ def test_verify_reads_once_and_matches(tmp_path, monkeypatch):
         counted.append(len(data))
         return data
 
-    opened = []
-
-    def tracking_open(file, *args, **kwargs):
-        opened.append((Path(file), *args))
-        return open(file, *args, **kwargs)
-
     monkeypatch.setattr(pgbackrest._HashingReader, "read", counting)
-    # Shadows the builtin inside the engine module only: every file the engine opens.
-    monkeypatch.setattr(pgbackrest, "open", tracking_open, raising=False)
+    events = watch_files(monkeypatch)
 
-    verified = engine.verify(result)
+    result = engine.export(full(), verify=True)
 
-    assert sum(counted) == size
-    assert opened == [(result.path, "rb")]
-    assert verified.path == result.path
-    assert verified.success
-    assert verified.checksum == result.checksum
-    assert verified.size_bytes == size
+    final = engine.unit_path(NEWEST)
+    [(_, temp, mode)] = [e for e in events if e[0] == "open" and e[1].parent == engine.out_dir]
+    assert is_temp(temp) and mode == "rb"
+    renames = [e for e in events if e[0] == "rename"]
+    assert renames == [("rename", temp, final)]
+    assert events.index(("open", temp, "rb")) < events.index(renames[0])
+    assert sum(counted) == final.stat().st_size
+    assert result.path == final
+    assert result.success
+    assert result.checksum == hashlib.sha256(final.read_bytes()).hexdigest()
+    assert result.size_bytes == final.stat().st_size
+
+
+def test_export_without_verify_reads_nothing_back(tmp_path, monkeypatch):
+    repo = make_repo(tmp_path)
+    engine = make_engine(tmp_path, repo)
+    events = watch_files(monkeypatch)
+
+    result = engine.export(full(), verify=False)
+
+    assert [e for e in events if e[0] == "open" and e[1].parent == engine.out_dir] == []
+    assert result.checksum == hashlib.sha256(result.path.read_bytes()).hexdigest()
+
+
+def flip(where: str):
+    """Damage the temp file: a byte inside a data file's content, or the very last byte of the
+    tar's zero padding, which only the drain after the walk reads."""
+
+    def damage(path: Path) -> None:
+        data = bytearray(path.read_bytes())
+        offset = data.index(f"{NEWEST} 1259".encode()) if where == "data" else len(data) - 1
+        data[offset] ^= 0x01
+        path.write_bytes(bytes(data))
+
+    return damage
 
 
 @pytest.mark.parametrize("where", ["data", "padding"])
-def test_verify_detects_corruption(tmp_path, where):
+def test_export_detects_corruption_and_publishes_nothing(tmp_path, monkeypatch, where):
     repo = make_repo(tmp_path)
     engine = make_engine(tmp_path, repo)
-    result = engine.export(full())
-    data = bytearray(result.path.read_bytes())
-    # A byte inside a data file's content, or the very last byte of the tar's zero padding,
-    # which only the drain after the walk reads.
-    offset = data.index(f"{NEWEST} 1259".encode()) if where == "data" else len(data) - 1
-    data[offset] ^= 0x01
-    result.path.write_bytes(bytes(data))
+    store = history(tmp_path)
+    watch_files(monkeypatch, before_read_back=flip(where))
 
     with pytest.raises(BackupError, match="checksum"):
-        engine.verify(result)
+        store.run("pg", "pgbackrest-full", lambda: engine.export(full()), {"label": NEWEST})
+
+    assert list(engine.out_dir.iterdir()) == []
+    assert [record.status for record in store.records(job="pg")] == ["failed"]
 
 
-def test_verify_detects_other_members(tmp_path):
+def test_a_read_error_in_the_read_back_publishes_nothing(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     engine = make_engine(tmp_path, repo)
-    result = engine.export(full())
-    # Replace the unit with a valid tar of other members, and claim its own digest.
+
+    def eio(self, *args):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(pgbackrest._HashingReader, "read", eio)
+
+    with pytest.raises(BackupError) as caught:
+        engine.export(full())
+
+    assert str(caught.value).startswith(f"verification of {engine.unit_path(NEWEST)} failed: ")
+    assert os.strerror(errno.EIO) in str(caught.value)
+    assert list(engine.out_dir.iterdir()) == []
+
+
+def test_read_back_detects_other_members(tmp_path):
+    engine = make_engine(tmp_path, make_repo(tmp_path))
+    # A valid tar of other members, read back against its own digest.
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
         info = tarfile.TarInfo("backup/main/backup.info")
         info.size = 3
         tar.addfile(info, io.BytesIO(b"abc"))
-    result.path.write_bytes(buffer.getvalue())
-    forged = BackupResult(
-        result.path,
-        size_bytes=len(buffer.getvalue()),
-        success=True,
-        checksum=hashlib.sha256(buffer.getvalue()).hexdigest(),
-    )
+    temp = tmp_path / "forged.tar"
+    temp.write_bytes(buffer.getvalue())
+    unit = engine.unit_path(NEWEST)
 
-    with pytest.raises(BackupError, match="members"):
-        engine.verify(forged)
+    with pytest.raises(BackupError) as caught:
+        engine._read_back(
+            temp, unit, hashlib.sha256(buffer.getvalue()).hexdigest(), expected_names()
+        )
+
+    assert str(caught.value) == (
+        f"verification of {unit} failed: members differ from those written"
+    )
 
 
 # ---- refusals before anything is written ----------------------------------------------------
