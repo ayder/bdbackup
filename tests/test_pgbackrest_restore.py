@@ -418,6 +418,25 @@ def test_archive_restore_names_the_destination_in_full(tmp_path, monkeypatch):
     assert command(tmp_path / "relative-unit") in result.output.splitlines()
 
 
+def test_archive_restore_with_a_quoted_tilde_prints_the_command(tmp_path, monkeypatch):
+    # A quoted ~ reaches bdbackup unexpanded; the restore expands it, and so must the output.
+    site = make_site(tmp_path)
+    assert site.run().exit_code == 0
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+
+    result = CliRunner().invoke(
+        main, ["restore", "--archive", str(site.unit), "--dst", "~/from-archive"]
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0] == f"Restored to: {home / 'from-archive'}"
+    assert lines.count(command(home / "from-archive")) == 1
+    assert (home / "from-archive" / "backup" / "main" / "backup.info").is_file()
+
+
 def test_archive_restore_page_errors_flag(tmp_path):
     site = make_site(tmp_path, fulls=((NEWEST, True, True),))
     assert site.run().exit_code == 0
