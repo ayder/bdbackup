@@ -257,6 +257,16 @@ def test_restore_lines_print_the_pre_start_steps_in_order(tmp_path):
     assert "service unit" in lines[steps[2] - 1]
 
 
+def test_restore_lines_point_to_the_document_when_the_config_lives_elsewhere(tmp_path):
+    # Debian and Ubuntu keep postgresql.conf outside the data directory; pgBackRest backs up
+    # only the data directory, so the check fails there until the document's steps are done.
+    lines = restore_lines(NEWEST_FACTS, tmp_path / "unit")
+
+    note = lines[lines.index(CHECK) + 1]
+    assert "postgresql.conf" in note and "outside the data directory" in note
+    assert "docs/README_PGBACKREST.md" in note
+
+
 def test_restore_lines_check_names_the_backups_postgresql_version(tmp_path):
     facts = UnitFacts("main", NEWEST, "18", page_errors=False)
     lines = restore_lines(facts, tmp_path / "unit")
