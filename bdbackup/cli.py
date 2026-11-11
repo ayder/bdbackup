@@ -374,9 +374,9 @@ def restore(
 
     def _run():
         if mode == "archive":
-            FileBackup.restore_archive(archive, dst)
-            click.echo(f"Restored to: {dst}")
-            _echo_restore_command(dst)
+            restored = FileBackup.restore_archive(archive, dst)
+            click.echo(f"Restored to: {restored}")
+            _echo_restore_command(restored)
             return
         if mode == "backup":
             xb = XtraBackup(backup_root=root, binary=binary or "xtrabackup",
