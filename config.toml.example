@@ -26,7 +26,9 @@
 # Paths expand ~ and resolve relative to this config file; template/exclude
 # entries resolve relative to chdir (or the process working directory).
 # A key the backend does not accept fails the job (exit 1); --validate reports
-# it as FAIL and --dry-run refuses it (exit 2).
+# it as FAIL and --dry-run refuses it (exit 2). A pgbackrest job is the
+# exception: a key it does not accept, or an empty stanza, is a usage error,
+# so a real run exits 2 too.
 #
 # Types must match the constructor: strings for paths, integers for ports,
 # booleans for flags, and arrays of strings for the exclusion lists.

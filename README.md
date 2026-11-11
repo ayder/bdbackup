@@ -113,7 +113,7 @@ The CLI uses these exit codes:
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Backup/verify failure (including a job whose backend rejects its settings in a real run), or validation checks failed/incomplete |
+| 1 | Backup/verify failure (including a job whose backend rejects its settings in a real run, except a pgbackrest job: exit 2), or validation checks failed/incomplete |
 | 2 | Usage error, an inactive job, or a configuration error found when the config loads or by `--dry-run` |
 | 3 | Lock held; for GFS, another run of the job is in progress or only deferred work remains |
 

@@ -44,6 +44,10 @@ bdbackup and are rejected in the config. `out_dir`, the `[history]` `database` a
 `restore_root`, and the job's own `restore_root` must be outside `repo_path`, and no GFS
 stage path may lie inside `repo_path` or contain it. Config paths expand `~`.
 
+A key the job does not accept, or an empty `stanza`, is a usage error: `run` and
+`run --dry-run` of the job exit 2, unlike the other job types, whose real run exits 1.
+`run --validate` reports it as a FAIL line and exits 1.
+
 Run the job as the OS user that owns the repository, never as root. From pgBackRest 2.59.0,
 pgBackRest itself refuses every command except `restore` as root by default. The job
 refuses root too:
