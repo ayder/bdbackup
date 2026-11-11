@@ -141,7 +141,9 @@ def restore_lines(facts: UnitFacts, repo_dir: Path) -> list[str]:
         notes.append(
             "--checksum-page-error=n is there because this backup recorded invalid page "
             "checksums. pgBackRest 2.60.0 and later stop a restore on an invalid page checksum "
-            "unless it is given; the restored cluster keeps those pages as they were."
+            "unless it is given; the restored cluster keeps those pages as they were. "
+            "pgBackRest 2.58.0 does not accept the option on restore: where the restoring "
+            "host's pgBackRest rejects it, run the command without it."
         )
 
     lines = ["", "To restore this backup, run this pgBackRest command:", " ".join(arguments), ""]

@@ -238,7 +238,8 @@ WARNING: full 20261109-010203F has page checksum errors; it is exported, and res
 ```
 
 The record holds `page_errors = true`, and the restore command adds
-`--checksum-page-error=n` (see [Restore](#restore)).
+`--checksum-page-error=n`, which pgBackRest 2.60.0 accepts and 2.58.0 rejects (see
+[Restore](#restore)).
 
 ## Dry run and validation
 
@@ -335,7 +336,9 @@ that restores:
   owner may not be able to write.
 - A tar with page checksum errors adds `--checksum-page-error=n` and a line saying why.
   pgBackRest 2.60.0 and later stop a restore on an invalid page checksum unless it is
-  given; the restored cluster keeps those pages as they were.
+  given; the restored cluster keeps those pages as they were. pgBackRest 2.58.0 does not
+  accept the option on restore (`option 'checksum-page-error' is not valid for command
+  'restore'`): where the restoring host's pgBackRest rejects it, run the command without it.
 
 Run the command as the OS user that will own the cluster, never root. The extracted
 directory belongs to the user who ran bdbackup. To restore as another user, or on another
