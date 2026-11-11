@@ -431,7 +431,7 @@ passphrase or cipher option is read, stored or printed. The run fails with exit 
 history row:
 
 ```
-encrypted repositories are not supported in 0.7.3
+encrypted repositories are not supported
 ```
 
 `--validate` reports the same as FAIL.

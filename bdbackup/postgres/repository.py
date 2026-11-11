@@ -18,7 +18,7 @@ from pathlib import Path
 
 from bdbackup.backends import BackupError
 
-ENCRYPTED = "encrypted repositories are not supported in 0.7.3"
+ENCRYPTED = "encrypted repositories are not supported"
 
 LABEL = re.compile(r"\d{8}-\d{6}F")
 
