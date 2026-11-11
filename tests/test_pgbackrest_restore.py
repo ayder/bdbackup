@@ -231,6 +231,25 @@ def test_restore_lines_page_errors(tmp_path):
     assert not any("checksum-page-error" in line for line in plain)
 
 
+def test_restore_lines_page_errors_note_states_the_version_condition(tmp_path):
+    # Seen in the images: 2.60.0 has checksum-page-error on restore; 2.58.0 rejects it
+    # ("option 'checksum-page-error' is not valid for command 'restore'").
+    facts = UnitFacts("main", NEWEST, "16", page_errors=True)
+    notes = " ".join(
+        line.strip() for line in restore_lines(facts, tmp_path / "unit")
+        if not line.startswith("pgbackrest ")
+    )
+
+    assert (
+        "pgBackRest 2.60.0 and later stop a restore on an invalid page checksum unless it is "
+        "given" in notes
+    )
+    assert (
+        "pgBackRest 2.58.0 does not accept the option on restore: where the restoring host's "
+        "pgBackRest rejects it, run the command without it." in notes
+    )
+
+
 def test_restore_lines_say_how_to_run_the_command(tmp_path):
     text = "\n".join(restore_lines(NEWEST_FACTS, tmp_path / "unit"))
 
