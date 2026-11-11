@@ -168,8 +168,9 @@ Backup jobs writing into the first stage must not delete or overwrite on their
 own: xtrabackup jobs set `retention_days = 0` and file jobs set
 `timestamp = true`. Configuration validation enforces both, rejects stage paths
 that overlap, and keeps the live history database out of stage paths.
-A [pgbackrest job](README_PGBACKREST.md) deletes and overwrites nothing on its own
-(each tar's name carries its backup label), so it needs no such setting.
+A [pgbackrest job](README_PGBACKREST.md) deletes and overwrites nothing on its own,
+apart from its own temporary files (each tar's name carries its backup label), so it needs
+no such setting.
 
 ## A first stage fed by a pgbackrest job
 
