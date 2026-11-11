@@ -258,7 +258,8 @@ keep = "7y"
 #
 # Where the tar <stanza>-<label>.tar is written (required). It must be the first
 # stage path of a GFS job in this file, or a directory below it, and outside
-# repo_path. The job refuses to write until that stage has its marker.
+# repo_path. The job refuses to write until that stage has its marker. Two
+# pgbackrest jobs may not export the same stanza into the same out_dir.
 # out_dir = "/mnt/backup/pg/main"
 #
 # The pgBackRest executable (default: "pgbackrest").

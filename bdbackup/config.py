@@ -151,6 +151,26 @@ class Config:
                 raise ConfigError(f"Job {name!r}: {exc}") from exc
             self._check_pgbackrest_layout(name, job)
             job.params["lock_file"] = Path(f"{self.history.database}.pgbackrest-{name}.lock")
+        self._check_pgbackrest_jobs_apart()
+
+    def _check_pgbackrest_jobs_apart(self) -> None:
+        """Refuse two pgbackrest jobs that export one stanza into one ``out_dir``.
+
+        They hold different locks, and each run removes the stanza's temporary files in
+        ``out_dir``, so one could remove the file the other is writing.
+        """
+        seen: dict[tuple[Path, str], str] = {}
+        for name, job in self.jobs.items():
+            stanza = job.params.get("stanza")
+            if job.type != "pgbackrest" or not isinstance(stanza, str):
+                continue  # the engine refuses a stanza that is not a string when it is built
+            key = (Path(job.params["out_dir"]).expanduser().resolve(), stanza)
+            if key in seen:
+                raise ConfigError(
+                    f"Job {name!r}: job {seen[key]!r} already exports stanza {stanza!r} into "
+                    "this out_dir; give each job its own out_dir"
+                )
+            seen[key] = name
 
     def _check_pgbackrest_layout(self, name: str, job: Job) -> None:
         """Keep the repository apart from everything bdbackup writes or locks.

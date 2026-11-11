@@ -127,7 +127,8 @@ still running is never picked; the export copies the previous full.
 
 A repository with several stanzas gets one pgbackrest job per stanza, each with its own
 `out_dir` (for example `/mnt/backup/pg/orders`) inside the same first stage. GFS selects
-per job, so the stanzas never compete for a slot.
+per job, so the stanzas never compete for a slot. Two pgbackrest jobs that export the same
+stanza into the same `out_dir` are rejected when the config loads.
 
 GFS dates a tar by the time its export completed, not by the full's stop time. With
 nightly fulls taken shortly before the export, both fall on the same day. Keep that in mind
