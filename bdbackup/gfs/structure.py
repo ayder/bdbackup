@@ -57,10 +57,11 @@ def _prepare(path: Path, marker: str | None) -> str:
     return f"{state}, marker written"
 
 
-def initialize(job: Job, out: Callable[[str], None]) -> int:
+def initialize(job: Job, out: Callable[[str], None], fed: bool = False) -> int:
+    """Prepare every stage; ``fed`` marks the first stage too (a pgbackrest job writes into it)."""
     failed = False
     for index, stage in enumerate(job.params["stage"], 1):
-        marker = marker_text(job, index) if index > 1 else None
+        marker = marker_text(job, index) if index > 1 or fed else None
         for path in stage.paths:
             try:
                 out(f"{path}: {_prepare(path, marker)}")

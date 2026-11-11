@@ -112,7 +112,7 @@ def _restore(
         raise BackupError(f"Recovery destination must be new: {destination}")
     info = json.loads(record.restore_info)
     kind = info.get("kind")
-    if kind not in {"xtrabackup", "file", "mysqldump"}:
+    if kind not in {"xtrabackup", "file", "mysqldump", "pgbackrest"}:
         raise BackupError(f"History restore is not supported for engine {record.backup_type!r}")
     if kind == "xtrabackup":
         backend = XtraBackup(
@@ -138,7 +138,7 @@ def _restore(
         on_source(source)
     destination.mkdir(parents=True, mode=0o700)
     try:
-        if kind == "file":
+        if kind in {"file", "pgbackrest"}:
             FileBackup.restore_archive(source, destination)
         else:
             sql = destination / "backup.sql"

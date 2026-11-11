@@ -53,6 +53,7 @@ logger = logging.getLogger("bdbackup.engines")
 # append "bdbackup.postgres" here — nothing else needs to change.
 FAMILIES: tuple[str, ...] = (
     "bdbackup.mysql",
+    "bdbackup.postgres",
 )
 
 

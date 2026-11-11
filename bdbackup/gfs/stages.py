@@ -121,7 +121,12 @@ def _overlap(a: Path, b: Path) -> bool:
 
 
 def _engine_output(job: Job) -> Path | None:
-    key = {"xtrabackup": "backup_root", "mysqldump": "out_dir", "file": "backup_dst"}.get(job.type)
+    key = {
+        "xtrabackup": "backup_root",
+        "mysqldump": "out_dir",
+        "file": "backup_dst",
+        "pgbackrest": "out_dir",
+    }.get(job.type)
     value = job.params.get(key) if key else None
     return Path(value).expanduser().resolve() if value is not None else None
 
@@ -169,3 +174,25 @@ def check_gfs_config(jobs: Mapping[str, Job], history: HistorySettings | None) -
                 raise ValueError(
                     f"Job {other.name!r} writes into first stage {first}: set timestamp = true"
                 )
+
+
+def pgbackrest_first_stage(job: Job, jobs: Mapping[str, Job]) -> Path:
+    """The first stage path of the gfs job whose first stage holds the job's ``out_dir``.
+
+    ``out_dir`` holds when it equals that path or lies below it.
+    """
+    output = _engine_output(job)
+    if output is not None:
+        for other in jobs.values():
+            if other.type == "gfs":
+                first = other.params["stage"][0].paths[0]
+                if output.is_relative_to(first):
+                    return first
+    raise ValueError("out_dir must be inside the first stage of a gfs job")
+
+
+def fed_first_stages(jobs: Mapping[str, Job]) -> set[Path]:
+    """The first stage paths that some pgbackrest job writes into."""
+    return {
+        pgbackrest_first_stage(job, jobs) for job in jobs.values() if job.type == "pgbackrest"
+    }

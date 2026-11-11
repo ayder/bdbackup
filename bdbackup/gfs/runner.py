@@ -19,7 +19,7 @@ from bdbackup.config import Config, Job
 from bdbackup.gfs import store
 from bdbackup.gfs.actions import LocalTransport, Refusal, Transport, copy_verified, verify
 from bdbackup.gfs.policy import Decision, Unit, decide
-from bdbackup.gfs.stages import MARKER, Stage
+from bdbackup.gfs.stages import MARKER, Stage, fed_first_stages
 from bdbackup.history import History, artifact_identity
 from bdbackup.utils import process_lock
 
@@ -83,6 +83,8 @@ class _Run:
                  dry_run: bool):
         self.job = job
         self.stages: tuple[Stage, ...] = job.params["stage"]
+        # A pgbackrest job writes into the first stage: it has a marker and a ledger snapshot.
+        self.fed = self.stages[0].paths[0] in fed_first_stages(config.jobs)
         self.apply = not dry_run
         self.history = History(config.history)
         self.today = today
@@ -327,6 +329,8 @@ class _Run:
     def snapshot(self) -> None:
         """Copy the whole ledger to every later stage path, whatever the actions' outcome.
 
+        The first stage gets it too when a pgbackrest job feeds it, under the same marker rule.
+
         One consistent copy is made locally with SQLite's online backup and then copied to
         each path under a temporary name, fsynced and renamed, so SQLite never writes on a
         stage and every path receives the same bytes (spec 2 §4.3, D18).
@@ -350,7 +354,7 @@ class _Run:
             finally:
                 os.close(fd)
             name = snapshot_name(self.job)
-            for stage in self.stages[1:]:
+            for stage in self.stages if self.fed else self.stages[1:]:
                 for path in stage.paths:
                     if not (path / MARKER).is_file():
                         self.snapshot_failed(path, "destination not ready")
@@ -379,6 +383,9 @@ class _Run:
             f"({t.deleted_bytes} bytes), held {t.held}, deferred {t.deferred}, "
             f"refused {t.refused}, failed {t.failed}, unmanaged {unmanaged}"
         )
+        if modes_refused := getattr(self.transport, "modes_refused", 0):
+            self.out(f"permission bits not kept on {modes_refused} entries: "
+                     "the destination refused chmod")
         for index, stage in enumerate(self.stages):
             sizes = [size for at, size in self.where.values() if at == index]
             units = "unit" if len(sizes) == 1 else "units"

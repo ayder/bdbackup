@@ -227,7 +227,7 @@ class History:
             path = result.path.resolve(strict=True)
             identity = artifact_identity(path)
             unit = unit_path(path, restore_info or {})
-            digest = checksum(path)
+            digest = result.checksum or checksum(path)
         except BaseException as exc:
             # Store the exception class only: external diagnostics may contain credentials.
             with self._connect(create=True) as db:

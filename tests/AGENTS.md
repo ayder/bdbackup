@@ -19,13 +19,20 @@ Measured baselines before calling the gate.
 | Layer | What it runs | Environment | Where |
 |---|---|---|---|
 | `unit` | pytest tests of the package and the CLI (`click.testing.CliRunner`). Backup tools and database clients are never executed: physical backups use the `physical_runner` fixture (`tests/conftest.py`) through a patched `subprocess.run`; MySQL clients are patched as in `tests/test_helpers.py`. | `local-python` | `tests/` |
-| `integration` | Real servers and real backup tools in disposable, network-isolated Docker containers with synthetic data; a restore starts a server on the recovered data and checks rows. | `docker` | `scripts/integration_mysql.py`, `scripts/integration_physical.py` |
+| `integration` | Real servers and real backup tools in disposable, network-isolated Docker containers with synthetic data; a restore starts a server on the recovered data and checks rows. | `docker` | `scripts/integration_mysql.py`, `scripts/integration_physical.py`, `scripts/integration_pgbackrest.py` |
 
 - `local-python`: Python 3.12+, editable install `pip install -e '.[dev]'` in `.venv/`. CI runs
   Python 3.12, 3.13 and 3.14.
 - `docker`: a running Docker daemon with the images pulled: `mysql:8.4`,
-  `percona/percona-server:8.4`, `percona/percona-xtrabackup:8.4`, `mariadb:11.4`. The scripts
-  create and remove only their own containers and volumes.
+  `percona/percona-server:8.4`, `percona/percona-xtrabackup:8.4`, `mariadb:11.4`; and the two
+  pgBackRest images built from `scripts/docker/pgbackrest.Dockerfile` (no official image
+  exists). Building needs the network; the test runs do not:
+  - `bdbackup-pgbackrest:16-2.58.0`:
+    `docker build -f scripts/docker/pgbackrest.Dockerfile --build-arg PG_MAJOR=16 --build-arg PGBACKREST_VERSION=2.58.0 -t bdbackup-pgbackrest:16-2.58.0 scripts/docker`
+  - `bdbackup-pgbackrest:18-2.60.0`:
+    `docker build -f scripts/docker/pgbackrest.Dockerfile --build-arg PG_MAJOR=18 --build-arg PGBACKREST_VERSION=2.60.0 -t bdbackup-pgbackrest:18-2.60.0 scripts/docker`
+
+  The scripts create and remove only their own containers, volumes and networks.
 
 Code that runs a backup tool, a database client or a restore against a server has an
 `integration` proof in `scripts/integration_*.py`. CLI and configuration logic is proven at
@@ -38,7 +45,7 @@ Code that runs a backup tool, a database client or a restore against a server ha
 | Lint | `.venv/bin/ruff check bdbackup tests scripts` | `All checks passed!`, exit 0 |
 | Unit, all | `.venv/bin/python -m pytest -q` | last line `N passed in …`, no `failed`/`error`, exit 0 |
 | Unit, named tests with evidence | `.venv/bin/python -m pytest -v <file>::<test>` | one line per test id ending in `PASSED` or `FAILED` |
-| Integration | `.venv/bin/python scripts/integration_mysql.py`; `.venv/bin/python scripts/integration_physical.py percona`, `percona-encrypted`, `mariadb` | each ends with its success line (`Real full and two-incremental database recovery passed` for physical runs) and exit 0 |
+| Integration | `.venv/bin/python scripts/integration_mysql.py`; `.venv/bin/python scripts/integration_physical.py percona`, `percona-encrypted`, `mariadb`; `.venv/bin/python scripts/integration_pgbackrest.py pg16-2.58`, `pg18-2.60` | each ends with its success line (`Real full and two-incremental database recovery passed` for physical runs, `Real pgBackRest export and restore passed` for pgBackRest runs) and exit 0 |
 | Package | `.venv/bin/python -m build && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist` | `PASSED` for every artifact from twine; smoke script exit 0 |
 
 Reading pytest evidence: only a test id's own `PASSED` / `FAILED` line in `-v` output counts.
@@ -73,19 +80,23 @@ sh -c '<commands of the step>' > <log> 2>&1; echo "exit=$?" >> <log>
    this step, reported as `expected <baseline>, measured <N>`, even when every test passed.
    You do not judge whether the change in count was intended.
 5. **Docker available.** Run `docker info --format '{{.ServerVersion}}'`.
-   Expected: a version string. Otherwise: report steps 6–9 as NOT RUN and OVERALL RED.
+   Expected: a version string. Otherwise: report steps 6–11 as NOT RUN and OVERALL RED.
 6. **Integration mysqldump.** Run `.venv/bin/python scripts/integration_mysql.py`.
    Expected: exit 0.
 7. **Integration percona.** Run `.venv/bin/python scripts/integration_physical.py percona`.
    Expected: exit 0 and the line `Real full and two-incremental database recovery passed`.
 8. **Integration percona-encrypted.** Same with `percona-encrypted`. Same expectation.
 9. **Integration mariadb.** Same with `mariadb`. Same expectation.
-10. **Package.** Run `rm -rf dist && .venv/bin/python -m build -q && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist`
+10. **Integration pgbackrest pg16-2.58.** Run
+    `.venv/bin/python scripts/integration_pgbackrest.py pg16-2.58`.
+    Expected: exit 0 and the line `Real pgBackRest export and restore passed`.
+11. **Integration pgbackrest pg18-2.60.** Same with `pg18-2.60`. Same expectation.
+12. **Package.** Run `rm -rf dist && .venv/bin/python -m build -q && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist`
     as one `sh -c '…'`, captured as above.
     Expected: the log contains one `Checking dist/… PASSED` line for the wheel and one for the
     sdist, then the smoke line `Installed wheel: … passed`, then `exit=0`. A log without the
     two twine lines is a FAIL of this step, even when it ends in `exit=0`.
-11. **Clean after.** Run `git status --porcelain`.
+13. **Clean after.** Run `git status --porcelain`.
     Expected: prints nothing except `dist/` if it is not ignored (it is ignored today).
 
 ### Report format
@@ -102,8 +113,10 @@ candidate: <sha>
 7 integration percona:  PASS|FAIL|NOT RUN
 8 integration percona-encrypted: PASS|FAIL|NOT RUN
 9 integration mariadb:  PASS|FAIL|NOT RUN
-10 package:             PASS|FAIL
-11 clean after:         PASS|FAIL
+10 integration pgbackrest pg16-2.58: PASS|FAIL|NOT RUN
+11 integration pgbackrest pg18-2.60: PASS|FAIL|NOT RUN
+12 package:             PASS|FAIL
+13 clean after:         PASS|FAIL
 logs: <evidence dir>/gate/
 OVERALL: GREEN|RED
 GATE COMPLETE
@@ -123,4 +136,4 @@ here and commits it with the candidate before calling the gate; the gate agent n
 
 | Baseline | Kind | Current value | Runner | Measured at |
 |---|---|---|---|---|
-| Unit test count | inventory | 371 passed | `.venv/bin/python -m pytest -q` | `3c4a894` |
+| Unit test count | inventory | 639 passed | `.venv/bin/python -m pytest -q` | `5848e61` |

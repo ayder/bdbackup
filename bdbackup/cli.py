@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+from contextlib import nullcontext
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -17,10 +19,13 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.gfs import runner as gfs_runner
 from bdbackup.gfs import store as gfs_store
 from bdbackup.gfs import structure as gfs_structure
+from bdbackup.gfs.stages import fed_first_stages
 from bdbackup.history import History
 from bdbackup.mysql import MySQLBackup, XtraBackup
+from bdbackup.postgres.restore import describe_unit, restore_lines
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
 from bdbackup.templates import TemplateError
+from bdbackup.utils import process_lock
 from bdbackup.validation import validate_config
 
 # Exit-code contract: 0 ok, 1 backup/verify failure, 2 usage (Click's usage error), 3 locked.
@@ -87,10 +92,18 @@ def _protect_history(backend, config):
         backend.exclude.update(excluded)
 
 
+def _now() -> datetime:
+    """The current time, UTC-aware; a function so tests can set the clock."""
+    return datetime.now(UTC)
+
+
 def _handle_errors(func, *args, **kwargs) -> int:
-    """Wrap a command body in the exit-code contract."""
+    """Wrap a command body in the exit-code contract.
+
+    Returns the body's own exit code when it returns one, else ``EXIT_OK``.
+    """
     try:
-        func(*args, **kwargs)
+        code = func(*args, **kwargs)
     except (click.ClickException, click.Abort):
         raise
     except BlockingIOError as exc:
@@ -107,7 +120,7 @@ def _handle_errors(func, *args, **kwargs) -> int:
     except Exception as exc:  # pragma: no cover - safety net
         logging.getLogger("bdbackup.cli").exception("Unexpected error: %s", exc)
         click.get_current_context().exit(EXIT_BACKUP_FAILED)
-    return EXIT_OK
+    return code if isinstance(code, int) else EXIT_OK
 
 
 def _dry_run(config: Config, job: Job, incremental: bool) -> None:
@@ -128,6 +141,47 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
         raise click.UsageError(f"--dry-run is not supported for job type {job.type!r}")
 
 
+def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) -> int:
+    """Export the newest pgBackRest full of the job's stanza as one tar; return the exit code.
+
+    A real run holds the job lock from before the full is chosen until the export is published.
+    A dry run takes no lock and writes nothing. When there is no new full nothing is recorded.
+    """
+    engine = build_backend(job)
+    engine.refuse_root()
+    with nullcontext() if dry_run else process_lock(engine.lock_file):
+        choice = engine.choose(History(config.history), job.name)
+        full = choice.full
+        if full.page_errors:
+            click.echo(
+                f"WARNING: full {full.label} has page checksum errors; it is exported, "
+                "and restoring it needs checksum-page-error=n"
+            )
+        if not choice.new:
+            hours = max(0, int((_now() - full.stop).total_seconds() // 3600))
+            message = f"no new full: newest {full.label}, {hours} hours old"
+            limit = engine.max_full_age_hours
+            if limit is not None and hours > limit:
+                click.echo(f"{message} (older than max_full_age_hours = {limit})")
+                return EXIT_BACKUP_FAILED
+            click.echo(message)
+            return EXIT_OK
+        if dry_run:
+            engine.require_marker()
+            click.echo(
+                f"Dry run; would export {full.label} ({full.repo_bytes} bytes) "
+                f"of stanza {engine.stanza} to {engine.unit_path(full.label)}"
+            )
+            return EXIT_OK
+
+        info = engine.restore_info(full, engine.version())
+        result = _tracked_backup(
+            config, job.name, "pgbackrest-full", lambda: engine.export(full, verify=verify), info
+        )
+    click.echo(f"Job {job.name}: {result.path}")
+    return EXIT_OK
+
+
 @main.command(name="run")
 @config_option(required=True)
 @click.option("-j", "--job", "job_name", help="Run this configured job.")
@@ -141,7 +195,7 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
     help="Verify the backup after creation.",
 )
 @click.option("--dry-run", is_flag=True,
-              help="Report what the job would do; run no tool and change nothing.")
+              help="Report what the job would do; run no backup tool and change nothing.")
 @click.option("--validate", "validate_only", is_flag=True,
               help="Check settings, filesystem access and MySQL grants of every job, or of "
                    "--job; run nothing.")
@@ -191,7 +245,8 @@ def run(
     if initialize:
         if job.type != "gfs":
             raise click.UsageError(f"--initialize-structure applies only to gfs jobs: {job.name}")
-        ctx.exit(gfs_structure.initialize(job, click.echo))
+        fed = job.params["stage"][0].paths[0] in fed_first_stages(config.jobs)
+        ctx.exit(gfs_structure.initialize(job, click.echo, fed))
     if validate_only:
         jobs = [job] if job else list(config.jobs.values())
         if not jobs:
@@ -208,6 +263,8 @@ def run(
     if job.type == "gfs":
         code = gfs_runner.run_job(config, job, out=click.echo, dry_run=dry_run)
         ctx.exit(code if code in (EXIT_OK, EXIT_LOCKED) else EXIT_BACKUP_FAILED)
+    if job.type == "pgbackrest":
+        ctx.exit(_handle_errors(_run_pgbackrest, config, job, verify=verify, dry_run=dry_run))
     if dry_run:
         return _handle_errors(_dry_run, config, job, incremental)
     info = {}
@@ -270,6 +327,14 @@ def _restore_mode(config_path, backup_id, job, yes, dst, archive, backup, root, 
     return "archive" if archive is not None else "backup"
 
 
+def _echo_restore_command(directory: Path) -> None:
+    """Print the pgbackrest restore command if ``directory`` holds an extracted pgBackRest unit."""
+    facts = describe_unit(directory)
+    if facts is not None:
+        for line in restore_lines(facts, directory.expanduser().absolute()):
+            click.echo(line)
+
+
 @main.command()
 @config_option()
 @click.option("--backup-id", type=click.IntRange(min=1), help="Successful backup ID from history.")
@@ -309,8 +374,9 @@ def restore(
 
     def _run():
         if mode == "archive":
-            FileBackup.restore_archive(archive, dst)
-            click.echo(f"Restored to: {dst}")
+            restored = FileBackup.restore_archive(archive, dst)
+            click.echo(f"Restored to: {restored}")
+            _echo_restore_command(restored)
             return
         if mode == "backup":
             xb = XtraBackup(backup_root=root, binary=binary or "xtrabackup",
@@ -382,6 +448,8 @@ def restore(
             click.echo(f"Prepared recovery directory: {restored}")
         else:
             click.echo(f"Restored to: {restored}")
+        if record.backup_type == "pgbackrest-full":
+            _echo_restore_command(restored)
 
     return _handle_errors(_run)
 

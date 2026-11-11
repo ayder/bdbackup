@@ -9,7 +9,7 @@ from typing import Any
 
 from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
-from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job
+from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
 
 
@@ -108,6 +108,8 @@ class Config:
                 "out_dir",
                 "backup_root",
                 "encrypt_key_file",
+                "repo_path",
+                "config_file",
             ):
                 if key in params:
                     try:
@@ -124,6 +126,82 @@ class Config:
                 check_gfs_config(self.jobs, self.history)
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
+        self._check_pgbackrest()
+
+    def _check_pgbackrest(self) -> None:
+        """Rules for pgbackrest jobs; they follow ``check_gfs_config``, which reads the stages."""
+        for name, job in self.jobs.items():
+            if job.type != "pgbackrest":
+                continue
+            if self.history is None:
+                raise ConfigError(f"Job {name!r}: pgbackrest jobs require a [history] section")
+            for key in ("first_stage", "lock_file"):
+                if key in job.params:
+                    raise ConfigError(f"Job {name!r}: {key} is set by bdbackup, not in the config")
+            for key, rule in (
+                ("repo", "a whole number of 1 or more"),
+                ("max_full_age_hours", "a positive whole number"),
+            ):
+                value = job.params.get(key, 1)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ConfigError(f"Job {name!r}: {key} must be {rule}")
+            try:
+                job.params["first_stage"] = pgbackrest_first_stage(job, self.jobs)
+            except ValueError as exc:
+                raise ConfigError(f"Job {name!r}: {exc}") from exc
+            self._check_pgbackrest_layout(name, job)
+            job.params["lock_file"] = Path(f"{self.history.database}.pgbackrest-{name}.lock")
+        self._check_pgbackrest_jobs_apart()
+
+    def _check_pgbackrest_jobs_apart(self) -> None:
+        """Refuse two pgbackrest jobs that export one stanza into one ``out_dir``.
+
+        They hold different locks, and each run removes the stanza's temporary files in
+        ``out_dir``, so one could remove the file the other is writing.
+        """
+        seen: dict[tuple[Path, str], str] = {}
+        for name, job in self.jobs.items():
+            stanza = job.params.get("stanza")
+            if job.type != "pgbackrest" or not isinstance(stanza, str):
+                continue  # the engine refuses a stanza that is not a string when it is built
+            key = (Path(job.params["out_dir"]).expanduser().resolve(), stanza)
+            if key in seen:
+                raise ConfigError(
+                    f"Job {name!r}: job {seen[key]!r} already exports stanza {stanza!r} into "
+                    "this out_dir; give each job its own out_dir"
+                )
+            seen[key] = name
+
+    def _check_pgbackrest_layout(self, name: str, job: Job) -> None:
+        """Keep the repository apart from everything bdbackup writes or locks.
+
+        bdbackup never writes under ``repo_path``; the units, the gfs rotation, the history
+        database with its lock and journal files, and the restores do.
+        """
+        if "repo_path" not in job.params:
+            return  # the engine refuses the job when it is built
+        repo = Path(job.params["repo_path"]).expanduser().resolve()
+        out_dir = Path(job.params["out_dir"]).expanduser().resolve()
+        if out_dir.is_relative_to(repo):
+            raise ConfigError(f"Job {name!r}: out_dir must be outside repo_path")
+        # Both [history] paths are resolved when the section is read.
+        for key, path in (
+            ("[history] database", self.history.database),
+            ("[history] restore_root", self.history.restore_root),
+            ("restore_root", job.restore_root),
+        ):
+            if path is not None and path.is_relative_to(repo):
+                raise ConfigError(f"Job {name!r}: {key} must be outside repo_path")
+        for other in self.jobs.values():
+            if other.type != "gfs":
+                continue
+            for stage in other.params["stage"]:
+                if any(repo.is_relative_to(path) for path in stage.paths):
+                    raise ConfigError(
+                        f"Job {name!r}: repo_path must be outside every gfs stage path"
+                    )
+                if any(path.is_relative_to(repo) for path in stage.paths):
+                    raise ConfigError(f"Job {name!r}: a gfs stage path must be outside repo_path")
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:

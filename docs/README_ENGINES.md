@@ -9,7 +9,7 @@ Part of the [bdbackup documentation](../README.md).
 `active` and `restore_root` are job metadata and are not passed to an engine backend.
 
 Database engines are pluggable and live in per-database family packages
-(`bdbackup/mysql/` today; `bdbackup/postgres/` is planned). Each engine maps a
+(`bdbackup/mysql/` and `bdbackup/postgres/`). Each engine maps a
 config `type` name to a backend class; adding one never requires editing
 existing wiring code:
 
@@ -17,6 +17,7 @@ existing wiring code:
 |--------|---------------|---------|-------|
 | `mysqldump` | `mysqldump` | `bdbackup.mysql.MySQLBackup` | Logical, gzip-compressed SQL dumps |
 | `xtrabackup` | `xtrabackup` | `bdbackup.mysql.XtraBackup` | Percona XtraBackup / MariaDB mariabackup |
+| `pgbackrest` | `pgbackrest` | `bdbackup.postgres.PgBackRest` | pgBackRest full backups exported as one tar to a GFS first stage; see [README_PGBACKREST.md](README_PGBACKREST.md) |
 
 To add an engine, drop a self-registering module into either
 `bdbackup/mysql/` (shipped with the package) or
@@ -45,8 +46,8 @@ ENGINE = EngineInfo(
 A config `type` is validated against the live registry, so the new engine is
 immediately usable from `config.toml`. MySQL-specific helpers shared by the
 family (e.g. `mysql_cnf_file` for credential-safe defaults files) live in
-`bdbackup/mysql/helpers.py`. A new database family means creating
-`bdbackup/postgres/` and appending `"bdbackup.postgres"` to
+`bdbackup/mysql/helpers.py`. A new database family means creating its package,
+shaped like `bdbackup/postgres/`, and appending its import path to
 `bdbackup.engines.FAMILIES` — the single deliberate modification point.
 A dry run of a custom engine exits 2: only the built-in types describe their run.
 

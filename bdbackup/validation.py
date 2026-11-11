@@ -13,7 +13,7 @@ from pathlib import Path
 
 from bdbackup.config import Config, Job, build_backend
 from bdbackup.filebackup import FileBackup
-from bdbackup.gfs.stages import MARKER
+from bdbackup.gfs.stages import MARKER, fed_first_stages
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.mysql.helpers import mysql_cnf_file
 
@@ -283,8 +283,9 @@ def _mysql(report: Report, backend) -> None:
         _grant_help(report, backend, account, requirements)
 
 
-def _gfs(report: Report, job: Job, config_path: Path) -> None:
-    for stage in job.params["stage"][1:]:
+def _gfs(report: Report, job: Job, config_path: Path, fed: bool) -> None:
+    """Check the later stages, and the first one when a pgbackrest job writes into it."""
+    for stage in job.params["stage"] if fed else job.params["stage"][1:]:
         for path in stage.paths:
             if not path.is_dir():
                 report.add("FAIL", f"Stage path {path}: does not exist")
@@ -322,7 +323,12 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
             if job.restore_root is not None:
                 _directory(report, job.restore_root, "Recovery root", write=True, create=True)
             if job.type == "gfs":
-                _gfs(report, job, config.path)
+                first = job.params["stage"][0].paths[0]
+                _gfs(report, job, config.path, first in fed_first_stages(config.jobs))
+                continue
+            if job.type == "pgbackrest":
+                for status, message in build_backend(job).preflight():
+                    report.add(status, message)
                 continue
             if job.type not in {"file", "xtrabackup", "mysqldump"}:
                 report.add("FAIL", f"Preflight checks are not implemented for engine {job.type!r}.")

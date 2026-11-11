@@ -5,11 +5,13 @@ Copies go through a ``Transport`` so that object storage can be added later (spe
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import shutil
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -45,7 +47,23 @@ def _fsync_dir(path: Path) -> None:
 
 
 class LocalTransport:
-    """Local or mounted directories."""
+    """Local or mounted directories.
+
+    A share that maps every user to one account refuses chmod with EPERM. The copy then goes on
+    with whatever permission bits the share gave it, and ``modes_refused`` counts the refusals
+    for the run's report. Any other error from those calls still fails the copy.
+    """
+
+    modes_refused: int = 0
+
+    @contextmanager
+    def _mode_may_be_refused(self) -> Iterator[None]:
+        try:
+            yield
+        except PermissionError as exc:
+            if exc.errno != errno.EPERM:
+                raise
+            self.modes_refused += 1
 
     def _copy_file(self, source: Path, target: Path) -> str:
         digest = hashlib.sha256()
@@ -55,7 +73,8 @@ class LocalTransport:
                 writer.write(chunk)
             writer.flush()
             os.fsync(writer.fileno())
-        shutil.copymode(source, target)
+        with self._mode_may_be_refused():
+            shutil.copymode(source, target)
         return digest.hexdigest()
 
     def copy(self, source: Path, temp: Path, on_file: Callable[[str, str], None]) -> None:
@@ -87,7 +106,8 @@ class LocalTransport:
                     raise Refusal(f"unexpected entry {entry.relative_to(source).as_posix()}")
             _fsync_dir(target_dir)
         for here, target_dir in reversed(directories):
-            os.chmod(target_dir, stat.S_IMODE(here.lstat().st_mode))
+            with self._mode_may_be_refused():
+                os.chmod(target_dir, stat.S_IMODE(here.lstat().st_mode))
 
     def rename(self, temp: Path, final: Path) -> None:
         if os.path.lexists(final):
