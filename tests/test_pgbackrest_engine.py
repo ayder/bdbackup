@@ -194,6 +194,39 @@ def test_config_accepts_history_and_restores_beside_the_repo(tmp_path):
     assert config.jobs["pg"].restore_root == tmp_path.resolve() / "repo-restores"
 
 
+def second_job(stanza: str, out_dir: str) -> str:
+    return (
+        f'[pg2]\ntype = "pgbackrest"\nstanza = "{stanza}"\nrepo_path = "repo"\nrepo = 2\n'
+        f'out_dir = "{out_dir}"\n'
+    )
+
+
+def test_config_rejects_two_jobs_with_one_stanza_and_one_out_dir(tmp_path):
+    # One job's start would remove the other's temporary file: both match on the stanza.
+    path = write_config(tmp_path, extra=second_job("main", "STAGE1/pg/../pg/main"))
+
+    with pytest.raises(ConfigError) as refused:
+        Config(path)
+
+    assert str(refused.value) == (
+        "Job 'pg2': job 'pg' already exports stanza 'main' into this out_dir; "
+        "give each job its own out_dir"
+    )
+
+
+@pytest.mark.parametrize(
+    ("stanza", "out_dir"),
+    [
+        pytest.param("main", "STAGE1/pg/repo2", id="same-stanza-own-out-dir"),
+        pytest.param("orders", "STAGE1/pg/main", id="same-out-dir-other-stanza"),
+    ],
+)
+def test_config_accepts_two_jobs_that_differ_in_stanza_or_out_dir(tmp_path, stanza, out_dir):
+    config = Config(write_config(tmp_path, extra=second_job(stanza, out_dir)))
+
+    assert {"pg", "pg2"} <= set(config.jobs)
+
+
 def test_config_accepts_repo_beside_the_stages(tmp_path):
     job = Config(write_config(tmp_path, repo_path="STAGE1-repo")).jobs["pg"]
 
