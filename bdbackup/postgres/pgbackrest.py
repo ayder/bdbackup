@@ -33,6 +33,7 @@ from bdbackup.postgres.repository import (
     newest_full,
     parse_info_file,
     read_info_pair,
+    stanza_problem,
 )
 
 TESTED_VERSIONS = ("2.58.0", "2.60.0")
@@ -195,7 +196,8 @@ class PgBackRest:
 
         Nothing is written and no lock is taken. A failing check is one FAIL line, never an
         exception, and the checks after it still run, except that the encryption and
-        repository directory checks are skipped when ``info`` does not list the stanza.
+        repository directory checks are skipped when ``info`` does not list the stanza or
+        reports it with a problem status.
         """
         lines = [self._binary_line(), self._version_line(), self._root_line()]
         stanza_line, entry = self._stanza_line()
@@ -247,6 +249,9 @@ class PgBackRest:
         entry = next((stanza for stanza in document if stanza.get("name") == self.stanza), None)
         if entry is None:
             return ("FAIL", f"stanza {self.stanza!r} is not in the pgbackrest info output"), None
+        problem = stanza_problem(entry)
+        if problem is not None:
+            return ("FAIL", problem), None
         return ("OK", f"stanza {self.stanza} is listed by pgbackrest info"), entry
 
     @staticmethod

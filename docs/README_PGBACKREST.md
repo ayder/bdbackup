@@ -159,7 +159,8 @@ the share is mounted.
 2. Run `pgbackrest [--config=…] --repo=<repo> --repo<repo>-path=<repo_path> --stanza=<stanza>
    info --output=json` and pick the newest full by stop time. Differentials and incrementals
    are ignored.
-3. Refuse, with exit 1 and no history row, an encrypted repository, a stanza with no full
+3. Refuse, with exit 1 and no history row, a stanza that `info` reports with a problem
+   status (as `--validate` does, below), an encrypted repository, a stanza with no full
    (`stanza main has no full backup`) and a full taken without archive-copy.
 4. If this job already has a successful record for the full's label, there is nothing to
    export (see below). Otherwise write the tar, read it back once to verify it, and record
@@ -253,7 +254,10 @@ and writes nothing. It reports, one line each:
 - `pgbackrest version` parses. The version is reported, with
   `(not a tested version: 2.58.0, 2.60.0)` when it is another one. That note is not a FAIL;
 - the user is not root;
-- the `info` command succeeds and lists the stanza;
+- the `info` command succeeds and lists the stanza with a usable status. pgBackRest lists
+  an unknown stanza too, with exit 0 and status 1 (`missing stanza path`); any status other
+  than 0 (`ok`) or 2 (`no valid backups`) is a FAIL that quotes pgBackRest's message, for
+  example `stanza 'main': pgbackrest info reports status 1: missing stanza path`;
 - the repository is not encrypted;
 - the user can read and search `backup/<stanza>/` and `archive/<stanza>/` under
   `repo_path`;

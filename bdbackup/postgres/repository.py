@@ -45,6 +45,22 @@ class InfoPair:
     copy_stat: os.stat_result
 
 
+# The stanza status codes of ``info --output=json`` that leave a stanza usable: 0 is "ok" and 2
+# is "no valid backups", an existing stanza before its first backup. Any other code, such as 1
+# ("missing stanza path"), which pgBackRest reports for an unknown stanza with exit 0, is not.
+USABLE_STATUS = (0, 2)
+
+
+def stanza_problem(entry: dict) -> str | None:
+    """Why ``info`` reports the stanza ``entry`` unusable, or None when its status allows it."""
+    status = entry.get("status", {})
+    code = status.get("code", 0) if isinstance(status, dict) else None
+    if code in USABLE_STATUS and not isinstance(code, bool):
+        return None
+    message = status.get("message") if isinstance(status, dict) else None
+    return f"stanza {entry.get('name')!r}: pgbackrest info reports status {code}: {message}"
+
+
 def is_encrypted(entry: dict) -> bool:
     """Whether a stanza of the ``info --output=json`` document names a cipher on any repository."""
     return any(repo.get("cipher", "none") != "none" for repo in entry.get("repo", []))
@@ -54,12 +70,15 @@ def newest_full(info: list[dict], stanza: str) -> FullBackup | None:
     """The newest full backup of ``stanza`` in the parsed ``info --output=json`` document.
 
     "Newest" is by stop time; diffs and incrementals are ignored. Returns None when the stanza
-    has no full. Raises RepositoryError when the stanza is not in the output or when the
-    repository is encrypted.
+    has no full. Raises RepositoryError when the stanza is not in the output, when ``info``
+    reports it with a problem status, or when the repository is encrypted.
     """
     entry = next((item for item in info if item.get("name") == stanza), None)
     if entry is None:
         raise RepositoryError(f"stanza {stanza!r} is not in the pgbackrest info output")
+    problem = stanza_problem(entry)
+    if problem is not None:
+        raise RepositoryError(problem)
     if is_encrypted(entry):
         raise RepositoryError(ENCRYPTED)
     fulls = [backup for backup in entry.get("backup", []) if backup.get("type") == "full"]
