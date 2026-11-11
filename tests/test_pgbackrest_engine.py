@@ -359,6 +359,7 @@ def test_command_shape(tmp_path):
         f"--config={tmp_path / 'pgbackrest.conf'}",
         "--repo=2",
         f"--repo2-path={tmp_path / 'repo'}",
+        "--repo2-type=posix",
         "--stanza=main",
         "info",
         "--output=json",
@@ -370,6 +371,7 @@ def test_command_shape_without_config_file(tmp_path):
         "pgbackrest",
         "--repo=1",
         f"--repo1-path={tmp_path / 'repo'}",
+        "--repo1-type=posix",
         "--stanza=main",
         "info",
     ]
