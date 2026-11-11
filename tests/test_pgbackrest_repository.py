@@ -20,7 +20,7 @@ from bdbackup.postgres.repository import (
     parse_info_file,
     read_info_pair,
 )
-from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo
+from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo, missing_stanza_info
 
 OLDER = "20261108-010000F"
 FULL = "20261109-010000F"
@@ -105,6 +105,32 @@ def test_newest_full_unknown_stanza(tmp_path):
         newest_full(info_json(repo, "main"), "other")
     with pytest.raises(RepositoryError, match="other"):
         newest_full([], "other")
+
+
+def test_newest_full_refuses_a_stanza_info_reports_missing():
+    # Real pgBackRest lists an unknown stanza, with exit 0, as status 1.
+    with pytest.raises(RepositoryError) as refused:
+        newest_full(missing_stanza_info("nosuch"), "nosuch")
+
+    assert str(refused.value) == (
+        "stanza 'nosuch': pgbackrest info reports status 1: missing stanza path"
+    )
+
+
+@pytest.mark.parametrize("code", [3, 4, 5, 99])
+def test_newest_full_refuses_any_other_problem_status(tmp_path, code):
+    info = info_json(make_repo(tmp_path), "main")
+    info[0]["status"] = {"code": code, "message": "something is wrong"}
+
+    with pytest.raises(RepositoryError, match=f"status {code}: something is wrong"):
+        newest_full(info, "main")
+
+
+def test_newest_full_status_no_valid_backups_is_no_full(tmp_path):
+    info = info_json(make_repo(tmp_path, fulls=()), "main")
+    assert info[0]["status"]["code"] == 2
+
+    assert newest_full(info, "main") is None
 
 
 def test_newest_full_reads_page_errors_and_version(tmp_path):

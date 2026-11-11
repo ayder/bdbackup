@@ -20,6 +20,30 @@ STOP_AFTER_START = 60  # seconds a fake backup takes
 
 _BACKUP_TYPES = {"F": "full", "D": "diff", "I": "incr"}
 
+_NO_LOCK = {"backup": {"held": False}, "restore": {"held": False}}
+
+
+def missing_stanza_info(stanza: str) -> list[dict]:
+    """What real ``pgbackrest info --output=json`` prints, with exit 0, for a stanza that does
+    not exist: verbatim from pgBackRest 2.58.0 and 2.60.0 (Task 10), but for the name."""
+    return [
+        {
+            "archive": [],
+            "backup": [],
+            "cipher": "none",
+            "db": [],
+            "name": stanza,
+            "repo": [
+                {
+                    "cipher": "none",
+                    "key": 1,
+                    "status": {"code": 1, "message": "missing stanza path"},
+                }
+            ],
+            "status": {"code": 1, "lock": _NO_LOCK, "message": "missing stanza path"},
+        }
+    ]
+
 
 def _label_start(label: str) -> int:
     """Start of a backup label (the last timestamp in it) as epoch seconds."""
@@ -137,12 +161,15 @@ def info_json(repo, stanza: str) -> list[dict]:
         for label, entry in sections["backup:current"].items()
     ]
     db = sections["db"]
+    # Real pgBackRest reports a stanza without backups as status 2.
+    status = {"code": 0, "message": "ok"} if backups else {"code": 2, "message": "no valid backups"}
     return [
         {
             "name": stanza,
             "repo": [{"key": 1, "cipher": CIPHER if "cipher" in sections else "none"}],
             "db": [{"id": db["db-id"], "version": db["db-version"]}],
             "backup": backups,
+            "status": {**status, "lock": _NO_LOCK},
         }
     ]
 

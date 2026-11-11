@@ -21,7 +21,7 @@ from bdbackup.history import History, HistorySettings
 from bdbackup.postgres import PgBackRest
 from bdbackup.postgres.pgbackrest import ENGINE, TESTED_VERSIONS, Choice
 from bdbackup.postgres.repository import FullBackup, RepositoryError
-from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo
+from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo, missing_stanza_info
 
 OLDER = "20261108-010000F"
 NEWEST = "20261109-010000F"
@@ -763,6 +763,30 @@ def test_preflight_stanza_not_listed(tmp_path):
 
     assert failures(lines) == [("FAIL", "stanza 'other' is not in the pgbackrest info output")]
     assert not any("encrypted" in message or "readable" in message for _, message in lines)
+
+
+def test_preflight_stanza_info_reports_missing(tmp_path):
+    # Real pgBackRest lists an unknown stanza, with exit 0, as status 1.
+    engine, _ = preflight_site(tmp_path, stanza="nosuch")
+
+    lines = preflight(engine, scripted(json.dumps(missing_stanza_info("nosuch"))))
+
+    assert failures(lines) == [
+        ("FAIL", "stanza 'nosuch': pgbackrest info reports status 1: missing stanza path")
+    ]
+    assert not any("encrypted" in message or "readable" in message for _, message in lines)
+
+
+def test_run_refuses_a_stanza_info_reports_missing(tmp_path):
+    engine, _ = preflight_site(tmp_path, stanza="nosuch")
+    history = History(HistorySettings(tmp_path / "h.sqlite3", tmp_path / "restores"))
+
+    with (
+        patch("bdbackup.postgres.pgbackrest.subprocess.run",
+              side_effect=scripted(json.dumps(missing_stanza_info("nosuch")))),
+        pytest.raises(BackupError, match="status 1: missing stanza path"),
+    ):
+        engine.choose(history, "pg-main")
 
 
 def test_preflight_skips_encryption_and_directories_when_info_fails(tmp_path):
