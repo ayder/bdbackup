@@ -970,6 +970,24 @@ def test_preflight_output_directory_looks_no_further_up_than_the_first_stage(tmp
     ]
 
 
+def test_preflight_output_directory_through_a_symlink_stops_at_the_first_stage(tmp_path):
+    # out_dir names the share through a link (/mnt/backup -> /srv/nfs); the stage is resolved.
+    engine, stage = preflight_site(tmp_path)
+    link = tmp_path / "mnt"
+    link.symlink_to(stage, target_is_directory=True)
+    engine = make_engine(
+        tmp_path, repo_path=engine.repo_path, out_dir=link / "pg", first_stage=stage
+    )
+    shutil.rmtree(stage)  # unmounted: tmp_path above it is writable
+
+    lines = preflight(engine, fake_pgbackrest(engine.repo_path))
+
+    assert lines[-1] == (
+        "FAIL",
+        f"Output directory: {link / 'pg'} does not exist and {stage} is not a writable directory",
+    )
+
+
 def test_preflight_stage_that_cannot_be_searched_is_a_fail_not_an_exception(tmp_path):
     engine, stage = preflight_site(tmp_path)
     stage.chmod(0o000)
