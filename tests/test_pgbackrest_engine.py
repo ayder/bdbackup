@@ -544,7 +544,7 @@ def test_choose_before_the_history_database_exists(tmp_path, history):
         ),
         pytest.param(
             {"cipher": True},
-            "encrypted repositories are not supported in 0.7.3",
+            "encrypted repositories are not supported",
             id="encrypted",
         ),
     ],
@@ -568,7 +568,7 @@ def test_choose_refuses_a_cipher_before_anything_else(tmp_path, history):
     with pytest.raises(RepositoryError) as refused:
         choose(tmp_path, history, fulls=((NEWEST, False, False),), cipher=True)
 
-    assert str(refused.value) == "encrypted repositories are not supported in 0.7.3"
+    assert str(refused.value) == "encrypted repositories are not supported"
 
 
 def test_choose_refuses_a_missing_archive_copy_even_when_the_label_was_exported(
@@ -816,7 +816,7 @@ def test_preflight_refuses_an_encrypted_repository_and_checks_the_directories(tm
 
     lines = preflight(engine, fake_pgbackrest(engine.repo_path))
 
-    assert failures(lines) == [("FAIL", "encrypted repositories are not supported in 0.7.3")]
+    assert failures(lines) == [("FAIL", "encrypted repositories are not supported")]
     assert ("OK", f"{tmp_path / 'repo' / 'backup' / 'main'}: readable and searchable") in lines
 
 

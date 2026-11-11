@@ -95,7 +95,7 @@ def test_newest_full_refuses_cipher(tmp_path):
     with pytest.raises(RepositoryError) as refused:
         newest_full(info_json(repo, "main"), "main")
 
-    assert str(refused.value) == "encrypted repositories are not supported in 0.7.3"
+    assert str(refused.value) == "encrypted repositories are not supported"
 
 
 def test_newest_full_unknown_stanza(tmp_path):
