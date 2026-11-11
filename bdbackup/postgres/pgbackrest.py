@@ -81,7 +81,6 @@ class PgBackRest:
         self.binary = binary
         self.config_file = Path(config_file) if config_file is not None else None
         self.max_full_age_hours = max_full_age_hours
-        self._written: dict[Path, list[str]] = {}  # member names of each unit exported
 
     def command(self, *args: str) -> list[str]:
         """A pgBackRest command line that names the repository and stanza this job reads."""
@@ -298,22 +297,24 @@ class PgBackRest:
             return "OK", f"{subject} does not exist; {target} is writable, so it can be created"
         return "FAIL", f"{subject} does not exist and {target} is not a writable directory"
 
-    def export(self, full: FullBackup) -> BackupResult:
+    def export(self, full: FullBackup, *, verify: bool = True) -> BackupResult:
         """Write ``full`` as one tar in ``out_dir``, hashing its bytes as they are written.
 
-        Nothing is published unless the whole tar was written and synced; on any failure the
-        temporary file is removed. Every file under ``repo_path`` is opened read-only.
+        With ``verify`` the temporary file is read back once before it gets its final name.
+        Nothing is published unless the whole tar was written, synced and, with ``verify``,
+        read back; on any failure the temporary file is removed. Every file under
+        ``repo_path`` is opened read-only.
         """
         self.require_marker()
         try:
-            return self._export(full)
+            return self._export(full, verify)
         except OSError as exc:
             # Not left as an OSError: BlockingIOError would read as a busy lock (exit 3).
             raise BackupError(
                 f"cannot export {full.label} to {self.out_dir}: {exc.strerror or exc}"
             ) from exc
 
-    def _export(self, full: FullBackup) -> BackupResult:
+    def _export(self, full: FullBackup, verify: bool) -> BackupResult:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._remove_stale_temps()
         final = self.unit_path(full.label)
@@ -328,6 +329,9 @@ class PgBackRest:
             # Cleared before the close: a failed close has still released the descriptor.
             closing, fd = fd, None
             os.close(closing)
+            if verify:
+                # As FileBackup.close_archive does: a tar that fails is never published.
+                self._read_back(temp, final, writer.sha256.hexdigest(), names)
             os.rename(temp, final)
         except BaseException:
             # A failed tar stream flushes its buffer again when it is collected; that write
@@ -338,7 +342,6 @@ class PgBackRest:
             temp.unlink(missing_ok=True)
             raise
         _fsync_dir(self.out_dir)
-        self._written[final] = names
         return BackupResult(
             final, size_bytes=writer.size, success=True, checksum=writer.sha256.hexdigest()
         )
@@ -385,12 +388,12 @@ class PgBackRest:
         tar.close()
         return names
 
-    def verify(self, result: BackupResult) -> BackupResult:
-        """Read the published tar back once: walk its members and re-hash every byte."""
-        path = result.path
-        written = self._written.get(path)
-        if written is None or result.checksum is None:
-            raise BackupError(f"{path} was not exported by this run; nothing to verify it against")
+    @staticmethod
+    def _read_back(path: Path, unit: Path, checksum: str, written: list[str]) -> None:
+        """Read the tar at ``path`` once: walk its members and re-hash every byte.
+
+        ``unit`` is the name the tar is published under; a failure names it, not ``path``.
+        """
         try:
             with open(path, "rb") as stream:
                 reader = _HashingReader(stream)
@@ -406,16 +409,14 @@ class PgBackRest:
                 while reader.read(_CHUNK):
                     pass
         except (tarfile.TarError, OSError, EOFError) as exc:
-            raise BackupError(f"verification of {path} failed: {exc}") from exc
+            raise BackupError(f"verification of {unit} failed: {exc}") from exc
         digest = reader.sha256.hexdigest()
-        if digest != result.checksum:
+        if digest != checksum:
             raise BackupError(
-                f"verification of {path} failed: checksum {digest} read back, "
-                f"{result.checksum} written"
+                f"verification of {unit} failed: checksum {digest} read back, {checksum} written"
             )
         if names != written:
-            raise BackupError(f"verification of {path} failed: members differ from those written")
-        return BackupResult(path, size_bytes=reader.size, success=True, checksum=digest)
+            raise BackupError(f"verification of {unit} failed: members differ from those written")
 
     def backup(self, name: str | None = None) -> BackupResult:
         """Not used: a pgbackrest job exports through ``bdbackup run`` only."""

@@ -144,7 +144,7 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
 def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) -> int:
     """Export the newest pgBackRest full of the job's stanza as one tar; return the exit code.
 
-    A real run holds the job lock from before the full is chosen until the export is verified.
+    A real run holds the job lock from before the full is chosen until the export is published.
     A dry run takes no lock and writes nothing. When there is no new full nothing is recorded.
     """
     engine = build_backend(job)
@@ -174,14 +174,10 @@ def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) ->
             )
             return EXIT_OK
 
-        def action():
-            result = engine.export(full)
-            if verify:
-                engine.verify(result)
-            return result
-
         info = engine.restore_info(full, engine.version())
-        result = _tracked_backup(config, job.name, "pgbackrest-full", action, info)
+        result = _tracked_backup(
+            config, job.name, "pgbackrest-full", lambda: engine.export(full, verify=verify), info
+        )
     click.echo(f"Job {job.name}: {result.path}")
     return EXIT_OK
 

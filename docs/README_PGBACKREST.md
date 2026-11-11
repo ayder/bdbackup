@@ -186,10 +186,11 @@ second apart. If a full changes or disappears while it is exported (an expire re
 for example), the run fails with `input changed during export: <path>` and nothing is
 published. Run it again.
 
-The tar is written under a temporary name, synced, renamed into place, and the directory is
-synced. A temporary file that an earlier run of the same stanza left behind is removed at
-the start of the next run. The final name is never replaced: if it already exists without a
-matching history record, the run fails with `unit already exists: <path>`.
+The tar is written under a temporary name and synced, read back once to verify it, then
+renamed into place, and the directory is synced. A tar that fails its read-back never gets
+its final name. A temporary file that an earlier run of the same stanza left behind is
+removed at the start of the next run. The final name is never replaced: if it already
+exists without a matching history record, the run fails with `unit already exists: <path>`.
 
 Over NFS this costs one write and one read per tar. The SHA-256 is computed while the tar
 is written, and the verification reads the tar back once, walking its structure and
