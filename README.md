@@ -392,8 +392,8 @@ ruff check bdbackup tests scripts
 ```
 
 Optional database integration tests use disposable, network-isolated Docker
-containers with synthetic data. They remove only the containers and volumes
-created for that run. Pull the matching images before running:
+containers with synthetic data. They remove only the containers, volumes and
+networks created for that run. Pull the matching images before running:
 
 ```bash
 python scripts/integration_mysql.py           # mysql:8.4

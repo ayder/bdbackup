@@ -14,7 +14,10 @@ runs in this process, and the pgbackrest commands it runs go to the repository c
 
 The restore runs the pgbackrest command bdbackup printed, then its pre-start step, its
 `postgres -C` check and its pg_ctl start, each with only the placeholders filled in, in a
-fresh container that holds decoy pgBackRest configs.
+fresh container that holds decoy pgBackRest configs. The one deviation from the printed text:
+pgbackrest restore runs with PGBACKREST_LOG_LEVEL_CONSOLE=info in its environment. That only
+raises the console log level, so that pgBackRest logs the options in effect, which proves the
+repository path it read and that no decoy option reached it.
 """
 
 import json
@@ -189,6 +192,7 @@ def main(variant):
     primary, standby, repository = (prefix + "-primary", prefix + "-standby", prefix + "-repo")
     restorer = prefix + "-restore"
     containers = [restorer, standby, primary, repository]
+    leftovers = []  # containers or the network that cleanup could not remove
     uid = os.getuid()
 
     def docker(*args, check=True):
@@ -450,17 +454,21 @@ def main(variant):
                    f"--stanza={STANZA}", "--type=full", "--no-archive-copy", "backup")
             while_held = set()
             deadline = time.monotonic() + 120
-            while len(labels()) == len(before) or stanza_info()["status"]["lock"]["backup"][
-                "held"
-            ]:
-                status = stanza_info()["status"]
+            while True:
+                entry = stanza_info()  # one sample: its status and its backups agree
+                status = entry["status"]
                 if status["lock"]["backup"]["held"]:
                     while_held.add((status["code"], status["message"]))
+                elif len(entry["backup"]) > len(before):
+                    break
                 if time.monotonic() > deadline:
                     raise RuntimeError("F3 did not complete")
+                # Short: the lock is held for about a second in this small cluster.
+                time.sleep(0.25)
             (f3,) = [label for label in labels() if label not in before]
-            print(f"  status while F3 held the backup lock: {sorted(while_held) or 'not seen'}",
-                  flush=True)
+            print(f"  status while F3 held the backup lock: {sorted(while_held)}", flush=True)
+            if not while_held:
+                raise RuntimeError("never saw F3 hold the backup lock; the status check is void")
             if any(code != 0 for code, _ in while_held):
                 raise RuntimeError("a running backup gives the stanza a non-zero status")
             code, output = bdbackup("run", "-c", config, "-j", "pg-main")
@@ -655,10 +663,21 @@ def main(variant):
             raise
         finally:
             for container in containers:
-                docker("rm", "-f", "-v", container, check=False)
-            docker("network", "rm", network, check=False)
+                removed = docker("rm", "-f", "-v", container, check=False)
+                # A container that a failed run never created is not a leftover.
+                if removed.returncode and "No such container" not in removed.stderr:
+                    leftovers.append(f"container {container}: {removed.stderr.strip()}")
+            removed = docker("network", "rm", network, check=False)
+            if removed.returncode and "not found" not in removed.stderr:
+                leftovers.append(f"network {network}: {removed.stderr.strip()}")
             logging.getLogger("bdbackup").removeHandler(captured)
-            print("Removed disposable pgBackRest-test containers and network", flush=True)
+            for leftover in leftovers:
+                print(f"Could not remove {leftover}", flush=True)
+            if not leftovers:
+                print("Removed disposable pgBackRest-test containers and network", flush=True)
+    # Not raised in the finally block, where it would hide the error of a failed run.
+    if leftovers:
+        raise RuntimeError(f"left {len(leftovers)} Docker objects behind; remove them by hand")
 
 
 if __name__ == "__main__":
