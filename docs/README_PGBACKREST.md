@@ -263,7 +263,7 @@ and writes nothing. It reports, one line each:
 
 ## Restore
 
-The restore was tested against pgBackRest 2.58.0 and 2.60.0.
+The restore was tested against pgBackRest 2.58.0 and 2.60.0, with PostgreSQL 16 and 18.
 
 `bdbackup history` lists the exports as `pgbackrest-full`, with the tar as path and unit.
 Restore one from the history like any other backup:
@@ -274,13 +274,22 @@ bdbackup restore -c /opt/dbs/config.toml --job pg-main
 
 It checks the tar against its recorded checksum and extracts it into the new destination,
 which becomes a directory that works as `--repo1-path`. Then it prints the command that
-restores the cluster:
+restores the cluster, and the steps that turn archiving off and start the copy:
 
 ```
 Restored to: /restore/bdbackup/pg-main-12
 
 To restore this backup, run this pgBackRest command:
-pgbackrest --no-config --stanza=main --repo1-path=/restore/bdbackup/pg-main-12 --pg1-path=<PGDATA> --set=20261109-010203F --type=none --archive-mode=off --log-level-file=off restore
+pgbackrest --no-config --stanza=main --repo1-path=/restore/bdbackup/pg-main-12 --pg1-path=<PGDATA> --set=20261109-010203F --type=none --log-level-file=off restore
+
+Before the first start, as the cluster owner, turn archiving off in the copy:
+printf '\n%s\n%s\n' "archive_mode = 'off'" "archive_command = ''" >> <PGDATA>/postgresql.auto.conf
+
+Check it with the PostgreSQL 16 server binary, without starting the server; it must print off:
+postgres -D <PGDATA> -C archive_mode
+
+Start the copy directly with pg_ctl as the cluster owner, never through a cluster manager or service unit that holds the production configuration:
+pg_ctl -D <PGDATA> -o "-c listen_addresses=localhost -c port=<free port>" start
 
   - <PGDATA> is a new, empty directory on the host that restores.
   - Run the command as the OS user that will own the cluster, never root. Unset every
@@ -289,9 +298,11 @@ pgbackrest --no-config --stanza=main --repo1-path=/restore/bdbackup/pg-main-12 -
     it with mode 0700). To restore as another user or on another host, copy it there first and
     change --repo1-path to the copy.
   - Start the restored cluster with PostgreSQL 16.
-  - archive_mode must be off before the restored cluster starts for the first time. With
-    --type=none the cluster stays on the production timeline, and one archived WAL segment would
-    collide with production WAL. The command passes --archive-mode=off for this.
+  - archive_mode must be off before the copy starts for the first time. With --type=none the
+    copy stays on the production timeline, and one archived WAL segment would collide with
+    production WAL. pgBackRest writes no recovery settings under --type=none, so the step after
+    the command turns archiving off in postgresql.auto.conf, which is always read; the empty
+    archive_command keeps the copy from archiving even if archive_mode is forced on at start.
 ```
 
 The command is built from the extracted directory, not from the history or the file name:
@@ -305,6 +316,10 @@ that restores:
 - `--repo1-path` is the extracted directory, so the restore reads nothing else.
 - `--type=none` writes no recovery target. The cluster comes up at the end of the backup
   and stays on the production timeline.
+- There is no `--archive-mode=off`. Under `--type=none` pgBackRest writes no recovery
+  settings by design, so the option has no effect there: the restored cluster would start
+  with the production `archive_mode`. The printed step appends `archive_mode = 'off'` and
+  `archive_command = ''` to `<PGDATA>/postgresql.auto.conf` instead.
 - `--log-level-file=off` keeps pgBackRest from writing to a log directory that the cluster
   owner may not be able to write.
 - A tar with page checksum errors adds `--checksum-page-error=n` and a line saying why.
@@ -315,6 +330,30 @@ Run the command as the OS user that will own the cluster, never root. The extrac
 directory belongs to the user who ran bdbackup. To restore as another user, or on another
 host, copy the directory there first, hand it over to that user, and change `--repo1-path`
 to the copy. bdbackup changes no ownership or permissions itself.
+
+### Before and at the first start
+
+Run the printed steps in order, as the cluster owner, before the copy starts for the first
+time:
+
+1. The `printf` line appends `archive_mode = 'off'` and `archive_command = ''` to
+   `<PGDATA>/postgresql.auto.conf`. The empty `archive_command` is a guard: if something
+   forces `archive_mode` on at start, the copy still archives nothing.
+2. `postgres -D <PGDATA> -C archive_mode` reads the configuration without starting the
+   server and must print `off`. Use the server binary of the PostgreSQL major version the
+   output names; on Debian and Ubuntu it is in `/usr/lib/postgresql/<major>/bin`.
+3. Start the copy directly with `pg_ctl`, on `localhost` and a free port. Never start it
+   through a cluster manager or a service unit that holds the production configuration.
+
+- `backup_label` is in `<PGDATA>` after the restore and is needed on the first start. Do
+  not remove it.
+- An install that keeps `postgresql.conf` outside the data directory restores a tree with no
+  `postgresql.conf`. `postgresql.auto.conf` is always in the data directory and always read,
+  so the step is the same.
+- If writes hang on the copy because production uses synchronous replication, set
+  `synchronous_standby_names = ''` the same way, in `postgresql.auto.conf` before the start.
+- The copy stays on the production timeline and writes no history file. Never give it the
+  production repository, and never use it as a replication source or target for production.
 
 ### When the repository host is lost
 
@@ -345,6 +384,10 @@ The restored cluster is a copy of a production data directory. It carries the pr
 `shared_preload_libraries` and any jobs stored in the database. The host that starts it
 needs the same extension packages, and those jobs run once the cluster starts unless you
 disable them first.
+
+If the database holds logical-replication subscriptions, add
+`max_logical_replication_workers = 0` to `<PGDATA>/postgresql.auto.conf` before the first
+start, so the copy does not connect to the production publisher.
 
 ## Encrypted repositories
 

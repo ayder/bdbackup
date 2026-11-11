@@ -98,12 +98,27 @@ def restore_lines(facts: UnitFacts, repo_dir: Path) -> list[str]:
         f"--pg1-path={PGDATA}",
         shlex.quote(f"--set={facts.label}"),
         "--type=none",
-        "--archive-mode=off",
         "--log-level-file=off",
     ]
     if facts.page_errors:
         arguments.append("--checksum-page-error=n")
     arguments.append("restore")
+
+    # Under --type=none pgBackRest writes no recovery settings, so --archive-mode=off has no
+    # effect there (Task 10, pgBackRest 2.58.0 and 2.60.0); the copy turns archiving off itself.
+    steps = [
+        "Before the first start, as the cluster owner, turn archiving off in the copy:",
+        f"printf '\\n%s\\n%s\\n' \"archive_mode = 'off'\" \"archive_command = ''\" "
+        f">> {PGDATA}/postgresql.auto.conf",
+        "",
+        f"Check it with the PostgreSQL {facts.pg_version} server binary, without starting the "
+        "server; it must print off:",
+        f"postgres -D {PGDATA} -C archive_mode",
+        "",
+        "Start the copy directly with pg_ctl as the cluster owner, never through a cluster "
+        "manager or service unit that holds the production configuration:",
+        f'pg_ctl -D {PGDATA} -o "-c listen_addresses=localhost -c port=<free port>" start',
+    ]
 
     notes = [
         f"{PGDATA} is a new, empty directory on the host that restores.",
@@ -113,10 +128,12 @@ def restore_lines(facts: UnitFacts, repo_dir: Path) -> list[str]:
         "mode 0700). To restore as another user or on another host, copy it there first and "
         "change --repo1-path to the copy.",
         f"Start the restored cluster with PostgreSQL {facts.pg_version}.",
-        "archive_mode must be off before the restored cluster starts for the first time. "
-        "With --type=none the cluster stays on the production timeline, and one archived WAL "
-        "segment would collide with production WAL. The command passes --archive-mode=off "
-        "for this.",
+        "archive_mode must be off before the copy starts for the first time. With "
+        "--type=none the copy stays on the production timeline, and one archived WAL segment "
+        "would collide with production WAL. pgBackRest writes no recovery settings under "
+        "--type=none, so the step after the command turns archiving off in "
+        "postgresql.auto.conf, which is always read; the empty archive_command keeps the copy "
+        "from archiving even if archive_mode is forced on at start.",
     ]
     if facts.page_errors:
         notes.append(
@@ -126,6 +143,7 @@ def restore_lines(facts: UnitFacts, repo_dir: Path) -> list[str]:
         )
 
     lines = ["", "To restore this backup, run this pgBackRest command:", " ".join(arguments), ""]
+    lines += [*steps, ""]
     for note in notes:
         lines += textwrap.wrap(
             note,
