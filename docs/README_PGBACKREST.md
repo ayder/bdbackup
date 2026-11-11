@@ -40,7 +40,8 @@ directory.
 
 A pgbackrest job needs a `[history]` section; without one the config is rejected
 (`pgbackrest jobs require a [history] section`). `first_stage` and `lock_file` are set by
-bdbackup and are rejected in the config. `out_dir` must be outside `repo_path`, and no GFS
+bdbackup and are rejected in the config. `out_dir`, the `[history]` `database` and
+`restore_root`, and the job's own `restore_root` must be outside `repo_path`, and no GFS
 stage path may lie inside `repo_path` or contain it. Config paths expand `~`.
 
 Run the job as the OS user that owns the repository, never as root. From pgBackRest 2.59.0,

@@ -153,9 +153,10 @@ class Config:
             job.params["lock_file"] = Path(f"{self.history.database}.pgbackrest-{name}.lock")
 
     def _check_pgbackrest_layout(self, name: str, job: Job) -> None:
-        """Keep the repository apart from the units and from every gfs stage.
+        """Keep the repository apart from everything bdbackup writes or locks.
 
-        bdbackup never writes under ``repo_path``; the units and the gfs rotation do.
+        bdbackup never writes under ``repo_path``; the units, the gfs rotation, the history
+        database with its lock and journal files, and the restores do.
         """
         if "repo_path" not in job.params:
             return  # the engine refuses the job when it is built
@@ -163,6 +164,14 @@ class Config:
         out_dir = Path(job.params["out_dir"]).expanduser().resolve()
         if out_dir.is_relative_to(repo):
             raise ConfigError(f"Job {name!r}: out_dir must be outside repo_path")
+        # Both [history] paths are resolved when the section is read.
+        for key, path in (
+            ("[history] database", self.history.database),
+            ("[history] restore_root", self.history.restore_root),
+            ("restore_root", job.restore_root),
+        ):
+            if path is not None and path.is_relative_to(repo):
+                raise ConfigError(f"Job {name!r}: {key} must be outside repo_path")
         for other in self.jobs.values():
             if other.type != "gfs":
                 continue

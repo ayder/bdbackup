@@ -249,6 +249,8 @@ keep = "7y"
 # The repository root, what pgBackRest calls repo<repo>-path (required). The job
 # reads backup/<stanza>/ and archive/<stanza>/ there and passes the path to the
 # info command; it never writes, renames, deletes or locks anything under it.
+# The [history] database and restore_root, and a restore_root on this job, must
+# be outside it.
 # repo_path = "/var/lib/pgbackrest"
 #
 # Where the tar <stanza>-<label>.tar is written (required). It must be the first
