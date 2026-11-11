@@ -400,7 +400,12 @@ python scripts/integration_mysql.py           # mysql:8.4
 python scripts/integration_physical.py percona # percona-server/xtrabackup:8.4
 python scripts/integration_physical.py percona-encrypted # AES256 + zstd recovery
 python scripts/integration_physical.py mariadb # mariadb:11.4
+python scripts/integration_pgbackrest.py pg16-2.58 # bdbackup-pgbackrest:16-2.58.0
+python scripts/integration_pgbackrest.py pg18-2.60 # bdbackup-pgbackrest:18-2.60.0
 ```
+
+The pgBackRest images have no official source; build them from
+`scripts/docker/pgbackrest.Dockerfile` with the commands in `tests/AGENTS.md`.
 
 Physical recovery returns a prepared data directory; copying it into a server's
 data directory, assigning ownership to the server user, and starting that server
