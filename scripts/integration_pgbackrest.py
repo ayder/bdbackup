@@ -18,6 +18,10 @@ fresh container that holds decoy pgBackRest configs. The one deviation from the 
 pgbackrest restore runs with PGBACKREST_LOG_LEVEL_CONSOLE=info in its environment. That only
 raises the console log level, so that pgBackRest logs the options in effect, which proves the
 repository path it read and that no decoy option reached it.
+
+Every bdbackup call is bracketed by a digest of the repository tree (path, size, mtime_ns and
+inode of every entry): bdbackup never writes, renames, deletes or locks anything there.
+pgBackRest's own commands run between the calls, so the digest is taken around each one.
 """
 
 import json
@@ -51,6 +55,7 @@ CONTROL = "/var/lib/postgresql/control"  # <PGDATA> of the control runs, which m
 SERVER_LOG = "/var/lib/postgresql/restored.log"
 FREE_PORT = "5433"  # <free port> in the printed pg_ctl line; nothing listens on it in there
 READY = "/etc/pgbackrest/ready"  # the restore container has installed its decoys
+F3_DONE = "/tmp/f3-done"  # noqa: S108 - in the disposable repository container: F3 has exited
 SUCCESS = "Real pgBackRest export and restore passed"
 
 # Taken before bdbackup's subprocess.run is patched: the patch replaces the attribute of the
@@ -180,6 +185,23 @@ def info_entries(text):
     return sections
 
 
+def tree_digest(root):
+    """Path, size, mtime_ns and inode of ``root`` and of every entry below it; no link followed."""
+    entries = {}
+    for directory, dirnames, filenames in os.walk(root):
+        for path in [Path(directory), *(Path(directory) / n for n in dirnames + filenames)]:
+            st = path.lstat()
+            entries[path.relative_to(root).as_posix()] = (st.st_size, st.st_mtime_ns, st.st_ino)
+    return entries
+
+
+def tree_changes(before, after):
+    """The entries that differ between two digests, for the error message."""
+    return sorted(
+        name for name in before.keys() | after.keys() if before.get(name) != after.get(name)
+    )
+
+
 def main(variant):
     if variant not in VARIANTS:
         raise SystemExit(f"usage: {sys.argv[0]} {{{' | '.join(VARIANTS)}}}")
@@ -245,11 +267,19 @@ def main(variant):
             raise RuntimeError(f"expected one new backup, found {new}")
         return new[0]
 
+    routed_calls = []  # (command, exit status) of every pgbackrest command bdbackup ran
+
     def routed(cmd, **kwargs):
         """bdbackup's pgbackrest commands, run as postgres in the repository container."""
         if cmd[0] != "pgbackrest":
             raise RuntimeError(f"unexpected command from bdbackup: {cmd}")
-        return _run([docker_binary, "exec", "-u", "postgres", repository, *cmd], **kwargs)
+        try:
+            result = _run([docker_binary, "exec", "-u", "postgres", repository, *cmd], **kwargs)
+        except subprocess.CalledProcessError as exc:
+            routed_calls.append((list(cmd), exc.returncode))
+            raise
+        routed_calls.append((list(cmd), result.returncode))
+        return result
 
     captured = _Captured()
     captured.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
@@ -265,16 +295,24 @@ def main(variant):
             return f"{repository}:/usr/bin/pgbackrest"
         return real_which(name, *args, **kwargs)
 
+    digests = []  # the number of entries in the repository at each bdbackup call
+
     def bdbackup(*args):
         captured.lines.clear()
+        before = tree_digest(repo)
         with (
             patch("bdbackup.postgres.pgbackrest.subprocess.run", side_effect=routed),
             patch("bdbackup.postgres.pgbackrest.shutil.which", side_effect=which),
         ):
             result = CliRunner().invoke(cli, [str(arg) for arg in args])
+        after = tree_digest(repo)
         print(f"$ bdbackup {' '.join(map(str, args))}  -> exit {result.exit_code}", flush=True)
         for line in result.output.splitlines():
             print(f"  {line}", flush=True)
+        if after != before:
+            raise RuntimeError(f"bdbackup {args[0]} changed the repository: "
+                               f"{tree_changes(before, after)[:20]}")
+        digests.append(len(before))
         if result.exception is not None and not isinstance(result.exception, SystemExit):
             raise RuntimeError(f"bdbackup raised {result.exception!r}")
         return result.exit_code, result.output + "\n".join(captured.lines)
@@ -373,6 +411,14 @@ def main(variant):
                   flush=True)
             if unknown.returncode or json.loads(unknown.stdout)[0]["status"]["code"] != 1:
                 raise RuntimeError("pgbackrest info no longer lists an unknown stanza as status 1")
+            # The printed restore note: 2.60.0 has checksum-page-error on restore, 2.58.0 not.
+            # Console warn: at info, help logs a "restore command begin" line before its text.
+            page_help = pgbackrest("--log-level-console=warn", "help", "restore",
+                                   "checksum-page-error", check=False)
+            print(f"  help restore checksum-page-error: exit {page_help.returncode}, "
+                  f"{(page_help.stdout + page_help.stderr).strip().splitlines()[0]}", flush=True)
+            if (page_help.returncode == 0) != (version != "2.58.0"):
+                raise RuntimeError("checksum-page-error on restore differs from the printed note")
 
             # --- Step 3: export F2 through bdbackup run.
             history_db, restores = work / "history.sqlite3", work / "restores"
@@ -406,6 +452,14 @@ def main(variant):
             code, output = bdbackup("run", "-c", config, "-j", "pg-main")
             if code:
                 raise RuntimeError(f"bdbackup run exited {code}")
+            info_calls = [(cmd, status) for cmd, status in routed_calls if "info" in cmd]
+            if not info_calls or any(
+                status or "--repo1-type=posix" not in cmd for cmd, status in info_calls
+            ):
+                raise RuntimeError(f"an info command lacked --repo1-type=posix or failed: "
+                                   f"{info_calls}")
+            print(f"  bdbackup's info command, accepted: {' '.join(info_calls[-1][0])}",
+                  flush=True)
             history = History(HistorySettings(history_db, restores))
             records = history.records(job="pg-main", successful=True)
             info = json.loads(records[0].restore_info) if len(records) == 1 else {}
@@ -450,8 +504,9 @@ def main(variant):
             # --- Step 5: a full without archive-copy is refused, by option-archive-copy.
             # Taken in the background, to see what info reports while a backup holds its lock.
             before = labels()
-            docker("exec", "-d", "-u", "postgres", repository, "pgbackrest",
-                   f"--stanza={STANZA}", "--type=full", "--no-archive-copy", "backup")
+            docker("exec", "-d", "-u", "postgres", repository, "sh", "-c",
+                   f"pgbackrest --stanza={STANZA} --type=full --no-archive-copy backup;"
+                   f" touch {F3_DONE}")
             while_held = set()
             deadline = time.monotonic() + 120
             while True:
@@ -471,6 +526,11 @@ def main(variant):
                 raise RuntimeError("never saw F3 hold the backup lock; the status check is void")
             if any(code != 0 for code, _ in while_held):
                 raise RuntimeError("a running backup gives the stanza a non-zero status")
+            # The backup command expires after the backup is listed; the repository digest
+            # around the next bdbackup call must not see pgBackRest's own writes.
+            wait_for("F3's backup command to exit", lambda: docker(
+                "exec", repository, "test", "-f", F3_DONE, check=False).returncode == 0,
+                timeout=120)
             code, output = bdbackup("run", "-c", config, "-j", "pg-main")
             if code != 1 or f"full {f3} was taken without archive-copy" not in output:
                 raise RuntimeError(f"F3 run exited {code}: {output}")
@@ -653,6 +713,9 @@ def main(variant):
                 raise RuntimeError("the restored cluster is still in recovery")
             print(f"Step 9: the restore used --repo1-path={from_history}; neither "
                   "decoy config was read", flush=True)
+            print(f"Step 10: the repository tree ({min(digests)} to {max(digests)} entries) "
+                  f"was the same before and after each of the {len(digests)} bdbackup calls",
+                  flush=True)
             print(SUCCESS, flush=True)
         except BaseException:
             for container in containers:
