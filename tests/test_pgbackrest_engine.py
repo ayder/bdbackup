@@ -152,6 +152,48 @@ def test_config_rejects_stage_inside_repo(tmp_path, repo_path):
     assert str(refused.value) == "Job 'pg': a gfs stage path must be outside repo_path"
 
 
+@pytest.mark.parametrize(
+    ("history", "extra", "message"),
+    [
+        pytest.param(
+            'database = "repo/state/history.sqlite3"\n',
+            "",
+            "[history] database must be outside repo_path",
+            id="history-database",
+        ),
+        pytest.param(
+            'database = "state/history.sqlite3"\nrestore_root = "repo/restores"\n',
+            "",
+            "[history] restore_root must be outside repo_path",
+            id="history-restore-root",
+        ),
+        pytest.param(
+            'database = "state/history.sqlite3"\n',
+            'restore_root = "repo/../repo/restores"\n',
+            "restore_root must be outside repo_path",
+            id="job-restore-root",
+        ),
+    ],
+)
+def test_config_keeps_the_history_and_the_restores_out_of_the_repo(
+    tmp_path, history, extra, message
+):
+    # The history database, its lock and journal files, and every restore are written.
+    path = write_config(tmp_path, extra=extra)
+    path.write_text(path.read_text().replace('database = "state/history.sqlite3"\n', history, 1))
+
+    with pytest.raises(ConfigError) as refused:
+        Config(path)
+
+    assert str(refused.value) == f"Job 'pg': {message}"
+
+
+def test_config_accepts_history_and_restores_beside_the_repo(tmp_path):
+    config = Config(write_config(tmp_path, extra='restore_root = "repo-restores"\n'))
+
+    assert config.jobs["pg"].restore_root == tmp_path.resolve() / "repo-restores"
+
+
 def test_config_accepts_repo_beside_the_stages(tmp_path):
     job = Config(write_config(tmp_path, repo_path="STAGE1-repo")).jobs["pg"]
 
