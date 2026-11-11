@@ -38,9 +38,18 @@ def command(repo_dir, label=NEWEST, stanza="main", page_errors=False) -> str:
     page = " --checksum-page-error=n" if page_errors else ""
     return (
         f"pgbackrest --no-config --stanza={stanza} --repo1-path={repo_dir} "
-        f"--pg1-path=<PGDATA> --set={label} --type=none --archive-mode=off "
+        f"--pg1-path=<PGDATA> --set={label} --type=none "
         f"--log-level-file=off{page} restore"
     )
+
+
+# The steps after the command, written out in full (spec 6.3, as amended by the Task 10 ruling).
+PRE_START = (
+    "printf '\\n%s\\n%s\\n' \"archive_mode = 'off'\" \"archive_command = ''\" "
+    ">> <PGDATA>/postgresql.auto.conf"
+)
+CHECK = "postgres -D <PGDATA> -C archive_mode"
+START = 'pg_ctl -D <PGDATA> -o "-c listen_addresses=localhost -c port=<free port>" start'
 
 
 def extracted(tmp_path, *, stanza="main", fulls=((NEWEST, True, False),)) -> Path:
@@ -231,6 +240,37 @@ def test_restore_lines_say_how_to_run_the_command(tmp_path):
     assert "0700" in text and "copy" in text and "--repo1-path" in text
     assert "PostgreSQL 16" in text
     assert "archive_mode" in text and "off" in text
+    assert "production timeline" in text
+
+
+def test_restore_lines_print_the_pre_start_steps_in_order(tmp_path):
+    lines = restore_lines(NEWEST_FACTS, tmp_path / "unit")
+
+    (command_at,) = [i for i, line in enumerate(lines) if line.startswith("pgbackrest ")]
+    steps = [lines.index(PRE_START), lines.index(CHECK), lines.index(START)]
+    assert command_at < steps[0] < steps[1] < steps[2]
+    # Each step is introduced by the line before it.
+    assert "before the first start" in lines[steps[0] - 1].lower()
+    assert "cluster owner" in lines[steps[0] - 1]
+    assert "PostgreSQL 16" in lines[steps[1] - 1] and "off" in lines[steps[1] - 1]
+    assert "pg_ctl" in lines[steps[2] - 1] and "cluster owner" in lines[steps[2] - 1]
+    assert "service unit" in lines[steps[2] - 1]
+
+
+def test_restore_lines_check_names_the_backups_postgresql_version(tmp_path):
+    facts = UnitFacts("main", NEWEST, "18", page_errors=False)
+    lines = restore_lines(facts, tmp_path / "unit")
+
+    assert "PostgreSQL 18" in lines[lines.index(CHECK) - 1]
+
+
+def test_restore_lines_no_archive_mode_option_and_no_signal_file(tmp_path):
+    text = "\n".join(restore_lines(NEWEST_FACTS, tmp_path / "unit"))
+
+    # Under --type=none pgBackRest writes no recovery settings: the option has no effect.
+    assert "--archive-mode" not in text
+    assert "The command passes" not in text
+    assert "signal" not in text
 
 
 def test_restore_lines_name_the_postgresql_version(tmp_path):
@@ -254,7 +294,6 @@ def test_restore_lines_quote_what_the_shell_would_read(tmp_path):
         "--pg1-path=<PGDATA>",
         f"--set={NEWEST}",
         "--type=none",
-        "--archive-mode=off",
         "--log-level-file=off",
         "restore",
     ]
@@ -293,6 +332,7 @@ def test_history_restore_prints_command(tmp_path, managed):
     assert f"Restored to: {destination}" in lines
     assert lines.count(command(destination)) == 1
     assert lines.index(f"Restored to: {destination}") < lines.index(command(destination))
+    assert lines.count(PRE_START) == lines.count(CHECK) == lines.count(START) == 1
     # What is printed is what was restored: the tree `describe_unit` read is the pgBackRest
     # repository the command points at.
     assert (destination / "backup" / "main" / "backup.info").is_file()
@@ -333,6 +373,7 @@ def test_archive_restore_prints_command(tmp_path):
     lines = result.output.splitlines()
     assert lines[0] == f"Restored to: {destination}"
     assert lines.count(command(destination)) == 1
+    assert lines.count(PRE_START) == lines.count(CHECK) == lines.count(START) == 1
 
 
 def test_archive_and_history_restore_print_the_same_text(tmp_path):
