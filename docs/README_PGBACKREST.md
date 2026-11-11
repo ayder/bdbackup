@@ -32,7 +32,7 @@ directory.
 |-----|----------|-------------|
 | `stanza` | yes | The pgBackRest stanza. One job exports one stanza. |
 | `repo` | no (default `1`) | The index of the local POSIX repository in the host's `pgbackrest.conf`. The `info` command the job runs gets `--repo=<repo>`, so it lists only that repository's backups, even when the host also configures another repository such as S3. |
-| `repo_path` | yes | The repository root (what pgBackRest calls `repo<repo>-path`). The job reads `backup/<stanza>/` and `archive/<stanza>/` there and passes it as `--repo<repo>-path` to the `info` command, so `info` and the job read the same repository. Relative paths resolve against the config file. |
+| `repo_path` | yes | The repository root (what pgBackRest calls `repo<repo>-path`). The job reads `backup/<stanza>/` and `archive/<stanza>/` there and passes it as `--repo<repo>-path`, with `--repo<repo>-type=posix`, to the `info` command, so `info` and the job read the same repository even when the host's `pgbackrest.conf` sets another type for that index. Relative paths resolve against the config file. |
 | `out_dir` | yes | Where the tar is written. It must be the first stage path of a GFS job in the same config, or a directory below it. |
 | `binary` | no (default `pgbackrest`) | The pgBackRest executable. |
 | `config_file` | no | Passed as `--config` to the `info` command the job runs. When it is not set, pgBackRest's default applies. (`pgbackrest version` runs without any of these options.) |
@@ -157,9 +157,9 @@ the share is mounted.
 1. Refuse root, then take the job lock. The lock file is
    `<history database>.pgbackrest-<job>.lock`, beside the history database and never on the
    share. A second run of the same job exits 3.
-2. Run `pgbackrest [--config=…] --repo=<repo> --repo<repo>-path=<repo_path> --stanza=<stanza>
-   info --output=json` and pick the newest full by stop time. Differentials and incrementals
-   are ignored.
+2. Run `pgbackrest [--config=…] --repo=<repo> --repo<repo>-path=<repo_path>
+   --repo<repo>-type=posix --stanza=<stanza> info --output=json` and pick the newest full by
+   stop time. Differentials and incrementals are ignored.
 3. Refuse, with exit 1 and no history row, a stanza that `info` reports with a problem
    status (as `--validate` does, below), an encrypted repository, a stanza with no full
    (`stanza main has no full backup`) and a full taken without archive-copy.

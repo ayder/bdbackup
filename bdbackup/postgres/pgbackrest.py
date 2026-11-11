@@ -89,6 +89,8 @@ class PgBackRest:
             *([f"--config={self.config_file}"] if self.config_file is not None else []),
             f"--repo={self.repo}",
             f"--repo{self.repo}-path={self.repo_path}",
+            # A pgbackrest.conf that makes this index an object store must not redirect info.
+            f"--repo{self.repo}-type=posix",
             f"--stanza={self.stanza}",
             *args,
         ]
