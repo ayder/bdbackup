@@ -1725,3 +1725,25 @@ def test_same_filesystem_compares_the_devices_of_two_live_paths(tmp_path):
     assert transport.same_filesystem(a, tmp_path / "missing") is False
     with patch("bdbackup.gfs.actions.os.stat", on_another_device):
         assert transport.same_filesystem(a, b) is False
+
+
+# ---- the run report names a stage whose checksums are not re-read (0.7.4, D1) ----------------
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["apply", "dry-run"])
+def test_a_verify_false_stage_says_its_checksums_are_not_re_read(env, dry_run):
+    env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily"], "daily", "20d", NO_VERIFY),
+               (["NFS/weekly"], "weekly", "8w")])
+    size_a = env.file_unit("a", days_ago=7).stat().st_size
+    size_b = env.file_unit("b", days_ago=0).stat().st_size
+    env.dry_run = dry_run
+
+    result = env.run_cli()
+
+    assert result.exit_code == 0, result.output
+    after = result.output.split("Summary:", 1)[1].splitlines()[1:]
+    assert [line for line in after if line.startswith("Stage ")] == [
+        f"Stage {env.abs('BACKUP')}: 1 unit ({size_b} bytes)",
+        f"Stage {env.abs('NFS/daily')}: 1 unit ({size_a} bytes), checksums not re-read",
+        f"Stage {env.abs('NFS/weekly')}: 0 units (0 bytes)",
+    ], result.output
