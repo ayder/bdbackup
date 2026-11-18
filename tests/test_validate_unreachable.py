@@ -154,6 +154,23 @@ def test_an_unsearchable_parent_of_a_file_job_source_is_a_fail_line(tmp_path, lo
     assert "Invalid settings or inaccessible path" not in result.output
 
 
+def test_a_reachable_source_root_is_still_walked_beside_an_unreachable_one(tmp_path, lock):
+    root = tmp_path.resolve()
+    (root / "locked" / "source").mkdir(parents=True)
+    (root / "locked" / "source" / "hello").write_text("hello")
+    config = site(root, '[history]\ndatabase = "state/h.sqlite3"\n', chdir=".")
+    (root / "paths").write_text("source/hello\nlocked/source/hello\n")
+    lock(root / "locked")
+
+    result = validate(config)
+
+    assert_report(
+        result,
+        unreachable("Backup source", root / "locked" / "source" / "hello", root / "locked"),
+        "[OK] Checked access to 1 selected source entries.",
+    )
+
+
 # ---- what must not change ---------------------------------------------------------------------
 
 
