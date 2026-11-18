@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,15 +45,46 @@ class HistoryData:
     units: dict[str, LedgerUnit] = field(default_factory=dict)  # unit path -> ledger row
     judged: dict[int, bool] | None = None  # record id -> managed; None before schema 5
     places: dict[int, tuple[gfs_store.Place, ...]] = field(default_factory=dict)
+    user_version: int | None = None  # PRAGMA user_version; None when there is no database
+    # (gfs job, from stage, to stage), stages counted from 1 -> run_at of the newest ok move
+    last_moves: dict[tuple[str, int, int], str] = field(default_factory=dict)
 
 
 def _tables(db) -> set[str]:
     return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def read_history(history: History) -> HistoryData:
+def _stage_case(column: str, stages: Sequence[Sequence[Path]]) -> tuple[str, list]:
+    """A SQL ``CASE`` giving the 1-based stage whose path holds ``column``, and its parameters."""
+    whens, params = [], []
+    for index, paths in enumerate(stages, 1):
+        for path in paths:
+            whens.append(f"WHEN substr({column}, 1, ?) = ? THEN {index}")
+            params += [len(str(path)) + 1, f"{path}/"]
+    return "CASE " + " ".join(whens) + " END", params
+
+
+def _last_moves(db, job: str, stages: Sequence[Sequence[Path]]) -> dict[tuple[str, int, int], str]:
+    """The newest ``run_at`` of an ok move of the gfs job, per (from stage, to stage), found with
+    one aggregate query; a path is matched to a stage by containment, as the stage figures do.
+    A step with no destination (the completion of an interrupted move) is left out."""
+    source, source_params = _stage_case("source", stages)
+    destination, destination_params = _stage_case("destination", stages)
+    rows = db.execute(  # the f-string holds the CASE built above: fixed text and placeholders
+        f"SELECT {source}, {destination}, MAX(run_at) FROM gfs_steps"  # noqa: S608
+        " WHERE gfs_job = ? AND action = 'move' AND outcome = 'ok' AND destination IS NOT NULL"
+        " GROUP BY 1, 2",
+        (*source_params, *destination_params, job),
+    )
+    return {(job, row[0], row[1]): row[2] for row in rows if row[0] and row[1]}
+
+
+def read_history(
+    history: History, stages: Mapping[str, Sequence[Sequence[Path]]] | None = None
+) -> HistoryData:
     """Read the history database; raises HistoryError when it cannot be read.
 
+    ``stages`` maps each gfs job to the paths of each of its stages, to find its last moves.
     Nothing is written or migrated: an older database simply lacks some tables, and the data
     that depends on them is empty.
     """
@@ -61,8 +93,13 @@ def read_history(history: History) -> HistoryData:
     gfs_runs: list[GfsRun] = []
     units: dict[str, LedgerUnit] = {}
     judged = None
+    last_moves: dict[tuple[str, int, int], str] = {}
     with history._connect() as db:
         tables = _tables(db)
+        user_version = db.execute("PRAGMA user_version").fetchone()[0]
+        if "gfs_steps" in tables:
+            for job, job_stages in (stages or {}).items():
+                last_moves.update(_last_moves(db, job, job_stages))
         records = tuple(
             BackupRecord(**dict(row))
             for row in db.execute("SELECT * FROM backup_runs WHERE status='success' ORDER BY id")
@@ -93,5 +130,5 @@ def read_history(history: History) -> HistoryData:
             }
     return HistoryData(
         records, running, history.last_runs(), tuple(gfs_runs), units, judged,
-        gfs_store.places(history),
+        gfs_store.places(history), user_version, last_moves,
     )

@@ -88,6 +88,39 @@ def _facts(job: Job, data: HistoryData) -> list[_Fact]:
     return facts
 
 
+def _unmanaged(job: Job, data: HistoryData) -> dict[str, list[int]]:
+    """``[units, bytes]`` of the records the gfs job does not manage, by reason (spec 4.5).
+
+    The rule is ``store.load``'s: ``no_checksum`` is a successful record under the first stage
+    with no unit or no checksum; ``unavailable`` is a record of one of the job's units that was
+    missing or replaced when GFS first judged it. A record not judged yet is not counted.
+    """
+    stages = job.params["stage"]
+    first = stages[0].paths[0]
+    paths = {path for stage in stages for path in stage.paths}
+    found = {"no_checksum": [0, 0], "unavailable": [0, 0]}
+    by_unit = defaultdict(list)
+    for record in data.records:
+        if record.unit and record.checksum:
+            by_unit[record.unit].append(record)
+        elif record.path and Path(record.path).is_relative_to(first):
+            found["no_checksum"][0] += 1
+            found["no_checksum"][1] += record.size_bytes or 0
+    for unit_text, records in by_unit.items():
+        row = data.units.get(unit_text)
+        if row is not None and row.deleted:
+            continue
+        if not Path(unit_text).is_relative_to(first) and (
+            row is None or not any(path in paths for path in row.stages)
+        ):
+            continue  # another gfs job's unit
+        for record in records:
+            if data.judged is not None and data.judged.get(record.id) is False:
+                found["unavailable"][0] += 1
+                found["unavailable"][1] += record.size_bytes or 0
+    return found
+
+
 def stage_figures(job: Job, data: HistoryData) -> list[tuple[int, int]]:
     """``(units, bytes)`` of each stage, in order, as the GFS report counts them."""
     figures = [[0, 0] for _ in job.params["stage"]]
@@ -204,7 +237,19 @@ class GfsCollector:
             })
             yield Sample(f.GFS_STAGE_UNITS, units, {"job_name": name, "stage": str(index)})
             yield Sample(f.GFS_STAGE_BYTES, size, {"job_name": name, "stage": str(index)})
+        for index, stage in enumerate(stages, 1):
+            yield Sample(f.GFS_STAGE_VERIFY, int(stage.verify),
+                         {"job_name": name, "stage": str(index)})
         yield from self._sources(job, ctx, facts)
+        for (moved_job, source, target), run_at in sorted(ctx.data.last_moves.items()):
+            if moved_job == name:
+                yield Sample(f.GFS_LAST_MOVE, epoch(run_at), {
+                    "job_name": name, "from_stage": str(source), "to_stage": str(target),
+                })
+        for reason, (count, size) in _unmanaged(job, ctx.data).items():
+            labels = {"job_name": name, "stage": "1", "reason": reason}
+            yield Sample(f.GFS_UNMANAGED_UNITS, count, labels)
+            yield Sample(f.GFS_UNMANAGED_BYTES, size, labels)
         for index, path in _destination_paths(job, ctx):
             marker = results.stat(path / MARKER)
             ready = 1 if marker is not None and S_ISREG(marker.st_mode) else 0

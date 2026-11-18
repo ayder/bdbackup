@@ -183,8 +183,12 @@ def collect_all(
         )
 
     history_ok = True
+    stages = {
+        job.name: [stage.paths for stage in job.params["stage"]]
+        for job in jobs.values() if job.active and job.type == "gfs"
+    }
     try:
-        data = read_history(history)
+        data = read_history(history, stages)
     except (HistoryError, OSError) as exc:
         fail("history", "", "unreadable", exc)
         history_ok, data = False, HistoryData()

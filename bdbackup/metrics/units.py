@@ -64,6 +64,8 @@ class HistoryUnitsCollector:
         return [StatRequest(path) for path in paths]
 
     def collect(self, job: Job | None, ctx: Context, results: Results) -> Iterator[Sample]:
+        if ctx.data.user_version is not None:  # the database is local: it never waits for a share
+            yield Sample(f.HISTORY_SCHEMA_VERSION, ctx.data.user_version)
         if results.probe_status(DESTINATION) not in (None, "ok"):
             return
         counts: dict[str, dict[str, int]] = {}
