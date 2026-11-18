@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from stat import S_ISREG
 from typing import TYPE_CHECKING
 
-from bdbackup.gfs.stages import MARKER, fed_first_stages
+from bdbackup.gfs.stages import MARKER
 from bdbackup.metrics import families as f
 from bdbackup.metrics.collector import Context, Request, Results, StatRequest
 from bdbackup.metrics.data import GFS_COUNTS, HistoryData
@@ -64,10 +64,23 @@ def stage_figures(job: Job, data: HistoryData) -> list[tuple[int, int]]:
     return [(units, size) for units, size in figures]
 
 
+def _fed_first_stages(jobs: Mapping[str, Job]) -> set[Path]:
+    """The first stage each pgbackrest job writes into, as the configuration stored it.
+
+    ``gfs.stages.fed_first_stages`` computes the same set but resolves each ``out_dir``, which
+    reads the share; the metrics process never does (D8).
+    """
+    return {
+        job.params["first_stage"]
+        for job in jobs.values()
+        if job.type == "pgbackrest" and "first_stage" in job.params
+    }
+
+
 def _destination_paths(job: Job, ctx: Context) -> list[tuple[int, Path]]:
     """``(stage index from 1, path)`` of every later stage path, and the first when fed."""
     stages = job.params["stage"]
-    fed = stages[0].paths[0] in fed_first_stages(ctx.jobs)
+    fed = stages[0].paths[0] in _fed_first_stages(ctx.jobs)
     return [
         (index, path)
         for index, stage in enumerate(stages, 1)

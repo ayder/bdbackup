@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 
 from bdbackup.metrics.collector import (
@@ -54,11 +55,6 @@ for i, request in enumerate(json.load(sys.stdin)):
     sys.stdout.write(json.dumps(line) + "\\n")
     sys.stdout.flush()
 """
-
-# Time a probe is still given to hand over what its child already wrote, when the deadline of
-# the run has passed while an earlier probe was waited on.
-_GRACE_SECONDS = 0.05
-
 
 def _child_argv() -> list[str]:
     """The command of a probe child; tests replace it with a child that hangs."""
@@ -117,49 +113,67 @@ def _close(child: subprocess.Popen) -> None:
             pass
 
 
+def _converse(group: list[Request], child: subprocess.Popen, deadline: float) -> tuple[dict, str]:
+    """Send ``child`` its requests and read its lines until ``deadline``; its answers and status."""
+    payload = json.dumps([_wire(request) for request in group]).encode()
+    timed_out = False
+    try:
+        output, _ = child.communicate(payload, timeout=max(deadline - time.monotonic(), 0.0))
+    except subprocess.TimeoutExpired as exc:
+        output, timed_out = exc.stdout, True
+        child.kill()  # and do not wait: on a hard mount it may not die until the I/O does
+    except OSError:
+        output = None
+        child.kill()
+    answers, well_formed = _parse(group, output)
+    complete = well_formed and len(answers) == len(group)
+    if timed_out:
+        status = "ok" if complete else "timeout"
+    else:
+        status = "ok" if complete and child.returncode == 0 else "failed"
+    _close(child)
+    return answers, status
+
+
 def run_probes(requests: list[Request], timeout_seconds: float) -> Results:
     """Run the requests in one child per probe, under one deadline; never raises.
 
-    ``Results.status`` says for each probe that ran whether it finished (``ok``), hit the
-    deadline (``timeout``; the lines it printed before are kept, the child is killed and not
-    waited for) or failed (it could not start, exited nonzero, printed something that is not a
-    line, or stopped before answering every request).
+    The children start first, and each is then talked to in a thread of its own, so a probe
+    that hangs cannot take the time another one needs (D10). ``Results.status`` says for each
+    probe that ran whether it finished (``ok``), hit the deadline (``timeout``; the lines it
+    printed before are kept, the child is killed and not waited for) or failed (it could not
+    start, exited nonzero, printed something that is not a line, or stopped before answering
+    every request).
     """
     deadline = time.monotonic() + timeout_seconds
     groups: dict[str, list[Request]] = {}
     for request in requests:
         groups.setdefault(request.probe, []).append(request)
-    answers: dict = {}
     status: dict[str, str] = {}
-    children = []
-    for name, group in groups.items():  # every child starts before any is waited on
+    children: dict[str, subprocess.Popen] = {}
+    for name in groups:
         try:
-            child = subprocess.Popen(  # noqa: S603
+            children[name] = subprocess.Popen(  # noqa: S603
                 _child_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, close_fds=True,
             )
         except (OSError, ValueError):
             status[name] = "failed"
-            continue
-        children.append((name, group, child))
-    for name, group, child in children:
-        payload = json.dumps([_wire(request) for request in group]).encode()
-        remaining = max(deadline - time.monotonic(), _GRACE_SECONDS)
-        timed_out = False
-        try:
-            output, _ = child.communicate(payload, timeout=remaining)
-        except subprocess.TimeoutExpired as exc:
-            output, timed_out = exc.stdout, True
-            child.kill()  # and do not wait: on a hard mount it may not die until the I/O does
-        except OSError:
-            output = None
-            child.kill()
-        got, well_formed = _parse(group, output)
-        answers.update(got)
-        complete = well_formed and len(got) == len(group)
-        if timed_out:
-            status[name] = "ok" if complete else "timeout"
+    outcomes: dict[str, tuple[dict, str]] = {}
+
+    def talk(name: str) -> None:
+        outcomes[name] = _converse(groups[name], children[name], deadline)
+
+    threads = [threading.Thread(target=talk, args=(name,), daemon=True) for name in children]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    answers: dict = {}
+    for name in groups:
+        if name in outcomes:
+            got, status[name] = outcomes[name]
+            answers.update(got)
         else:
-            status[name] = "ok" if complete and child.returncode == 0 else "failed"
-        _close(child)
+            status.setdefault(name, "failed")  # a thread that died is not an answer
     return Results(answers, status)
