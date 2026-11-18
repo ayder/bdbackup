@@ -96,7 +96,10 @@ class PgBackRest:
         ]
 
     def _run(self, cmd: list[str], name: str) -> str:
-        """Run ``cmd`` and return its stdout; a failure carries pgBackRest's last stderr line."""
+        """Run ``cmd`` and return its stdout; a failure carries pgBackRest's last stderr line.
+
+        A binary that cannot be started is a BackupError too, never an OSError.
+        """
         try:
             completed = subprocess.run(  # noqa: S603
                 cmd, check=True, capture_output=True, text=True
@@ -105,7 +108,21 @@ class PgBackRest:
             lines = (exc.stderr or "").strip().splitlines()
             detail = lines[-1].strip() if lines else f"exit status {exc.returncode}"
             raise BackupError(f"pgbackrest {name} failed: {detail}") from exc
+        except OSError as exc:
+            raise BackupError(self._start_failure(cmd[0], name, exc)) from exc
         return completed.stdout
+
+    @staticmethod
+    def _start_failure(binary: str, name: str, exc: OSError) -> str:
+        """The message for a pgBackRest command that could not be started."""
+        if isinstance(exc, FileNotFoundError):
+            return (
+                f"pgbackrest binary not found: {binary} "
+                "(set the job's binary key to its full path)"
+            )
+        if isinstance(exc, PermissionError):
+            return f"pgbackrest binary is not executable: {binary} (check its permissions)"
+        return f"pgbackrest {name} failed: {exc.strerror or exc}"
 
     def version(self) -> str:
         """The pgBackRest version, for example ``2.58.0`` from ``pgBackRest 2.58.0``."""
@@ -216,9 +233,11 @@ class PgBackRest:
         try:
             return call(), None
         except BackupError as exc:
+            # A binary that cannot be started is reported as the OS says it, as it always was
+            # here; ``run`` names the binary and the fix instead.
+            if isinstance(exc.__cause__, OSError):
+                return None, f"pgbackrest {name} failed: {exc.__cause__.strerror or exc.__cause__}"
             return None, str(exc)
-        except OSError as exc:  # the binary is missing or cannot be run
-            return None, f"pgbackrest {name} failed: {exc.strerror or exc}"
 
     def _binary_line(self) -> tuple[str, str]:
         found = shutil.which(self.binary)
