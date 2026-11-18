@@ -532,3 +532,24 @@ def test_a_first_stage_a_pgbackrest_job_writes_into_has_capacity_too(env, monkey
 
     assert by_path(collected, "bdbackup_destination_size_bytes").get(("1", first)) == 1000 * 4096
     assert by_path(collected, "bdbackup_destination_free_bytes").get(("1", first)) == 400 * 4096
+
+
+def test_the_schema_version_is_present_when_the_rest_of_the_history_is_unreadable(env):
+    touch_database(env)
+    sql(env, "PRAGMA user_version = 99")  # a newer schema than this bdbackup reads
+
+    collected = collect(env)
+
+    assert collected.errors == [MetricError("history", "", "unreadable")]
+    assert values(collected, "bdbackup_history_units", "job_name", "state") == {}
+    assert values(collected, "bdbackup_history_schema_version") == {(): 99}
+
+
+def test_there_is_no_schema_version_when_the_file_is_not_a_database(env):
+    env.database.parent.mkdir(parents=True, exist_ok=True)
+    env.database.write_bytes(b"this is not a sqlite database" * 50)
+
+    collected = collect(env)
+
+    assert collected.errors == [MetricError("history", "", "unreadable")]
+    assert values(collected, "bdbackup_history_schema_version") == {}
