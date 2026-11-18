@@ -30,6 +30,11 @@ class Refusal(Exception):
         self.reason = reason
 
 
+def final_name_exists(final: Path) -> Refusal:
+    """The refusal when a unit's final name is taken; the docs say how to clear it (D7)."""
+    return Refusal(f'final name exists: {final}; see docs/README_GFS.md, "Final name exists"')
+
+
 class Transport(Protocol):
     def copy(self, source: Path, temp: Path, on_file: Callable[[str, str], None]) -> None: ...
     def same_filesystem(self, a: Path, b: Path) -> bool: ...
@@ -112,14 +117,30 @@ class LocalTransport:
                 os.chmod(target_dir, stat.S_IMODE(here.lstat().st_mode))
 
     def same_filesystem(self, a: Path, b: Path) -> bool:
-        return False  # stub: no rename is offered yet
+        """Whether two live paths are on one device; a path that cannot be examined is not."""
+        try:
+            return os.stat(a).st_dev == os.stat(b).st_dev
+        except OSError:
+            return False
 
     def relocate(self, source: Path, final: Path) -> None:
-        pass  # stub: the runner does not call it yet
+        """Rename a unit to its final name on one filesystem, reading none of its data.
+
+        ``os.rename`` silently replaces a file or an empty directory, so a taken name is refused
+        first. It fails with EXDEV when the two paths are on different mounts of one device;
+        the caller then copies.
+        """
+        final.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(final):
+            raise final_name_exists(final)
+        os.rename(source, final)
+        _fsync_dir(final.parent)
+        if source.parent != final.parent:
+            _fsync_dir(source.parent)
 
     def rename(self, temp: Path, final: Path) -> None:
         if os.path.lexists(final):
-            raise Refusal(f"final name exists: {final}")
+            raise final_name_exists(final)
         os.rename(temp, final)
         _fsync_dir(final.parent)
 

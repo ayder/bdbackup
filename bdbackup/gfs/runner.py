@@ -6,6 +6,7 @@ the directory it leaves and the one it enters, and a busy lock defers the unit (
 
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
 from collections.abc import Callable
@@ -17,7 +18,14 @@ from uuid import uuid4
 
 from bdbackup.config import Config, Job
 from bdbackup.gfs import store
-from bdbackup.gfs.actions import LocalTransport, Refusal, Transport, copy_verified, verify
+from bdbackup.gfs.actions import (
+    LocalTransport,
+    Refusal,
+    Transport,
+    copy_verified,
+    final_name_exists,
+    verify,
+)
 from bdbackup.gfs.policy import Decision, Unit, decide
 from bdbackup.gfs.stages import MARKER, Stage, fed_first_stages
 from bdbackup.history import History, artifact_identity
@@ -173,6 +181,38 @@ class _Run:
         return replace(unit, locations=tuple(loc for loc in unit.locations
                                              if loc not in leftovers))
 
+    def renamable(self, unit, target: int) -> bool:
+        """A move is a rename when one path takes a one-location unit on the same filesystem.
+
+        Decided before anything is read, from the two stage paths (D6).
+        """
+        paths = self.stages[target].paths
+        return (len(paths) == 1 and len(unit.locations) == 1
+                and self.transport.same_filesystem(unit.locations[0].stage_path, paths[0]))
+
+    def rename(self, unit, stage_path: Path, final: Path) -> tuple[bool, store.ManagedUnit]:
+        """Move a unit by renaming it; ``False`` when the paths turn out to be on two mounts.
+
+        The source is verified under its own stage's flag, then under the engine locks the row
+        is recorded, the rename is done and the new location written (D6).
+        """
+        location = unit.locations[0]
+        self.verify(unit, location)
+        renamed = False
+        try:
+            with ExitStack() as stack:
+                _engine_locks(stack, unit, [location.path, final])
+                unit = self.ensure_row(unit)
+                self.transport.relocate(location.path, final)
+                renamed = True
+                store.record_move(
+                    self.history, unit.id, [store.Location(stage_path, final)],
+                    unit.locations, {final: _identities(unit, final)})
+        except OSError as exc:
+            if renamed or exc.errno != errno.EXDEV:
+                raise
+        return renamed, unit
+
     def move(self, unit, current: int, decision: Decision) -> None:
         target = decision.target
         finals = [path / unit.relative for path in self.stages[target].paths]
@@ -181,11 +221,19 @@ class _Run:
                 raise Refusal(f"destination not ready: {path}")
         for final in finals:
             if self.transport.exists(final):
-                raise Refusal(f"final name exists: {final}")
+                raise final_name_exists(final)
         if not self.apply:
             self.line("move", unit, current, target, decision.reason)
             return
         source = unit.locations[0].path
+        if self.renamable(unit, target):
+            renamed, unit = self.rename(unit, self.stages[target].paths[0], finals[0])
+            if renamed:
+                self.tally.moved += 1
+                self.tally.moved_bytes += unit.size
+                self.line("move", unit, current, target, f"{decision.reason}, renamed")
+                self.step(unit, "move", source, finals[0], "ok", decision.reason)
+                return
         for location in unit.locations[1:]:  # the source is hashed while it is copied
             self.verify(unit, location)
         temps: list[Path] = []
