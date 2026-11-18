@@ -11,6 +11,7 @@ from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
+from bdbackup.metrics.settings import MetricsSettings
 
 
 @dataclass
@@ -44,6 +45,7 @@ class Config:
         self.path = Path(path).expanduser().resolve()
         self.jobs: dict[str, Job] = {}
         self.history: HistorySettings | None = None
+        self.metrics: MetricsSettings | None = None
         self._load()
 
     def _load(self) -> None:
