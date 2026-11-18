@@ -151,7 +151,7 @@ def test_blocked_collectors_share_one_deadline(env, release):
     collected = run(config, jobs)
     elapsed = time.monotonic() - started
 
-    assert elapsed < 2.6  # one wait for the three, not three waits
+    assert elapsed < 4  # one wait for the three: three waits one after another take over 4.5 s
     assert sorted(collected.errors) == [
         MetricError("fake", name, "timeout") for name in ("f1", "f2", "f3")
     ]

@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -17,8 +18,10 @@ from click.testing import CliRunner
 
 from bdbackup.cli import main
 from bdbackup.engines import _reset_for_tests
+from bdbackup.metrics import probe
 from bdbackup.utils import process_lock
 from tests.pgbackrest_fake import fake_pgbackrest
+from tests.test_metrics_probe import hang_on_stat
 from tests.test_pgbackrest_cli import make_site
 
 RUN = "bdbackup.postgres.pgbackrest.subprocess.run"
@@ -162,6 +165,47 @@ def test_the_run_never_changes_the_history_the_stages_or_the_repository(tmp_path
 
     assert snapshot() == before
     assert metrics_file(tmp_path).exists()
+
+
+def test_a_probe_that_times_out_is_the_destination_error_and_the_lock_is_released(tmp_path):
+    site = metrics_site(tmp_path, metrics='[metrics]\npath = "metrics/bdbackup.prom"\n'
+                                          "timeout_seconds = 1\n")
+    children = []
+    real_popen = subprocess.Popen
+
+    def spying(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        return child
+
+    started = time.monotonic()
+    # A probe child that hangs before it answers a stat: nothing but the child is abandoned, so
+    # the command ends normally (a killed child leaves no thread behind).
+    with (
+        patch.object(probe, "_child_argv", lambda: [sys.executable, "-c", hang_on_stat(0)]),
+        patch.object(subprocess, "Popen", spying),
+    ):
+        first = invoke(site.config)
+    elapsed = time.monotonic() - started
+    for child in children:
+        child.wait(timeout=10)  # killed by the probe, reaped here
+
+    assert first.exit_code == 1, first.output
+    assert elapsed < 6
+    text = written(tmp_path)
+    assert lines(text, "bdbackup_metrics_success") == ["bdbackup_metrics_success 0"]
+    assert lines(text, "bdbackup_metrics_error") == [
+        'bdbackup_metrics_error{source="destination",job_name="",reason="timeout"} 1'
+    ]
+    ready = lines(text, "bdbackup_destination_ready")
+    assert ready and all(line.endswith(" 0") for line in ready)
+
+    second = invoke(site.config)  # the real child; and the lock was released
+
+    assert second.exit_code == 0, second.output
+    text = written(tmp_path)
+    assert lines(text, "bdbackup_metrics_success") == ["bdbackup_metrics_success 1"]
+    assert all(line.endswith(" 1") for line in lines(text, "bdbackup_destination_ready"))
 
 
 # ---- before the lock: only local files are read -----------------------------------------------
