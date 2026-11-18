@@ -24,6 +24,7 @@ from bdbackup.metrics.collector import (
 from bdbackup.metrics.data import HistoryData, read_history
 from bdbackup.metrics.gfs import GfsCollector
 from bdbackup.metrics.jobs import LAST_RUN_JOB_TYPES, JobCollector
+from bdbackup.metrics.probe import run_probes
 from bdbackup.metrics.registry import Registry, engine_prefix
 from bdbackup.metrics.render import Sample, render
 from bdbackup.metrics.units import HistoryUnitsCollector
@@ -116,7 +117,7 @@ def collect_all(
     *,
     now: datetime,
     timeout_seconds: int,
-    probe: Callable[[list[Request], int], Results],
+    probe: Callable[[list[Request], int], Results] = run_probes,
 ) -> Collected:
     """Collect every family; no collector can stop another.
 
