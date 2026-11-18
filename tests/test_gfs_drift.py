@@ -177,6 +177,23 @@ def test_what_bdbackup_writes_and_the_history_knows_is_not_unknown(env):
     assert lines(output) == []
 
 
+def test_the_entries_a_filesystem_or_an_appliance_keeps_are_not_unknown(env):
+    placed(env)
+    daily = env.root / "NFS/daily"
+    for where in (daily, daily / "files"):  # at the export root and below a directory above a unit
+        (where / "lost+found").mkdir()
+        (where / "lost+found" / "recovered").write_text("x")
+        (where / ".snapshot").mkdir()  # an appliance may show it in every directory
+        (where / ".snapshot" / "nightly").write_text("x")
+    (daily / "lost+found-not").write_text("x")  # the names are exact: this one is a stray
+
+    code, output, facts = run(env)
+
+    assert code == 0, output
+    assert stages(facts) == {**CLEAN, 2: (True, 0, 1)}
+    assert lines(output) == [f"Drift {env.abs('NFS/daily')}: 0 missing, 1 unknown"]
+
+
 # ---- unchecked stages --------------------------------------------------------------------------
 
 
