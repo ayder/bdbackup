@@ -9,10 +9,11 @@ from __future__ import annotations
 import errno
 import os
 import sqlite3
+from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack, closing
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -41,7 +42,10 @@ class RunOutcome:
     """
 
     locked: bool = False
-    facts: dict | None = None  # stub: nothing computes them yet
+    # The facts of a run that finished and was not a dry run (spec 16 section 6), for
+    # ``last_runs.facts``: ``computed_at``, the reason ``reasons``, the ``moves`` by method and
+    # the ``drift``. ``None`` for a dry run, a busy job lock and a run that raised.
+    facts: dict | None = None
 
 
 def job_lock_path(config: Config, name: str) -> Path:
@@ -64,6 +68,10 @@ class _Tally:
     deferred: int = 0
     refused: int = 0
     failed: int = 0
+    renamed: int = 0
+    copied: int = 0
+    # (stage from 1, 0 when not configured; outcome; reason class) -> units
+    reasons: Counter = field(default_factory=Counter)
     lines: list[str] = field(default_factory=list)
     snapshots: list[str] = field(default_factory=list)
 
@@ -100,8 +108,9 @@ def _identities(unit: store.ManagedUnit, at: Path) -> dict[int, str]:
 
 class _Run:
     def __init__(self, config: Config, job: Job, today, out, transport: Transport,
-                 dry_run: bool):
+                 dry_run: bool, outcome: RunOutcome | None = None):
         self.job = job
+        self.outcome = outcome
         self.stages: tuple[Stage, ...] = job.params["stage"]
         # A pgbackrest job writes into the first stage: it has a marker and a ledger snapshot.
         self.fed = self.stages[0].paths[0] in fed_first_stages(config.jobs)
@@ -114,6 +123,10 @@ class _Run:
         # Unit path -> (stage index or None once deleted, size) when the run ends (§4.6).
         self.where: dict[str, tuple[int | None, int]] = {}
         self.run_id: int | None = None
+
+    def count(self, outcome: str, reason_class: str, index: int | None) -> None:
+        """Count one unit that was ``outcome`` for ``reason_class``, in the stage ``index``."""
+        self.tally.reasons[(0 if index is None else index + 1, outcome, reason_class)] += 1
 
     def label(self, index: int | None) -> str:
         return str(self.stages[index].paths[0]) if index is not None else "-"
@@ -145,12 +158,14 @@ class _Run:
             self.where[str(unit.unit)] = (current, unit.size)
         record_id, started = backup
         self.tally.deferred += 1
+        self.count("deferred", "backup_running", current)
         self.line("defer", unit, current, None,
                   f"deferred: backup running (record {record_id}, started {started})")
         self.step(unit, "defer", None, None, "deferred", "backup running")
 
-    def refuse(self, unit, current, reason) -> None:
+    def refuse(self, unit, current, reason, reason_class: str = "other") -> None:
         self.tally.refused += 1
+        self.count("refused", reason_class, current)
         self.line("refused", unit, current, None, f"refused: {reason}")
         self.step(unit, "refuse", None, None, "refused", reason)
 
@@ -219,7 +234,7 @@ class _Run:
         finals = [path / unit.relative for path in self.stages[target].paths]
         for path in self.stages[target].paths:
             if not (path / MARKER).is_file():
-                raise Refusal(f"destination not ready: {path}")
+                raise Refusal(f"destination not ready: {path}", "destination_not_ready")
         for final in finals:
             if self.transport.exists(final):
                 raise final_name_exists(final)
@@ -230,6 +245,7 @@ class _Run:
         if self.renamable(unit, target):
             renamed, unit = self.rename(unit, self.stages[target].paths[0], finals[0])
             if renamed:
+                self.tally.renamed += 1
                 self.tally.moved += 1
                 self.tally.moved_bytes += unit.size
                 self.line("move", unit, current, target, f"{decision.reason}, renamed")
@@ -256,6 +272,7 @@ class _Run:
             for temp in temps:
                 if self.transport.exists(temp):
                     self.transport.remove(temp)
+        self.tally.copied += 1
         self.tally.moved += 1
         self.tally.moved_bytes += unit.size
         self.line("move", unit, current, target, decision.reason)
@@ -298,18 +315,21 @@ class _Run:
                 self.where[str(unit.unit)] = (None, unit.size)
             elif decision.action == "hold":
                 self.tally.held += 1
+                self.count("held", "period_incomplete", current)
                 self.line("hold", unit, current, None, decision.reason)
                 self.step(unit, "hold", None, None, "held", decision.reason)
             else:
                 self.ensure_row(unit)
         except Refusal as refusal:
-            self.refuse(unit, current, refusal.reason)
+            self.refuse(unit, current, refusal.reason, refusal.reason_class)
         except _Deferred:
             self.tally.deferred += 1
+            self.count("deferred", "locked", current)
             self.line("defer", unit, current, decision.target, "deferred: locked")
             self.step(unit, decision.action, None, None, "deferred", "locked")
         except Exception as exc:  # the next run retries; nothing was recorded as done
             self.tally.failed += 1
+            self.count("failed", "error", current)
             self.line("failed", unit, current, decision.target, f"failed: {exc}")
             for source, destination in self.paths(unit, decision):
                 self.step(unit, decision.action, source, destination, "failed",
@@ -352,7 +372,8 @@ class _Run:
                 self.defer_running(unit, indexes, running[unit.series])
                 continue
             if None in indexes or not indexes:
-                self.refuse(self.ensure_row(unit), None, "stage not configured")
+                self.refuse(self.ensure_row(unit), None, "stage not configured",
+                            "stage_not_configured")
                 continue
             current = max(indexes)
             self.where[str(unit.unit)] = (current, unit.size)
@@ -362,10 +383,11 @@ class _Run:
                 try:
                     unit = self.complete_interrupted(unit, current, leftovers)
                 except Refusal as refusal:
-                    self.refuse(unit, current, refusal.reason)
+                    self.refuse(unit, current, refusal.reason, refusal.reason_class)
                     continue
                 except _Deferred:
                     self.tally.deferred += 1
+                    self.count("deferred", "locked", current)
                     self.line("defer", unit, current, current, "deferred: locked")
                     continue
             placed[str(unit.unit)] = (unit, current)
@@ -384,11 +406,28 @@ class _Run:
             self.snapshot()
             if self.tally.failed != failed:
                 self.finish(unmanaged)
+            if self.outcome is not None:
+                self.outcome.facts = self.facts()
         self.report(unmanaged)
         return self.exit_code()
 
+    def facts(self) -> dict:
+        """What this run leaves for ``last_runs.facts`` (spec 16 section 6)."""
+        t = self.tally
+        return {
+            "computed_at": datetime.now(UTC).isoformat(),
+            "reasons": [
+                {"stage": stage, "outcome": outcome, "reason": reason, "units": units}
+                for (stage, outcome, reason), units in sorted(t.reasons.items())
+            ],
+            "moves": {"rename": t.renamed, "copy": t.copied},
+            "drift": [],
+        }
+
     def snapshot_failed(self, path: Path, reason) -> None:
         self.tally.failed += 1
+        self.count("failed", "snapshot", next(
+            (i for i, stage in enumerate(self.stages) if path in stage.paths), None))
         self.tally.snapshots.append(f"failed snapshot {path}: {reason}")
 
     def snapshot(self) -> None:
@@ -471,7 +510,9 @@ def run_job(config: Config, job: Job, *, now: datetime | None = None,
     today = (now or datetime.now()).date()
     try:
         with process_lock(job_lock_path(config, job.name)):
-            return _Run(config, job, today, out, transport or LocalTransport(), dry_run).run()
+            return _Run(
+                config, job, today, out, transport or LocalTransport(), dry_run, outcome
+            ).run()
     except BlockingIOError:
         if outcome is not None:
             outcome.locked = True

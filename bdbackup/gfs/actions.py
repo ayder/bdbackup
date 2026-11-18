@@ -22,17 +22,31 @@ from bdbackup.ledger import LedgerError, checksum
 _CHUNK = 1024 * 1024
 
 
-class Refusal(Exception):
-    """GFS will not act on this unit now; the reason is reported and recorded."""
+# The classes of a refusal (spec 16 section 6.1), fixed: metrics never parses the reason text.
+REFUSAL_CLASSES = (
+    "checksum_mismatch", "unexpected_entry", "missing_location", "stage_not_configured",
+    "destination_not_ready", "final_name_exists", "other",
+)
 
-    def __init__(self, reason: str):
+
+class Refusal(Exception):
+    """GFS will not act on this unit now; the reason is reported and recorded.
+
+    ``reason_class`` is one of ``REFUSAL_CLASSES``; a refusal that names none is ``other``.
+    """
+
+    def __init__(self, reason: str, reason_class: str = "other"):
         super().__init__(reason)
         self.reason = reason
+        self.reason_class = reason_class
 
 
 def final_name_exists(final: Path) -> Refusal:
     """The refusal when a unit's final name is taken; the docs say how to clear it (D7)."""
-    return Refusal(f'final name exists: {final}; see docs/README_GFS.md, "Final name exists"')
+    return Refusal(
+        f'final name exists: {final}; see docs/README_GFS.md, "Final name exists"',
+        "final_name_exists",
+    )
 
 
 class Transport(Protocol):
@@ -110,7 +124,10 @@ class LocalTransport:
                     relative = entry.relative_to(source).as_posix()
                     on_file(relative, self._copy_file(entry, target))
                 else:
-                    raise Refusal(f"unexpected entry {entry.relative_to(source).as_posix()}")
+                    raise Refusal(
+                        f"unexpected entry {entry.relative_to(source).as_posix()}",
+                        "unexpected_entry",
+                    )
             _fsync_dir(target_dir)
         for here, target_dir in reversed(directories):
             with self._mode_may_be_refused():
@@ -171,10 +188,10 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
     Inside a member only regular files and directories are allowed (spec 2 §2).
     """
     if not os.path.lexists(at):
-        raise Refusal(f"missing location {at}")
+        raise Refusal(f"missing location {at}", "missing_location")
     if unit.kind != "xtrabackup":
         if not stat.S_ISREG(at.lstat().st_mode):
-            raise Refusal(f"unexpected entry {at.name}")
+            raise Refusal(f"unexpected entry {at.name}", "unexpected_entry")
         return
     members = set(_member_paths(unit))
     fulls = {m for m in members if "/" not in m}
@@ -186,7 +203,7 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
             if any(relative == m or relative.startswith(m + "/") for m in members):
                 mode = entry.lstat().st_mode
                 if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                    raise Refusal(f"unexpected entry {relative}")
+                    raise Refusal(f"unexpected entry {relative}", "unexpected_entry")
                 continue
             parts = relative.split("/")
             if relative == ".full_success" and entry.is_file() and not entry.is_symlink():
@@ -198,7 +215,7 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
                 and (len(parts) == 1 or (len(parts) == 2 and parts[1].startswith("Full_")))
             ):
                 continue
-            raise Refusal(f"unexpected entry {relative}")
+            raise Refusal(f"unexpected entry {relative}", "unexpected_entry")
 
 
 def verify(unit: ManagedUnit, at: Path, *, checksums: bool = True) -> None:
@@ -214,11 +231,11 @@ def verify(unit: ManagedUnit, at: Path, *, checksums: bool = True) -> None:
         try:
             actual = checksum(at / relative if relative != "." else at)
         except LedgerError as exc:
-            raise Refusal(f"unexpected entry {exc}") from None
+            raise Refusal(f"unexpected entry {exc}", "unexpected_entry") from None
         except OSError:
-            raise Refusal(f"missing location {at / relative}") from None
+            raise Refusal(f"missing location {at / relative}", "missing_location") from None
         if actual != member.checksum:
-            raise Refusal("checksum mismatch")
+            raise Refusal("checksum mismatch", "checksum_mismatch")
 
 
 def _manifest(digests: dict[str, str], member: str) -> str:
@@ -243,7 +260,7 @@ def copy_verified(unit: ManagedUnit, source: Path, final: Path, transport: Trans
         transport.copy(source, temp, lambda name, digest: digests.__setitem__(name, digest))
         for member, relative in zip(unit.members, _member_paths(unit), strict=True):
             if _manifest(digests, relative) != member.checksum:
-                raise Refusal("checksum mismatch")
+                raise Refusal("checksum mismatch", "checksum_mismatch")
     except BaseException:
         if transport.exists(temp):
             transport.remove(temp)

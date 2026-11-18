@@ -122,6 +122,42 @@ def _unmanaged(job: Job, data: HistoryData) -> dict[str, list[int]]:
     return found
 
 
+def _count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _run_facts(name: str, ctx: Context) -> Iterator[Sample]:
+    """The facts of the gfs job's last finished run, from ``last_runs`` (spec 16 section 6).
+
+    They carry their own time: a later run that was locked or raised leaves them as they were.
+    Without a valid ``computed_at`` nothing is written, and an entry that is not well formed
+    is skipped; the facts are data the run wrote, and a bad one is no reason to lose the rest.
+    """
+    run = ctx.data.last_runs.get(name)
+    facts = run.facts if run is not None else None
+    if not isinstance(facts, dict):
+        return
+    try:
+        computed = epoch(facts["computed_at"])
+    except (KeyError, TypeError, ValueError):
+        return
+    yield Sample(f.GFS_FACTS_TIMESTAMP, computed, {"job_name": name})
+    counted: dict[tuple[str, str, str], int] = defaultdict(int)
+    for entry in facts.get("reasons") or ():
+        if (isinstance(entry, dict) and _count(entry.get("stage")) and _count(entry.get("units"))
+                and isinstance(entry.get("outcome"), str) and isinstance(entry.get("reason"), str)):
+            counted[(str(entry["stage"]), entry["outcome"], entry["reason"])] += entry["units"]
+    for (stage, outcome, reason), units in counted.items():
+        yield Sample(f.GFS_LAST_RUN_REASON_UNITS, units, {
+            "job_name": name, "stage": stage, "outcome": outcome, "reason": reason,
+        })
+    moves = facts.get("moves")
+    for method in ("rename", "copy"):
+        if isinstance(moves, dict) and _count(moves.get(method)):
+            yield Sample(f.GFS_LAST_RUN_MOVES, moves[method],
+                         {"job_name": name, "method": method})
+
+
 def stage_figures(job: Job, data: HistoryData) -> list[tuple[int, int]]:
     """``(units, bytes)`` of each stage, in order, as the GFS report counts them."""
     figures = [[0, 0] for _ in job.params["stage"]]
@@ -249,6 +285,7 @@ class GfsCollector:
             yield Sample(f.GFS_STAGE_VERIFY, int(stage.verify),
                          {"job_name": name, "stage": str(index)})
         yield from self._sources(job, ctx, facts)
+        yield from _run_facts(name, ctx)
         for (moved_job, source, target), run_at in sorted(ctx.data.last_moves.items()):
             if moved_job == name:
                 yield Sample(f.GFS_LAST_MOVE, epoch(run_at), {

@@ -398,6 +398,7 @@ def run(
             code = gfs_runner.run_job(
                 config, job, out=_echo, dry_run=dry_run, outcome=outcome.gfs
             )
+            outcome.facts = outcome.gfs.facts  # none for a busy lock, and a raise never gets here
             ctx.exit(code if code in (EXIT_OK, EXIT_LOCKED) else EXIT_BACKUP_FAILED)
     if job.type == "pgbackrest":
         outcome = _Outcome()
