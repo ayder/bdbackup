@@ -448,7 +448,9 @@ class _Run:
         try:
             units, _, _ = store.load(self.history, self.stages[0].paths[0],
                                      {path for stage in self.stages for path in stage.paths})
-            recorded = [Path(r.path) for r in self.history.records(successful=True) if r.path]
+            recorded: list[Path] = []
+            if self.history.settings.database.exists():  # none yet (a dry run on a fresh install)
+                recorded = [Path(r.path) for r in self.history.records(successful=True) if r.path]
             requests = []
             for _, path in destinations:
                 locations = [str(loc.path) for unit in units for loc in unit.locations
