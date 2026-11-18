@@ -10,6 +10,20 @@ from datetime import UTC
 from pathlib import Path
 
 
+def real_path(path: str | Path) -> Path:
+    """``path`` with ``~`` expanded and every link followed; this looks at the filesystem."""
+    return Path(path).expanduser().resolve()
+
+
+def lexical_path(path: str | Path) -> Path:
+    """``path`` with ``~`` expanded, made absolute and normalised, from its text alone.
+
+    It follows no link and makes no call on the filesystem, so a share that hangs cannot block
+    it (``bdbackup metrics`` reads its configuration this way).
+    """
+    return Path(os.path.normpath(os.path.abspath(Path(path).expanduser())))
+
+
 @contextmanager
 def process_lock(lock_path: str | Path):
     """Advisory process lock using fcntl (POSIX only).

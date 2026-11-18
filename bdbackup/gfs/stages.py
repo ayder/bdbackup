@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import calendar
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from bdbackup.utils import real_path
 
 if TYPE_CHECKING:
     from bdbackup.config import Job
@@ -66,7 +68,9 @@ class Stage:
     keep: Keep
 
 
-def _stage(index: int, table: object, base: Path, previous: Stage | None) -> Stage:
+def _stage(
+    index: int, table: object, base: Path, previous: Stage | None, resolve: Callable[[Path], Path]
+) -> Stage:
     if not isinstance(table, dict):
         raise ValueError("stage must be a non-empty array of tables")
     for key in table:
@@ -99,12 +103,18 @@ def _stage(index: int, table: object, base: Path, previous: Stage | None) -> Sta
             f'stage {index}: keep "{keep}" must be longer than "{previous.keep}" '
             "on every calendar"
         )
-    resolved = tuple((base / Path(p).expanduser()).resolve() for p in paths)
+    resolved = tuple(resolve(base / Path(p).expanduser()) for p in paths)
     return Stage(resolved, period, keep)
 
 
-def parse_gfs_job(section: Mapping[str, object], base: Path) -> dict[str, object]:
-    """Validate one gfs job table; errors omit the ``Job '<name>': `` prefix."""
+def parse_gfs_job(
+    section: Mapping[str, object], base: Path, resolve: Callable[[Path], Path] = real_path
+) -> dict[str, object]:
+    """Validate one gfs job table; errors omit the ``Job '<name>': `` prefix.
+
+    ``resolve`` turns each stage path into its final form: ``real_path`` follows links, and
+    ``utils.lexical_path`` only normalises.
+    """
     if set(section) - _JOB_KEYS:
         raise ValueError("a gfs job accepts only type, active and stage")
     tables = section.get("stage")
@@ -112,7 +122,7 @@ def parse_gfs_job(section: Mapping[str, object], base: Path) -> dict[str, object
         raise ValueError("stage must be a non-empty array of tables")
     stages: list[Stage] = []
     for index, table in enumerate(tables, 1):
-        stages.append(_stage(index, table, base, stages[-1] if stages else None))
+        stages.append(_stage(index, table, base, stages[-1] if stages else None, resolve))
     return {"stage": tuple(stages)}
 
 
@@ -120,7 +130,7 @@ def _overlap(a: Path, b: Path) -> bool:
     return a == b or a.is_relative_to(b) or b.is_relative_to(a)
 
 
-def _engine_output(job: Job) -> Path | None:
+def _engine_output(job: Job, resolve: Callable[[Path], Path] = real_path) -> Path | None:
     key = {
         "xtrabackup": "backup_root",
         "mysqldump": "out_dir",
@@ -128,10 +138,14 @@ def _engine_output(job: Job) -> Path | None:
         "pgbackrest": "out_dir",
     }.get(job.type)
     value = job.params.get(key) if key else None
-    return Path(value).expanduser().resolve() if value is not None else None
+    return resolve(Path(value)) if value is not None else None
 
 
-def check_gfs_config(jobs: Mapping[str, Job], history: HistorySettings | None) -> None:
+def check_gfs_config(
+    jobs: Mapping[str, Job],
+    history: HistorySettings | None,
+    resolve: Callable[[Path], Path] = real_path,
+) -> None:
     """Rules across jobs: stage paths, the history database and engine outputs."""
     gfs = [job for job in jobs.values() if job.type == "gfs"]
     all_paths = []
@@ -155,7 +169,7 @@ def check_gfs_config(jobs: Mapping[str, Job], history: HistorySettings | None) -
         first = job.params["stage"][0].paths[0]
         later = [p for stage in job.params["stage"][1:] for p in stage.paths]
         for other in jobs.values():
-            output = _engine_output(other)
+            output = _engine_output(other, resolve)
             if output is None:
                 continue
             for path in later:
@@ -176,12 +190,14 @@ def check_gfs_config(jobs: Mapping[str, Job], history: HistorySettings | None) -
                 )
 
 
-def pgbackrest_first_stage(job: Job, jobs: Mapping[str, Job]) -> Path:
+def pgbackrest_first_stage(
+    job: Job, jobs: Mapping[str, Job], resolve: Callable[[Path], Path] = real_path
+) -> Path:
     """The first stage path of the gfs job whose first stage holds the job's ``out_dir``.
 
     ``out_dir`` holds when it equals that path or lies below it.
     """
-    output = _engine_output(job)
+    output = _engine_output(job, resolve)
     if output is not None:
         for other in jobs.values():
             if other.type == "gfs":
