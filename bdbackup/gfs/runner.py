@@ -24,6 +24,17 @@ from bdbackup.history import History, artifact_identity
 from bdbackup.utils import process_lock
 
 
+@dataclass
+class RunOutcome:
+    """What ``run_job`` reports besides its exit code.
+
+    ``locked`` is set when exit code 3 means another run of the job holds its lock, as opposed
+    to a run that finished with deferred units.
+    """
+
+    locked: bool = False
+
+
 def job_lock_path(config: Config, name: str) -> Path:
     """One run per gfs job: a lock file beside the live history database."""
     return Path(f"{config.history.database}.gfs-{name}.lock")
@@ -396,7 +407,7 @@ class _Run:
 
 def run_job(config: Config, job: Job, *, now: datetime | None = None,
             out: Callable[[str], None] = print, transport: Transport | None = None,
-            dry_run: bool = False) -> int:
+            dry_run: bool = False, outcome: RunOutcome | None = None) -> int:
     """Run one gfs job; return 0, 1 (a failure or refusal) or 3 (locked or deferred only).
 
     A dry run reports what would change and changes nothing.

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import errno
+import gc
 import hashlib
 import json
 import logging
 import os
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,7 +20,7 @@ from click.testing import CliRunner
 from bdbackup.cli import main
 from bdbackup.engines import _reset_for_tests
 from bdbackup.gfs.stages import MARKER
-from bdbackup.history import History, HistorySettings
+from bdbackup.history import History, HistoryError, HistorySettings
 from bdbackup.postgres import PgBackRest, pgbackrest
 from bdbackup.utils import process_lock
 from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo
@@ -90,6 +92,10 @@ class Site:
         if not (self.root / "state" / "history.sqlite3").exists():
             return []
         return self.history.records(job="pg")
+
+    def last_run(self):
+        """The ``last_runs`` row of job ``pg``; ``None`` before a run records one."""
+        return self.history.last_runs().get("pg")
 
     def run(self, *args: str, now: datetime = SOON):
         """Invoke ``run -j pg`` with pgBackRest faked and the clock at ``now``."""
@@ -501,3 +507,193 @@ def test_validate_still_reports_the_os_error_for_a_binary_that_cannot_run(
     assert f"[FAIL] pgbackrest version failed: {reason}" in lines
     assert f"[FAIL] pgbackrest info failed: {reason}" in lines
     assert "Traceback" not in result.output
+
+
+# ---- the outcome of each run, kept for the metrics command ------------------------------------
+
+
+def last_run(site):
+    row = site.last_run()
+    assert row is not None, "the run recorded no last_runs row"
+    return row
+
+
+def exported_facts(site, phases):
+    return {
+        "phases": phases,
+        "label": NEWEST,
+        "bytes": site.unit.stat().st_size,
+        "full_age_seconds": 9000,  # the fake stops a full a minute after its label; SOON is later
+    }
+
+
+def test_last_run_of_an_export_has_its_outcome_and_facts(tmp_path):
+    site = make_site(tmp_path)
+    ticks = iter([10.0, 12.5, 20.0, 23.0])  # write 2.5 seconds, read-back 3.0
+
+    with patch.object(pgbackrest, "_clock", lambda: next(ticks)):
+        result = site.run()
+
+    assert result.exit_code == 0, result.output
+    row = last_run(site)
+    assert (row.job_type, row.result, row.exit_code) == ("pgbackrest", "exported", 0)
+    assert row.facts == exported_facts(site, {"write": 2.5, "verify": 3.0})
+    assert datetime.fromisoformat(row.finished_at).utcoffset() == timedelta(0)
+
+
+def test_last_run_of_an_export_without_verify_has_no_verify_phase(tmp_path):
+    site = make_site(tmp_path)
+    ticks = iter([10.0, 12.5])
+
+    with patch.object(pgbackrest, "_clock", lambda: next(ticks)):
+        result = site.run("--no-verify")
+
+    assert result.exit_code == 0, result.output
+    assert last_run(site).facts == exported_facts(site, {"write": 2.5})
+
+
+def test_last_run_of_no_new_full_keeps_the_last_exports_facts(tmp_path):
+    site = make_site(tmp_path)
+    assert site.run().exit_code == 0
+    exported = last_run(site)
+
+    second = site.run()
+
+    assert second.exit_code == 0, second.output
+    row = last_run(site)
+    assert (row.result, row.exit_code) == ("no_new_full", 0)
+    assert row.facts == exported.facts
+    assert row.facts is not None
+
+
+def test_last_run_of_a_full_too_old_has_its_result_and_exit_code(tmp_path):
+    site = make_site(tmp_path, extra="max_full_age_hours = 26\n")
+    assert site.run().exit_code == 0
+    exported = last_run(site)
+
+    late = site.run(now=STOP + timedelta(hours=30))
+
+    assert late.exit_code == 1, late.output
+    row = last_run(site)
+    assert (row.result, row.exit_code) == ("full_too_old", 1)
+    assert row.facts == exported.facts
+
+
+def test_last_run_of_a_busy_lock_is_locked(tmp_path):
+    site = make_site(tmp_path)
+
+    with process_lock(site.lock_file):
+        result = site.run()
+
+    assert result.exit_code == 3, result.output
+    row = last_run(site)
+    assert (row.job_type, row.result, row.exit_code, row.facts) == ("pgbackrest", "locked", 3, None)
+
+
+def test_last_run_of_a_missing_marker_is_destination_not_ready(tmp_path):
+    site = make_site(tmp_path, marker=False)
+
+    result = site.run()
+
+    assert result.exit_code == 1, result.output
+    row = last_run(site)
+    assert (row.result, row.exit_code, row.facts) == ("destination_not_ready", 1, None)
+
+
+def test_last_run_of_a_full_disk_is_export_failed(tmp_path, monkeypatch):
+    site = make_site(tmp_path)
+    original = pgbackrest._HashingWriter.write
+    calls = []
+
+    def fail_first_write(self, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        return original(self, data)
+
+    monkeypatch.setattr(pgbackrest._HashingWriter, "write", fail_first_write)
+
+    result = site.run()
+    gc.collect()
+
+    assert result.exit_code == 1, result.output
+    row = last_run(site)
+    assert (row.result, row.exit_code, row.facts) == ("export_failed", 1, None)
+
+
+def test_last_run_of_a_failed_read_back_is_verify_failed(tmp_path, monkeypatch):
+    site = make_site(tmp_path)
+
+    def eio(self, *args):
+        raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+    monkeypatch.setattr(pgbackrest._HashingReader, "read", eio)
+
+    result = site.run()
+
+    assert result.exit_code == 1, result.output
+    row = last_run(site)
+    assert (row.result, row.exit_code, row.facts) == ("verify_failed", 1, None)
+
+
+@pytest.mark.parametrize("failing", ["info", "version"])
+def test_last_run_of_a_failing_pgbackrest_command_is_failed(tmp_path, failing):
+    site = make_site(tmp_path)
+    fake = fake_pgbackrest(site.repo)
+
+    def run(cmd, **kwargs):
+        if cmd[1:] and failing in cmd:
+            raise subprocess.CalledProcessError(55, cmd, output="", stderr="ERROR: [055]: no\n")
+        return fake(cmd, **kwargs)
+
+    with patch(RUN, run):
+        result = run_unfaked(site)
+
+    assert result.exit_code == 1, result.output
+    row = last_run(site)
+    assert (row.result, row.exit_code, row.facts) == ("failed", 1, None)
+
+
+def test_last_run_of_a_usage_error_is_failed_with_exit_code_2(tmp_path):
+    site = make_site(tmp_path)
+
+    with patch("bdbackup.cli.build_backend", side_effect=ValueError("bad setting")):
+        result = run_unfaked(site)
+
+    assert result.exit_code == 2, result.output
+    row = last_run(site)
+    assert (row.result, row.exit_code) == ("failed", 2)
+
+
+def test_a_dry_run_leaves_the_last_run_alone(tmp_path):
+    site = make_site(tmp_path)
+    assert site.run().exit_code == 0
+    before = last_run(site)
+
+    dry = site.run("--dry-run", now=STOP + timedelta(hours=30))
+
+    assert dry.exit_code == 0, dry.output
+    assert site.last_run() == before
+
+
+@pytest.mark.parametrize(
+    "error", [HistoryError("disk full"), OSError("read-only")], ids=["history", "os"]
+)
+@pytest.mark.parametrize(("marker", "code"), [(True, 0), (False, 1)], ids=["exported", "refused"])
+def test_a_last_run_recording_failure_is_a_warning_and_changes_nothing_else(
+    tmp_path, caplog, marker, code, error
+):
+    site = make_site(tmp_path, marker=marker)
+    caplog.set_level(logging.WARNING)
+
+    with patch.object(History, "record_last_run", side_effect=error):
+        result = site.run()
+
+    assert result.exit_code == code, result.output
+    assert ("Job pg:" in result.output) == (code == 0)
+    warnings = [
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == "bdbackup.cli"
+    ]
+    assert len(warnings) == 1, caplog.text
+    assert "last run" in warnings[0].getMessage()
+    assert str(error) in warnings[0].getMessage()
