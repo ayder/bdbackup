@@ -12,6 +12,8 @@ bdbackup, so it starts fast and cannot import a share-bound module.
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,16 +24,87 @@ from pathlib import Path
 # of the ledger snapshot, the recorded locations to look at, and every path the ledger knows
 # below the stage path. ``check`` is the whole of it; the tests run it in-process.
 CHILD_SOURCE = r'''
-import json, sys
+import json, os, stat, sys
+
+LOCK = ".bdbackup.lock"
+TEMP = ".gfs-tmp-"
+
+
+def device_of(path):
+    return os.lstat(path).st_dev
+
+
+def own_temporary(name):
+    # bdbackup's own temporary names: a GFS copy, and a pgbackrest export's tar before its rename.
+    return name.startswith(TEMP) or (name.startswith(".") and ".tar.tmp-" in name)
+
+
+def walk(root, known, ancestors, skip_at_root):
+    """The entries below ``root`` that are neither known nor a directory above a known path.
+
+    It never follows a symlink and never enters another device: a directory whose device is
+    not the root's counts as one entry. An unknown entry is one entry, whatever it holds.
+    """
+    unknown = 0
+    device = device_of(root)
+    pending = [(root, True)]
+    while pending:
+        directory, top = pending.pop()
+        with os.scandir(directory) as scan:
+            for entry in scan:
+                name = entry.name
+                path = os.path.join(directory, name)
+                if name == LOCK or own_temporary(name) or (top and name in skip_at_root):
+                    continue
+                if path in known:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if device_of(path) != device:
+                        unknown += 1
+                    elif path in ancestors:
+                        pending.append((path, False))
+                    else:
+                        unknown += 1
+                else:
+                    unknown += 1
+    return unknown
 
 
 def check(request):
-    return {"checked": False, "problem": "stub: nothing is checked yet"}
+    """``{"checked": True, "missing": n, "unknown": m}``, or why the path was not checked."""
+    root = request["path"]
+    try:
+        marker = os.stat(os.path.join(root, request["marker"]))
+    except (FileNotFoundError, NotADirectoryError):
+        return {"checked": False, "problem": "no marker"}
+    except OSError as exc:
+        return {"checked": False, "problem": "error: " + (exc.strerror or str(exc))}
+    if not stat.S_ISREG(marker.st_mode):
+        return {"checked": False, "problem": "no marker"}
+    try:
+        missing = 0
+        for location in request["locations"]:
+            try:
+                os.lstat(location)
+            except (FileNotFoundError, NotADirectoryError):
+                missing += 1
+        known = set(request["known"])
+        ancestors = set()
+        for path in known:
+            parent = os.path.dirname(path)
+            while parent.startswith(root + os.sep) and parent not in ancestors:
+                ancestors.add(parent)
+                parent = os.path.dirname(parent)
+        unknown = walk(root, known, ancestors, {request["marker"], request["snapshot"]})
+    except OSError as exc:
+        return {"checked": False, "problem": "error: " + (exc.strerror or str(exc))}
+    return {"checked": True, "missing": missing, "unknown": unknown}
 
 
 def main():
     for i, request in enumerate(json.load(sys.stdin)):
-        sys.stdout.write(json.dumps(dict(check(request), i=i)) + "\n")
+        line = dict(check(request), i=i)
+        sys.stdout.write(json.dumps(line) + "\n")
         sys.stdout.flush()
 
 
@@ -91,5 +164,45 @@ def _result(request: DriftRequest, line: dict) -> DriftResult:
 
 
 def run_child(requests: list[DriftRequest], timeout_seconds: float) -> list[DriftResult]:
-    """Stub: nothing is checked yet."""
-    return [DriftResult(r.path, False, problem="stub: nothing is checked yet") for r in requests]
+    """Check each request in one child under one deadline; never raises.
+
+    A request the child did not answer before the deadline is ``timeout``: the child is killed
+    and not waited for, as a hard mount may not release it until its I/O ends. A child that
+    cannot start, or that stops early, leaves its unanswered requests with an ``error``.
+    """
+    if not requests:
+        return []
+    payload = json.dumps([_wire(request) for request in requests]).encode()
+    timed_out = False
+    try:
+        child = subprocess.Popen(  # noqa: S603
+            _child_argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, close_fds=True,
+        )
+    except (OSError, ValueError) as exc:
+        return [DriftResult(r.path, False, problem=f"error: {exc}") for r in requests]
+    try:
+        output, _ = child.communicate(payload, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        output, timed_out = exc.stdout, True
+        child.kill()
+    except OSError:
+        output = None
+        child.kill()
+    for pipe in (child.stdin, child.stdout):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except OSError:
+            pass
+    answered: dict[int, DriftResult] = {}
+    text = output.decode("utf-8", "replace") if isinstance(output, bytes) else (output or "")
+    for raw in text.split("\n")[:-1]:  # what follows the last newline is incomplete or empty
+        try:
+            line = json.loads(raw)
+            answered[line["i"]] = _result(requests[line["i"]], line)
+        except (ValueError, KeyError, TypeError, IndexError):
+            break
+    why = "timeout" if timed_out else "error: the drift check ended early"
+    return [answered.get(i) or DriftResult(r.path, False, problem=why)
+            for i, r in enumerate(requests)]

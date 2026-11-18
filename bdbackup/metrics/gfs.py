@@ -151,6 +151,15 @@ def _run_facts(name: str, ctx: Context) -> Iterator[Sample]:
         yield Sample(f.GFS_LAST_RUN_REASON_UNITS, units, {
             "job_name": name, "stage": stage, "outcome": outcome, "reason": reason,
         })
+    drifted: dict[int, tuple[int, int]] = {}
+    for entry in facts.get("drift") or ():  # only a stage the run could check has a number
+        if (isinstance(entry, dict) and _count(entry.get("stage")) and entry.get("checked") is True
+                and _count(entry.get("missing")) and _count(entry.get("unknown"))):
+            drifted[entry["stage"]] = (entry["missing"], entry["unknown"])
+    for stage, (missing, unknown) in drifted.items():
+        labels = {"job_name": name, "stage": str(stage)}
+        yield Sample(f.GFS_DRIFT_MISSING, missing, labels)
+        yield Sample(f.GFS_DRIFT_UNKNOWN, unknown, labels)
     moves = facts.get("moves")
     for method in ("rename", "copy"):
         if isinstance(moves, dict) and _count(moves.get(method)):

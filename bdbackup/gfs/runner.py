@@ -27,11 +27,12 @@ from bdbackup.gfs.actions import (
     final_name_exists,
     verify,
 )
-from bdbackup.gfs.drift import Drift
+from bdbackup.gfs.drift import Drift, DriftRequest, DriftResult
 from bdbackup.gfs.drift import run_child as run_drift
 from bdbackup.gfs.policy import Decision, Unit, decide
 from bdbackup.gfs.stages import MARKER, Stage, fed_first_stages
 from bdbackup.history import History, artifact_identity
+from bdbackup.metrics.settings import DEFAULT_TIMEOUT_SECONDS
 from bdbackup.utils import process_lock
 
 
@@ -75,6 +76,7 @@ class _Tally:
     # (stage from 1, 0 when not configured; outcome; reason class) -> units
     reasons: Counter = field(default_factory=Counter)
     lines: list[str] = field(default_factory=list)
+    drift: list[str] = field(default_factory=list)  # the report's Drift lines
     snapshots: list[str] = field(default_factory=list)
 
 
@@ -114,7 +116,11 @@ class _Run:
                  drift: Drift = run_drift):
         self.job = job
         self.outcome = outcome
-        self.drift = drift  # stub: nothing calls it yet
+        self.drift = drift
+        # The drift check has the deadline of a metrics run: [metrics] timeout_seconds, or 60.
+        self.drift_timeout = (config.metrics.timeout_seconds if config.metrics is not None
+                              else DEFAULT_TIMEOUT_SECONDS)
+        self.drift_facts: list[dict] = []
         self.stages: tuple[Stage, ...] = job.params["stage"]
         # A pgbackrest job writes into the first stage: it has a marker and a ledger snapshot.
         self.fed = self.stages[0].paths[0] in fed_first_stages(config.jobs)
@@ -404,6 +410,7 @@ class _Run:
         for decision in sorted(decisions, key=lambda d: (d.unit.day, str(d.unit.id))):
             unit, current = placed[decision.unit.id]
             self.act(unit, current, decision)
+        self.check_drift()  # what the run leaves behind, before the snapshot is taken
         if self.apply:
             # The live row stays running through the snapshot step, so a run stuck there shows in
             # running_since. The local copy that goes to every stage gets the finished row
@@ -426,8 +433,62 @@ class _Run:
                 for (stage, outcome, reason), units in sorted(t.reasons.items())
             ],
             "moves": {"rename": t.renamed, "copy": t.copied},
-            "drift": [],
+            "drift": self.drift_facts,
         }
+
+    def check_drift(self) -> None:
+        """Compare the destination stage paths with the ledger (spec 16 section 6.3).
+
+        The later stage paths, and the first when a pgbackrest job writes into it, are checked
+        in a child under one deadline. Nothing here raises, changes the exit code or blocks an
+        action: a stage that could not be checked is reported and left out of the facts' counts.
+        """
+        destinations = [(index, path) for index, stage in enumerate(self.stages, 1)
+                        if index > 1 or self.fed for path in stage.paths]
+        try:
+            units, _, _ = store.load(self.history, self.stages[0].paths[0],
+                                     {path for stage in self.stages for path in stage.paths})
+            recorded = [Path(r.path) for r in self.history.records(successful=True) if r.path]
+            requests = []
+            for _, path in destinations:
+                locations = [str(loc.path) for unit in units for loc in unit.locations
+                             if loc.stage_path == path]
+                known = {*locations, *(str(r) for r in recorded if r.is_relative_to(path))}
+                requests.append(DriftRequest(path, MARKER, snapshot_name(self.job),
+                                             tuple(locations), tuple(sorted(known))))
+            results = self.drift(requests, self.drift_timeout)
+            if len(results) != len(requests):
+                raise RuntimeError("the drift check answered for the wrong stage paths")
+        except Exception as exc:
+            results = [DriftResult(path, False, problem=f"failed: {exc}")
+                       for _, path in destinations]
+        timed_out = False
+        for result in results:
+            if result.checked:
+                if result.missing or result.unknown:
+                    self.tally.drift.append(f"Drift {result.path}: {result.missing} missing, "
+                                            f"{result.unknown} unknown")
+            elif result.problem == "timeout":
+                if not timed_out:  # one line for every path the deadline cut off
+                    self.tally.drift.append(
+                        f"drift not checked: timeout after {self.drift_timeout} s")
+                timed_out = True
+            elif result.problem.startswith("error: "):
+                self.tally.drift.append(
+                    f"drift not checked: {result.path}: {result.problem[len('error: '):]}")
+            elif result.problem.startswith("failed: "):
+                if not any(line.startswith("drift not checked") for line in self.tally.drift):
+                    why = result.problem[len("failed: "):]
+                    self.tally.drift.append(f"drift not checked: {why}")
+        self.drift_facts = []
+        for index in sorted({index for index, _ in destinations}):
+            here = [r for (i, _), r in zip(destinations, results, strict=True) if i == index]
+            checked = all(r.checked for r in here)
+            self.drift_facts.append({
+                "stage": index, "checked": checked,
+                "missing": sum(r.missing for r in here) if checked else 0,
+                "unknown": sum(r.unknown for r in here) if checked else 0,
+            })
 
     def snapshot_failed(self, path: Path, reason) -> None:
         self.tally.failed += 1
@@ -504,6 +565,8 @@ class _Run:
             units = "unit" if len(sizes) == 1 else "units"
             note = "" if stage.verify else ", checksums not re-read"
             self.out(f"Stage {stage.paths[0]}: {len(sizes)} {units} ({sum(sizes)} bytes){note}")
+        for line in t.drift:
+            self.out(line)
         for line in t.snapshots:
             self.out(line)
 
