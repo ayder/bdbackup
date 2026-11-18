@@ -118,6 +118,19 @@ def test_a_symlink_is_an_entry_and_is_not_followed(env):
     assert stages(facts)[2] == (True, 0, 2)  # the two links, not what they point at
 
 
+def test_a_symlink_above_a_recorded_location_is_one_entry_and_is_not_followed(env):
+    placed(env)
+    files = env.root / "NFS/daily/files"
+    files.rename(env.root / "moved-files")
+    files.symlink_to(env.root / "moved-files", target_is_directory=True)
+
+    _, _, facts = run(env)
+
+    # The location is there through the link, so it is not missing; the link is not a directory
+    # above a unit, since the walk does not follow it: it is one unknown entry.
+    assert stages(facts)[2] == (True, 0, 1)
+
+
 def request_for(env, **overrides):
     """A check of NFS/daily after one run, for the child's code run in-process."""
     daily = env.abs("NFS/daily")
