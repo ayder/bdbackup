@@ -18,14 +18,14 @@ from bdbackup.engines import EngineInfo, _reset_for_tests, get_engine, list_engi
 from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History
 from bdbackup.metrics import probe
-from bdbackup.metrics.collector import ListPrefixRequest, MetricError
+from bdbackup.metrics.collector import DESTINATION, ListPrefixRequest, MetricError, Results
 from bdbackup.metrics.probe import CHILD_SOURCE, run_probes
 from bdbackup.metrics.render import Sample
 from bdbackup.metrics.run import collect_all
 from bdbackup.postgres import PgBackRest
 from tests.pgbackrest_fake import fake_pgbackrest, info_json, missing_stanza_info
 from tests.test_metrics_collect import FakeCollector, values
-from tests.test_metrics_probe import hang_on_stat
+from tests.test_metrics_probe import PACKAGE, hang_on_stat, runtime_imports
 from tests.test_pgbackrest_cli import NEWEST, SOON, make_site
 
 RUN = "bdbackup.postgres.pgbackrest.subprocess.run"
@@ -665,3 +665,44 @@ def test_the_collector_asks_for_one_directory_and_scans_nothing_in_the_parent(tm
         (directory.resolve(), f"{SEGMENT}-", "repository")
     ]
     assert not [path for path in scanned if str(site.repo) in str(path)]
+
+
+# ---- the parent touches no filesystem (D8): pinned, as the collector keeps it so ---------------
+
+
+def test_collecting_a_pgbackrest_job_makes_no_call_on_a_stage_or_the_repository(tmp_path):
+    site, _ = wal_site(tmp_path)
+    document = info_json(site.repo, "main")  # the fake reads the repository; not watched
+    config = Config(site.config)  # loading resolves paths; collecting must not
+    history = History(config.history)
+    roots = (str(site.root / "STAGE1"), str(site.repo))
+    calls = []
+
+    def watching(name):
+        real = getattr(os, name)
+
+        def wrapper(path, *args, **kwargs):
+            if isinstance(path, str | bytes | os.PathLike) and os.fsdecode(path).startswith(roots):
+                calls.append((name, os.fsdecode(path)))
+            return real(path, *args, **kwargs)
+
+        return wrapper
+
+    answered = Results({}, {DESTINATION: "ok", "repository": "ok"})
+    with patch.multiple(os, **{n: watching(n) for n in ("stat", "lstat", "readlink", "scandir")}):
+        with patch(RUN, scripted(document)):
+            collected = collect_all(
+                config.jobs, history, now=NOW, timeout_seconds=5,
+                probe=lambda requests, timeout: answered,
+            )
+
+    assert calls == []
+    assert wal(collected, "max_segment") == {("pg", "main", "1"): 255}  # the whole path ran
+    assert repo_series(collected, "backups", "type")
+
+
+def test_the_pgbackrest_collector_imports_neither_config_nor_cli_at_runtime():
+    imported = runtime_imports(PACKAGE / "postgres" / "metrics.py")
+
+    assert not {"bdbackup.config", "bdbackup.cli"} & imported
+    assert "subprocess" not in imported
