@@ -421,7 +421,8 @@ bdbackup_job_last_run_exit_code != 0
 # The last successful pgbackrest export is older than 26 hours.
 time() - bdbackup_job_last_success_timestamp_seconds{job_type="pgbackrest"} > 26 * 3600
 
-# An export or a GFS run has been running for more than 6 hours (a stuck or killed run).
+# An export or a GFS run has been running for more than 6 hours: a stuck run, a GFS run hung in its
+# ledger copy step, or a killed export (a killed GFS run is marked failed by the job's next run).
 time() - bdbackup_job_running_since_timestamp_seconds > 6 * 3600
 
 # A destination is not ready.
