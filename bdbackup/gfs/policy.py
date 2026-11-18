@@ -46,6 +46,21 @@ def _bucket_label(day: date, period: str) -> str:
     return str(day.year)
 
 
+def bucket_span(day: date, period: str) -> tuple[date, date]:
+    """The first and last day of the bucket of ``period`` that holds ``day``.
+
+    A bucket is the day itself (``daily``), its ISO week, its month or its year.
+    """
+    if period == "daily":
+        return day, day
+    if period == "weekly":
+        first = day - timedelta(days=day.weekday())
+        return first, first + timedelta(days=6)
+    if period == "monthly":
+        return day.replace(day=1), day.replace(day=calendar.monthrange(day.year, day.month)[1])
+    return date(day.year, 1, 1), date(day.year, 12, 31)
+
+
 def _eligibility(
     units: Sequence[Unit], today: date,
 ) -> tuple[dict[str, set[object]], Callable[[date, str], str | None]]:
