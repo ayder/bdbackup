@@ -24,6 +24,7 @@ from bdbackup.backends import BackupError, BackupResult
 from bdbackup.engines import EngineInfo
 from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History
+from bdbackup.postgres.metrics import PgBackRestCollector
 from bdbackup.postgres.repository import (
     ENCRYPTED,
     LABEL,
@@ -614,4 +615,5 @@ ENGINE = EngineInfo(
     backend=PgBackRest,
     description="pgBackRest full backups exported as one tar",
     family="postgres",
+    metrics=PgBackRestCollector(),
 )

@@ -46,6 +46,16 @@ def _isolate_registry(monkeypatch, tmp_path):
     _reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_pgbackrest(monkeypatch):
+    """A pgbackrest job is collected with ``pgbackrest info``; never run a real binary here."""
+
+    def refuse(cmd, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+    monkeypatch.setattr("bdbackup.postgres.pgbackrest.subprocess.run", refuse)
+
+
 @pytest.fixture
 def env(tmp_path):
     return Env(tmp_path)

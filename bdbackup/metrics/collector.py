@@ -112,12 +112,19 @@ class MetricError(NamedTuple):
 
 @dataclass(frozen=True)
 class Context:
-    """What every collector reads: the clock, the configured jobs and the history, read once."""
+    """What every collector reads: the clock, the configured jobs and the history, read once.
+
+    ``timeout_seconds`` is ``[metrics] timeout_seconds``: the limit of a command a collector runs.
+    ``scratch`` is memory for one run, which a collector may use to hand what its ``probes`` call
+    found to its ``collect`` call (an engine's command output, say); key it by engine and job.
+    """
 
     now: datetime
     jobs: Mapping[str, Job]
     history: History
     data: HistoryData
+    timeout_seconds: int = 60
+    scratch: dict = field(default_factory=dict)
 
 
 class Collector(Protocol):
@@ -134,5 +141,12 @@ class Collector(Protocol):
     def probes(self, job: Job | None, ctx: Context) -> list[Request]:
         """The filesystem checks the collector needs; it never makes them itself."""
 
-    def collect(self, job: Job | None, ctx: Context, results: Results) -> Iterable[Sample]:
-        """The samples, from ``ctx`` and the probes' answers."""
+    def collect(
+        self, job: Job | None, ctx: Context, results: Results
+    ) -> Iterable[Sample | MetricError]:
+        """The samples, from ``ctx`` and the probes' answers.
+
+        An engine's collector may also yield a :class:`MetricError` for its own source: the
+        ``source`` is the engine's name and the ``job_name`` the job's. That is an expected
+        failure (the command timed out), not a failure of the collector.
+        """

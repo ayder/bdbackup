@@ -1,8 +1,9 @@
 """A fake pgBackRest repository and command runner, shared by the pgBackRest engine tests.
 
 ``make_repo`` writes a repository tree on disk; ``info_json`` reads it back as the
-``pgbackrest info --output=json`` document; ``fake_pgbackrest`` answers the engine's
-``version`` and ``info`` commands from it, in place of ``subprocess.run``.
+``pgbackrest info --output=json`` document, with each backup's database size;
+``fake_pgbackrest`` answers the engine's ``version`` and ``info`` commands from it, in place of
+``subprocess.run``.
 
 The info files are parsed here by a few lines of this module's own, never by
 ``bdbackup.postgres.repository``, so a bug in the code under test cannot hide in its fake.
@@ -95,7 +96,8 @@ def make_repo(
     the label's last letter (``F`` full, ``D`` diff, ``I`` incr), so a diff is a label such as
     ``20261109-010000F_20261110-010000D``. Entries are listed in the order given, and a backup
     stops ``STOP_AFTER_START`` seconds after its label's time. Every label gets a
-    ``backup.manifest`` and two data files, one of them in a nested directory.
+    ``backup.manifest`` and two data files, one of them in a nested directory. A backup's
+    database size is ``10000`` times its position in ``fulls``, counting from 1.
     """
     repo = Path(root) / "repo"
     backup_dir = repo / "backup" / stanza
@@ -104,7 +106,7 @@ def make_repo(
     archive_dir.mkdir(parents=True)
 
     current: dict[str, object] = {}
-    for label, archive_copy, page_error in fulls:
+    for position, (label, archive_copy, page_error) in enumerate(fulls, 1):
         label_dir = backup_dir / label
         (label_dir / "pg_data" / "base" / "1").mkdir(parents=True)
         (label_dir / "backup.manifest").write_text(f'[backup]\nbackup-label="{label}"\n')
@@ -116,6 +118,7 @@ def make_repo(
             "backup-info-repo-size": sum(
                 f.stat().st_size for f in label_dir.rglob("*") if f.is_file()
             ),
+            "backup-info-size": 10000 * position,
             "backup-timestamp-start": start,
             "backup-timestamp-stop": start + STOP_AFTER_START,
             "backup-type": _BACKUP_TYPES[label[-1]],
@@ -155,7 +158,10 @@ def info_json(repo, stanza: str) -> list[dict]:
                 "stop": entry["backup-timestamp-stop"],
             },
             "error": entry["backup-error"],
-            "info": {"repository": {"size": entry["backup-info-repo-size"]}},
+            "info": {
+                "size": entry["backup-info-size"],
+                "repository": {"size": entry["backup-info-repo-size"]},
+            },
             "database": {"id": entry["db-id"]},
         }
         for label, entry in sections["backup:current"].items()
@@ -177,13 +183,15 @@ def info_json(repo, stanza: str) -> list[dict]:
 def fake_pgbackrest(repo, version: str = "2.58.0"):
     """A stand-in for ``subprocess.run`` that answers ``version`` and ``info --output=json``.
 
-    Every command it receives is appended to ``run.calls``. Any other pgBackRest command fails
-    the test with an ``AssertionError``.
+    Every command it receives is appended to ``run.calls``, and the keyword arguments of each
+    call to ``run.kwargs``. Any other pgBackRest command fails the test with an
+    ``AssertionError``.
     """
 
     def run(cmd, **kwargs):
         args = [str(arg) for arg in cmd]
         run.calls.append(args)
+        run.kwargs.append(kwargs)
         command = next(arg for arg in args[1:] if not arg.startswith("-"))
         if command == "version":
             stdout = f"pgBackRest {version}\n"
@@ -195,4 +203,5 @@ def fake_pgbackrest(repo, version: str = "2.58.0"):
         return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
 
     run.calls = []
+    run.kwargs = []
     return run
