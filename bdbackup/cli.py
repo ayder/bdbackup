@@ -221,6 +221,9 @@ def _last_run(config: Config, job: Job, outcome: _Outcome):
     raised again. A failure to record is a warning: it never changes the exit code or the output.
     """
     code = EXIT_OK
+    # A pgbackrest run is refused for root so that nothing is left owned by root: no database,
+    # no directory for it, and no row in one that exists.
+    record = not (job.type == "pgbackrest" and os.geteuid() == 0)
     try:
         yield
     except click.exceptions.Exit as exc:
@@ -234,14 +237,15 @@ def _last_run(config: Config, job: Job, outcome: _Outcome):
         outcome.raised = True
         raise
     finally:
-        try:
-            History(config.history).record_last_run(
-                job.name, job.type, code, _result_of(job, outcome, code), outcome.facts
-            )
-        except (HistoryError, OSError) as exc:
-            logging.getLogger("bdbackup.cli").warning(
-                "Could not record the last run of job %r: %s", job.name, exc
-            )
+        if record:
+            try:
+                History(config.history).record_last_run(
+                    job.name, job.type, code, _result_of(job, outcome, code), outcome.facts
+                )
+            except (HistoryError, OSError) as exc:
+                logging.getLogger("bdbackup.cli").warning(
+                    "Could not record the last run of job %r: %s", job.name, exc
+                )
 
 
 def _export_facts(full, result, progress: ExportProgress, started: datetime) -> dict:
@@ -253,7 +257,7 @@ def _export_facts(full, result, progress: ExportProgress, started: datetime) -> 
         "phases": phases,
         "label": full.label,
         "bytes": result.size_bytes,
-        "full_age_seconds": int((started - full.stop).total_seconds()),
+        "full_age_seconds": max(0, int((started - full.stop).total_seconds())),
     }
 
 
