@@ -80,7 +80,7 @@ mountpoint -q /proc/fs/nfsd || mount -t nfsd nfsd /proc/fs/nfsd
 rpcbind
 sleep 1
 rpc.nfsd 8
-rpc.mountd
+rpc.mountd -p 32767
 exportfs -rv
 """
 SAMPLE = re.compile(r"([a-z_0-9]+)(?:\{(.*)\})? (\S+)")
@@ -180,11 +180,11 @@ def main():
         return result.stdout
 
     def rules(action):
-        """Insert (``I``) or delete (``D``) the rules that drop the NFS (2049) and portmapper
-        (111) packets on loopback, in both directions."""
+        """Insert (``I``) or delete (``D``) the rules that drop the NFS (2049), portmapper (111)
+        and mountd (32767, pinned by the server setup) packets on loopback, both directions."""
         for chain, interface in (("INPUT", "-i lo"), ("OUTPUT", "-o lo")):
             for match in ("--dport", "--sport"):
-                for port in ("2049", "111"):
+                for port in ("2049", "111", "32767"):
                     command = (
                         f"iptables -{action} {chain} {interface} -p tcp {match} {port} -j DROP"
                     )
@@ -259,8 +259,17 @@ def main():
             if blocked.returncode != 124:
                 raise RuntimeError(f"a plain ls of the share did not hang (exit "
                                    f"{blocked.returncode}): the outage is not in effect")
-            print("Step 4: iptables drops NFS (2049) and portmapper (111) on loopback; "
-                  "ls of the share hangs (killed by timeout 5, exit 124)", flush=True)
+            print("Step 4: iptables drops NFS (2049), portmapper (111) and mountd (32767) on "
+                  "loopback; ls of the share hangs (killed by timeout 5, exit 124)", flush=True)
+            # The control of the lexical config read: a load that resolves the share's paths
+            # (run --validate loads the config that way) blocks on the same outage.
+            resolving = sh(f"timeout 5 bdbackup run -c {CONFIG_PATH} --validate", check=False)
+            if resolving.returncode != 124:
+                raise RuntimeError(f"a resolving config load did not hang (exit "
+                                   f"{resolving.returncode}): the outage does not block it, so "
+                                   "the lexical read proves nothing here")
+            print("  control: bdbackup run --validate, which resolves the config's paths, hangs "
+                  "too (killed by timeout 5, exit 124)", flush=True)
 
             # --- 5. A metrics run during the outage; the process list in the middle of it.
             started = time.monotonic()

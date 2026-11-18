@@ -634,35 +634,6 @@ def main(variant):
                   f"{after_archive['max']} -> {grown_archive['max']}; the segment series "
                   f"{int(segment)} -> {int(grown)}", flush=True)
 
-            # The GFS run: the unit is in the first stage, which the pgbackrest job feeds.
-            code, output = bdbackup("run", "-c", config, "-j", "pg-gfs")
-            if code:
-                raise RuntimeError(f"the gfs run exited {code}: {output}")
-            reported = STAGE_LINE.findall(output)
-            if [(path, count) for path, count, _ in reported] != [(str(stage), "1")]:
-                raise RuntimeError(f"the gfs report has no Stage line of one unit: {output}")
-            samples = metrics()
-            gfs_job = {"job_name": "pg-gfs", "job_type": "gfs"}
-            if one(samples, "bdbackup_job_last_run_result", result="completed", **gfs_job) != 1:
-                raise RuntimeError("the last run of pg-gfs is not completed")
-            if one(samples, "bdbackup_gfs_stage_units", job_name="pg-gfs", stage="1") != int(
-                reported[0][1]
-            ) or one(samples, "bdbackup_gfs_stage_bytes", job_name="pg-gfs", stage="1") != int(
-                reported[0][2]
-            ):
-                raise RuntimeError(f"the stage figures differ from the report {reported}")
-            if one(samples, "bdbackup_destination_ready", job_name="pg-gfs", stage="1",
-                   path=str(stage)) != 1:
-                raise RuntimeError("the fed first stage is not ready")
-            if one(samples, "bdbackup_history_units", job_name="pg-main", state="available") < 1:
-                raise RuntimeError("no available history unit of pg-main")
-            print(f"Step 3b: after the gfs run: completed, stage 1 holds {reported[0][1]} "
-                  f"unit(s) / {reported[0][2]} bytes as its report says, the fed first stage "
-                  "is ready, the export is an available history unit", flush=True)
-            print("  the metrics file:", flush=True)
-            for line in metrics_file.read_text().splitlines():
-                print(f"    {line}", flush=True)
-
             # --- Step 4: nothing new.
             code, output = bdbackup("run", "-c", config, "-j", "pg-main")
             if code or f"no new full: newest {f2}" not in output:
@@ -881,6 +852,35 @@ def main(variant):
                 raise RuntimeError("the restored cluster is still in recovery")
             print(f"Step 9: the restore used --repo1-path={from_history}; neither "
                   "decoy config was read", flush=True)
+            # --- Step 11: the GFS run, last: it makes the unit GFS-managed, which the restore steps
+            # above must not see. The unit is in the first stage, which the pgbackrest job feeds.
+            code, output = bdbackup("run", "-c", config, "-j", "pg-gfs")
+            if code:
+                raise RuntimeError(f"the gfs run exited {code}: {output}")
+            reported = STAGE_LINE.findall(output)
+            if [(path, count) for path, count, _ in reported] != [(str(stage), "1")]:
+                raise RuntimeError(f"the gfs report has no Stage line of one unit: {output}")
+            samples = metrics()
+            gfs_job = {"job_name": "pg-gfs", "job_type": "gfs"}
+            if one(samples, "bdbackup_job_last_run_result", result="completed", **gfs_job) != 1:
+                raise RuntimeError("the last run of pg-gfs is not completed")
+            if one(samples, "bdbackup_gfs_stage_units", job_name="pg-gfs", stage="1") != int(
+                reported[0][1]
+            ) or one(samples, "bdbackup_gfs_stage_bytes", job_name="pg-gfs", stage="1") != int(
+                reported[0][2]
+            ):
+                raise RuntimeError(f"the stage figures differ from the report {reported}")
+            if one(samples, "bdbackup_destination_ready", job_name="pg-gfs", stage="1",
+                   path=str(stage)) != 1:
+                raise RuntimeError("the fed first stage is not ready")
+            if one(samples, "bdbackup_history_units", job_name="pg-main", state="available") < 1:
+                raise RuntimeError("no available history unit of pg-main")
+            print(f"Step 11: after the gfs run: completed, stage 1 holds {reported[0][1]} "
+                  f"unit(s) / {reported[0][2]} bytes as its report says, the fed first stage "
+                  "is ready, the export is an available history unit", flush=True)
+            print("  the metrics file:", flush=True)
+            for line in metrics_file.read_text().splitlines():
+                print(f"    {line}", flush=True)
             print(f"Step 10: the repository tree ({min(digests)} to {max(digests)} entries) "
                   f"was the same before and after each of the {len(digests)} bdbackup calls",
                   flush=True)
