@@ -55,7 +55,8 @@ def _access(path: Path, mode: int) -> bool:
 
 # Python 3.12 raises PermissionError from Path.exists, is_dir and is_file on EACCES, and 3.14
 # returns False. Every filesystem check below goes through _stat, so 3.12 to 3.14 report
-# alike: ENOENT and ENOTDIR (and ELOOP, as pathlib ignored it) mean missing, EACCES unreachable.
+# alike: ENOENT and ENOTDIR (and ELOOP, as pathlib ignored it) mean missing, EACCES unreachable,
+# and any other error (on NFS ESTALE, EIO, ETIMEDOUT) is kept in ``_Entry.error`` for a FAIL line.
 _MISSING = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
 
 
@@ -65,6 +66,7 @@ class _Entry:
 
     info: os.stat_result | None = None
     unreachable: bool = False
+    error: OSError | None = None
 
     @property
     def exists(self) -> bool:
@@ -84,7 +86,7 @@ class _Entry:
 
 
 def _stat(path: Path, *, follow: bool = True) -> _Entry:
-    """Stat ``path`` (``lstat`` when ``follow`` is false); any other error is not hidden."""
+    """Stat ``path`` (``lstat`` when ``follow`` is false); an unexpected error is in ``error``."""
     try:
         return _Entry(os.stat(path) if follow else os.lstat(path))
     except OSError as exc:
@@ -92,7 +94,7 @@ def _stat(path: Path, *, follow: bool = True) -> _Entry:
             return _Entry()
         if exc.errno == errno.EACCES:
             return _Entry(unreachable=True)
-        raise
+        return _Entry(error=exc)
 
 
 def _unsearchable(path: Path) -> Path:
@@ -112,18 +114,38 @@ def _unreachable(report: Report, path: Path, label: str) -> None:
     )
 
 
+def _cannot_check(report: Report, path: Path, label: str, error: OSError) -> None:
+    name = errno.errorcode.get(error.errno, str(error.errno))
+    report.add("FAIL", f"{label}: cannot check {path}: {error.strerror or error} ({name})")
+
+
+def _unreadable(report: Report, path: Path, label: str, found: _Entry) -> bool:
+    """Report a path that could not be looked at as a FAIL line; true when it did."""
+    if found.unreachable:
+        _unreachable(report, path, label)
+    elif found.error is not None:
+        _cannot_check(report, path, label, found.error)
+    else:
+        return False
+    return True
+
+
 def _directory(report: Report, path: Path, label: str, *, write=False, create=False) -> None:
     path = path.expanduser().absolute()
     required = "read/write/search" if write else "read/search"
     found = _stat(path)
-    if found.unreachable:
-        _unreachable(report, path, label)
+    if _unreadable(report, path, label, found):
         return
     if not found.exists:
         parent = path.parent
-        while not _stat(parent).exists and parent != parent.parent:
+        above = _stat(parent)
+        while not above.exists and above.error is None and parent != parent.parent:
             parent = parent.parent
-        creatable = create and _stat(parent).is_dir and _access(parent, os.W_OK | os.X_OK)
+            above = _stat(parent)
+        if above.error is not None:
+            _cannot_check(report, parent, label, above.error)
+            return
+        creatable = create and above.is_dir and _access(parent, os.W_OK | os.X_OK)
         report.add(
             "OK" if creatable else "FAIL",
             f"{label}: {path} does not exist; "
@@ -141,8 +163,7 @@ def _directory(report: Report, path: Path, label: str, *, write=False, create=Fa
 
 def _file(report: Report, path: Path, label: str, *, write=False) -> None:
     found = _stat(path)
-    if found.unreachable:
-        _unreachable(report, path, label)
+    if _unreadable(report, path, label, found):
         return
     mode = os.R_OK | (os.W_OK if write else 0)
     if not found.is_file or not _access(path, mode):
@@ -365,6 +386,8 @@ def _metrics(report: Report, path: Path) -> None:
     if not report.lines[first].startswith("[OK]"):
         return
     found = _stat(path)
+    if _unreadable(report, path, "Metrics file", found):
+        return
     if found.is_dir:
         report.add("FAIL", f"Metrics file: {path} is a directory; the file cannot replace it.")
     elif found.exists:
@@ -380,20 +403,24 @@ def _gfs(report: Report, job: Job, config_path: Path, fed: bool) -> None:
     for stage in job.params["stage"] if fed else job.params["stage"][1:]:
         for path in stage.paths:
             found = _stat(path)
-            if found.unreachable:
-                _unreachable(report, path, "Stage path")
-            elif not found.is_dir:
+            if _unreadable(report, path, "Stage path", found):
+                continue
+            if not found.is_dir:
                 report.add("FAIL", f"Stage path {path}: does not exist")
             elif not _access(path, os.W_OK | os.X_OK):
                 report.add("FAIL", f"Stage path {path}: not writable by OS user {os_user()}")
-            elif not _stat(path / MARKER).is_file:
-                report.add("FAIL", f"Stage path {path}: {MARKER} missing; run bdbackup run -c "
-                                   f"{config_path} -j {job.name} --initialize-structure")
-            elif not _access(path / MARKER, os.W_OK):
-                report.add("FAIL", f"Stage path {path}: {MARKER} not writable by OS user "
-                                   f"{os_user()}")
             else:
-                report.add("OK", f"Stage path {path}: writable, marker present and writable")
+                marker = _stat(path / MARKER)
+                if _unreadable(report, path / MARKER, "Stage path", marker):
+                    continue
+                if not marker.is_file:
+                    report.add("FAIL", f"Stage path {path}: {MARKER} missing; run bdbackup run -c "
+                                       f"{config_path} -j {job.name} --initialize-structure")
+                elif not _access(path / MARKER, os.W_OK):
+                    report.add("FAIL", f"Stage path {path}: {MARKER} not writable by OS user "
+                                       f"{os_user()}")
+                else:
+                    report.add("OK", f"Stage path {path}: writable, marker present and writable")
 
 
 def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
@@ -404,7 +431,8 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
     if config.history:
         db = config.history.database
         _directory(report, db.parent, "SQLite history directory", write=True, create=True)
-        if _stat(db).exists:
+        found = _stat(db)
+        if found.exists or found.error is not None:
             _file(report, db, "SQLite history", write=True)
         _directory(report, config.history.restore_root, "Recovery root", write=True, create=True)
     if config.metrics is not None:
@@ -453,29 +481,35 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
                     )
                 if not backend.backup_paths:
                     report.add("FAIL", "File job needs a nonempty template_filename path list.")
-                # The walk stats each root first; one below an unsearchable directory is named
-                # here, and the walk is skipped, as it could only fail there.
-                roots = [backend._resolve_path(raw) for raw in backend.backup_paths]
-                blocked = [
-                    root for root in roots
-                    if _stat(root, follow=backend.follow_symlinks).unreachable
-                ]
-                for root in blocked:
-                    _unreachable(report, root, "Backup source")
+                # The walk stats each root first, and stops at one it cannot look at. Those roots
+                # are named here and left out: the walk below covers the others, so each still
+                # gets its own line. The backend is only for this check; nothing else reads it.
+                reachable = []
+                for raw in backend.backup_paths:
+                    root = backend._resolve_path(raw)
+                    found = _stat(root, follow=backend.follow_symlinks)
+                    if not _unreadable(report, root, "Backup source", found):
+                        reachable.append(raw)
+                backend.backup_paths = reachable
                 count = 0
-                walk = [] if blocked else backend._walk()
-                for source, _ in walk:
+                for source, _ in backend._walk():
                     count += 1
-                    if _stat(source, follow=False).is_symlink and not backend.follow_symlinks:
+                    link = _stat(source, follow=False)
+                    if _unreadable(report, source, "Backup source", link):
                         continue
-                    mode = os.R_OK | (os.X_OK if _stat(source).is_dir else 0)
+                    if link.is_symlink and not backend.follow_symlinks:
+                        continue
+                    target = _stat(source)
+                    if _unreadable(report, source, "Backup source", target):
+                        continue
+                    mode = os.R_OK | (os.X_OK if target.is_dir else 0)
                     if not _access(source, mode):
                         report.add(
                             "FAIL", f"OS user {os_user()} cannot read/search source {source}."
                         )
                 if count:
                     report.add("OK", f"Checked access to {count} selected source entries.")
-                elif backend.backup_paths and not blocked:
+                elif reachable:
                     report.add("FAIL", "No source entries selected after exclusions.")
             elif isinstance(backend, (MySQLBackup, XtraBackup)):
                 if not isinstance(backend.user, str) or not backend.user.strip():
