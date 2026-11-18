@@ -27,6 +27,8 @@ from bdbackup.gfs.actions import (
     final_name_exists,
     verify,
 )
+from bdbackup.gfs.drift import Drift
+from bdbackup.gfs.drift import run_child as run_drift
 from bdbackup.gfs.policy import Decision, Unit, decide
 from bdbackup.gfs.stages import MARKER, Stage, fed_first_stages
 from bdbackup.history import History, artifact_identity
@@ -108,9 +110,11 @@ def _identities(unit: store.ManagedUnit, at: Path) -> dict[int, str]:
 
 class _Run:
     def __init__(self, config: Config, job: Job, today, out, transport: Transport,
-                 dry_run: bool, outcome: RunOutcome | None = None):
+                 dry_run: bool, outcome: RunOutcome | None = None,
+                 drift: Drift = run_drift):
         self.job = job
         self.outcome = outcome
+        self.drift = drift  # stub: nothing calls it yet
         self.stages: tuple[Stage, ...] = job.params["stage"]
         # A pgbackrest job writes into the first stage: it has a marker and a ledger snapshot.
         self.fed = self.stages[0].paths[0] in fed_first_stages(config.jobs)
@@ -506,7 +510,8 @@ class _Run:
 
 def run_job(config: Config, job: Job, *, now: datetime | None = None,
             out: Callable[[str], None] = print, transport: Transport | None = None,
-            dry_run: bool = False, outcome: RunOutcome | None = None) -> int:
+            dry_run: bool = False, outcome: RunOutcome | None = None,
+            drift: Drift | None = None) -> int:
     """Run one gfs job; return 0, 1 (a failure or refusal) or 3 (locked or deferred only).
 
     A dry run reports what would change and changes nothing. ``outcome``, when given, tells a
@@ -516,7 +521,8 @@ def run_job(config: Config, job: Job, *, now: datetime | None = None,
     try:
         with process_lock(job_lock_path(config, job.name)):
             return _Run(
-                config, job, today, out, transport or LocalTransport(), dry_run, outcome
+                config, job, today, out, transport or LocalTransport(), dry_run, outcome,
+                drift or run_drift,
             ).run()
     except BlockingIOError:
         if outcome is not None:

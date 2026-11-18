@@ -169,11 +169,12 @@ class Env:
         return invoke("run", "-c", self.config_path, "-j", "gfs-main",
                       *(["--dry-run"] if self.dry_run else []))
 
-    def run_api(self, now, *, outcome=None, transport=None):
+    def run_api(self, now, *, outcome=None, transport=None, drift=None):
         config = Config(self.config_path)
         lines = []
         code = runner.run_job(config, config.get("gfs-main"), now=now, out=lines.append,
-                              dry_run=self.dry_run, outcome=outcome, transport=transport)
+                              dry_run=self.dry_run, outcome=outcome, transport=transport,
+                              drift=drift)
         return code, "\n".join(lines)
 
     def query(self, sql, *args):

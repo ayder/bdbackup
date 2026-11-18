@@ -46,6 +46,8 @@ GFS_LEDGER_SNAPSHOT = "bdbackup_gfs_ledger_snapshot_timestamp_seconds"
 GFS_FACTS_TIMESTAMP = "bdbackup_gfs_facts_timestamp_seconds"
 GFS_LAST_RUN_REASON_UNITS = "bdbackup_gfs_last_run_reason_units"
 GFS_LAST_RUN_MOVES = "bdbackup_gfs_last_run_moves"
+GFS_DRIFT_MISSING = "bdbackup_gfs_drift_missing_units"
+GFS_DRIFT_UNKNOWN = "bdbackup_gfs_drift_unknown_entries"
 GFS_LAST_MOVE = "bdbackup_gfs_last_move_timestamp_seconds"
 GFS_UNMANAGED_UNITS = "bdbackup_gfs_unmanaged_units"
 GFS_UNMANAGED_BYTES = "bdbackup_gfs_unmanaged_bytes"
@@ -193,6 +195,18 @@ BUILTIN = (
         GFS_LAST_RUN_MOVES,
         "Moves of the gfs job's last run, by method: rename or copy.",
         ("job_name", "method"),
+    ),
+    Family(
+        GFS_DRIFT_MISSING,
+        "Units the ledger records at the stage's paths that are not there; written only for a "
+        "stage the last run could check.",
+        ("job_name", "stage"),
+    ),
+    Family(
+        GFS_DRIFT_UNKNOWN,
+        "Entries at the stage's paths that the ledger does not record, bdbackup's own files "
+        "aside; written only for a stage the last run could check.",
+        ("job_name", "stage"),
     ),
     Family(
         HISTORY_SCHEMA_VERSION,

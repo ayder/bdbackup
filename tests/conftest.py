@@ -36,3 +36,17 @@ def physical_runner():
         return subprocess.CompletedProcess(cmd, 0, stdout="ok")
 
     return run
+
+
+@pytest.fixture(autouse=True)
+def _gfs_drift_in_process(monkeypatch):
+    """A gfs run checks drift in a child process; here it runs the child's code in-process, so
+    that only the tests of the drift check spawn one (they pass ``drift.run_child``)."""
+    from bdbackup.gfs import drift
+
+    check = drift.load_child()["check"]
+
+    def in_process(requests, timeout_seconds):
+        return [drift._result(request, check(drift._wire(request))) for request in requests]
+
+    monkeypatch.setattr("bdbackup.gfs.runner.run_drift", in_process)
