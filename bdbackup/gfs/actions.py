@@ -32,6 +32,8 @@ class Refusal(Exception):
 
 class Transport(Protocol):
     def copy(self, source: Path, temp: Path, on_file: Callable[[str, str], None]) -> None: ...
+    def same_filesystem(self, a: Path, b: Path) -> bool: ...
+    def relocate(self, source: Path, final: Path) -> None: ...
     def rename(self, temp: Path, final: Path) -> None: ...
     def replace(self, temp: Path, final: Path) -> None: ...
     def remove(self, path: Path) -> None: ...
@@ -108,6 +110,12 @@ class LocalTransport:
         for here, target_dir in reversed(directories):
             with self._mode_may_be_refused():
                 os.chmod(target_dir, stat.S_IMODE(here.lstat().st_mode))
+
+    def same_filesystem(self, a: Path, b: Path) -> bool:
+        return False  # stub: no rename is offered yet
+
+    def relocate(self, source: Path, final: Path) -> None:
+        pass  # stub: the runner does not call it yet
 
     def rename(self, temp: Path, final: Path) -> None:
         if os.path.lexists(final):

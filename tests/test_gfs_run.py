@@ -3,6 +3,7 @@
 import errno
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ import tarfile
 from contextlib import closing
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -22,7 +24,7 @@ from bdbackup.backends import BackupResult
 from bdbackup.cli import main
 from bdbackup.config import Config
 from bdbackup.gfs import actions, runner
-from bdbackup.history import History, HistoryError
+from bdbackup.history import History, HistoryError, artifact_identity
 from bdbackup.ledger import checksum
 from bdbackup.mysql import XtraBackup
 from bdbackup.recovery import backup_restore_info
@@ -209,6 +211,19 @@ def prepare_runner(physical_runner):
     return run
 
 
+class _CopyOnly(actions.LocalTransport):
+    """The copy path: this transport never offers a rename (0.7.4 renames within one device)."""
+
+    def same_filesystem(self, a, b):
+        return False
+
+
+@pytest.fixture
+def copy_path(monkeypatch):
+    """Pin a test to the copy path: every run gets ``_CopyOnly`` instead of ``LocalTransport``."""
+    monkeypatch.setattr(runner, "LocalTransport", _CopyOnly)
+
+
 def stage_files(env, name):
     """Files GFS placed as units: the marker and ledger snapshots are not units."""
     return [p for p in (env.root / name).rglob("*")
@@ -284,7 +299,7 @@ def test_incomplete_bucket_is_held(env):
     assert "held: 2026-W40 not complete" in output, output
 
 
-def test_move_refuses_modified_mirror(env):
+def test_move_refuses_modified_mirror(env, copy_path):
     env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
                (["NFS/weekly"], "weekly", "8w")])
     env.file_unit("a.tar.gz", day=date(2026, 8, 30))  # a Sunday, alone in ISO week 35
@@ -300,7 +315,7 @@ def test_move_refuses_modified_mirror(env):
     assert not (env.root / "NFS/weekly/files").exists()
 
 
-def test_failed_path_leaves_no_copy(env):
+def test_failed_path_leaves_no_copy(env, copy_path):
     env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
                (["NFS/weekly"], "weekly", "8w")])
     a = env.file_unit("a.tar.gz", days_ago=7)
@@ -322,7 +337,7 @@ def test_failed_path_leaves_no_copy(env):
     assert (env.root / "NFS/daily2/files/a.tar.gz").exists()
 
 
-def test_checksum_mismatch_refused_until_accepted(env):
+def test_checksum_mismatch_refused_until_accepted(env, copy_path):
     # AC9 is about a managed unit: GFS records it first, then the file changes on disk.
     a = env.file_unit("a.tar.gz", day=date(2026, 9, 25))
     env.file_unit("b.tar.gz", day=date(2026, 9, 29))
@@ -346,7 +361,7 @@ TWO_DAILY_PATHS = [(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "d
                    (["NFS/weekly"], "weekly", "8w")]
 
 
-class _FailingCopy(actions.LocalTransport):
+class _FailingCopy(_CopyOnly):
     def copy(self, source, temp, on_file):
         raise OSError("injected copy failure")
 
@@ -416,7 +431,7 @@ def _directory_modes(root: Path) -> dict[str, int]:
             for p in [root, *root.rglob("*")] if p.is_dir() and not p.is_symlink()}
 
 
-def test_move_keeps_directory_modes(env):
+def test_move_keeps_directory_modes(env, copy_path):
     unit = env.xtrabackup_unit(7)
     env.xtrabackup_unit(0)
     full_name = next(p.name for p in unit.iterdir() if p.name.startswith("Full_2"))
@@ -440,7 +455,7 @@ def _squashed(error):
     return OSError(error, "squashed")
 
 
-def test_copy_survives_eperm_from_chmod(env):
+def test_copy_survives_eperm_from_chmod(env, copy_path):
     unit = env.xtrabackup_unit(7)
     env.xtrabackup_unit(0)
     before = tree(unit)
@@ -459,7 +474,7 @@ def test_copy_survives_eperm_from_chmod(env):
 
 @pytest.mark.parametrize("error", [errno.EIO, errno.EACCES], ids=["EIO", "EACCES"])
 @pytest.mark.parametrize("call", ["os.chmod", "shutil.copymode"])
-def test_copy_fails_on_other_chmod_errors(env, call, error):
+def test_copy_fails_on_other_chmod_errors(env, copy_path, call, error):
     unit = env.xtrabackup_unit(7)
     env.xtrabackup_unit(0)
     before = tree(unit)
@@ -473,7 +488,7 @@ def test_copy_fails_on_other_chmod_errors(env, call, error):
     assert not stage_files(env, "NFS/daily")
 
 
-def test_report_has_no_chmod_line_when_modes_kept(env):
+def test_report_has_no_chmod_line_when_modes_kept(env, copy_path):
     env.file_unit("a.tar.gz", days_ago=7)
     env.file_unit("b.tar.gz", days_ago=0)
     code, output = env.run_api(datetime.now())
@@ -565,7 +580,7 @@ def test_changed_first_stage_keeps_managing_cold_copies(env):
     assert new.exists()
 
 
-def test_copy_holds_no_engine_lock_and_commit_defers(env):
+def test_copy_holds_no_engine_lock_and_commit_defers(env, copy_path):
     unit = env.xtrabackup_unit(7)
     env.xtrabackup_unit(0)
     lock = env.abs("BACKUP/mysql/prod") / ".bdbackup.lock"
@@ -1212,16 +1227,18 @@ def later_stage(*options):
     return [(["BACKUP"], "daily", "5d"), (["NFS/daily"], "daily", "20d", *options)]
 
 
-def expire_in_nfs_daily(env, make_unit, *, options):
+def expire_in_nfs_daily(env, checksums, make_unit, *, options):
     """A unit moved to NFS/daily, which is not the newest of its series, and the day it expires.
 
-    Returns the unit's path at NFS/daily and the clock to run at: 60 days on.
+    Returns the unit's path at NFS/daily and the clock to run at: 60 days on. The checksums
+    the move read are forgotten: a test looks at the run that follows.
     """
     env.write(later_stage(*options))
     unit = make_unit()
     assert env.run_api(datetime.now())[0] == 0
     moved = env.root / "NFS/daily" / unit.relative_to(env.root / "BACKUP")
     assert moved.exists() and not unit.exists()
+    checksums.clear()
     return moved, datetime.now() + timedelta(days=60)
 
 
@@ -1235,9 +1252,8 @@ def file_pair(env):
 
 @pytest.mark.parametrize("options", [(), (NO_VERIFY,)], ids=["default", "verify-false"])
 def test_a_changed_unit_is_deleted_only_in_a_verify_false_stage(env, checksums, options):
-    moved, later = expire_in_nfs_daily(env, file_pair(env), options=options)
+    moved, later = expire_in_nfs_daily(env, checksums, file_pair(env), options=options)
     moved.write_bytes(b"changed on disk")
-    checksums.clear()
 
     code, output = env.run_api(later)
 
@@ -1270,7 +1286,7 @@ def make_directory(moved):
 def test_a_verify_false_stage_still_refuses_a_file_unit_that_is_not_there_or_not_a_file(
     env, checksums, damage
 ):
-    moved, later = expire_in_nfs_daily(env, file_pair(env), options=(NO_VERIFY,))
+    moved, later = expire_in_nfs_daily(env, checksums, file_pair(env), options=(NO_VERIFY,))
     reason = damage(moved)
 
     code, output = env.run_api(later)
@@ -1289,7 +1305,7 @@ def test_a_verify_false_stage_still_refuses_an_unexpected_entry_in_an_xtrabackup
         env.xtrabackup_unit(0)
         return unit
 
-    moved, later = expire_in_nfs_daily(env, make, options=(NO_VERIFY,))
+    moved, later = expire_in_nfs_daily(env, checksums, make, options=(NO_VERIFY,))
     (moved / "stray").mkdir()
     before = tree(moved)
 
@@ -1343,10 +1359,11 @@ def test_a_changed_first_copy_in_a_verify_false_stage_is_still_refused(env, chec
     assert checksums == []
 
 
-def leave_an_interrupted_move(env, *, options, first=()):
+def leave_an_interrupted_move(env, checksums, *, options, first=()):
     """Unit a at NFS/daily, recorded there, with its earlier copy still in BACKUP.
 
     ``options`` go on the later stage, ``first`` on the first one the earlier copy is left in.
+    The checksums the first move read are forgotten.
     """
     env.write([(["BACKUP"], "daily", "5d", *first), *later_stage(*options)[1:]])
     a = env.file_unit("a.tar.gz", days_ago=7)
@@ -1358,6 +1375,7 @@ def leave_an_interrupted_move(env, *, options, first=()):
     with closing(sqlite3.connect(env.database)) as db, db:
         db.execute("INSERT INTO gfs_locations (unit_id, stage_path, path) VALUES (?, ?, ?)",
                    (unit_id, str(env.abs("BACKUP")), str(a.resolve())))
+    checksums.clear()
     return a, moved, unit_id
 
 
@@ -1365,9 +1383,8 @@ def leave_an_interrupted_move(env, *, options, first=()):
 def test_a_changed_later_copy_blocks_an_interrupted_move_only_in_a_default_stage(
     env, checksums, options
 ):
-    a, moved, unit_id = leave_an_interrupted_move(env, options=options)
+    a, moved, unit_id = leave_an_interrupted_move(env, checksums, options=options)
     moved.write_bytes(b"changed later copy")
-    checksums.clear()
 
     result = env.run_cli()
 
@@ -1385,9 +1402,10 @@ def test_a_changed_later_copy_blocks_an_interrupted_move_only_in_a_default_stage
 
 
 def test_an_interrupted_move_between_two_verify_false_stages_reads_neither_copy(env, checksums):
-    a, moved, unit_id = leave_an_interrupted_move(env, options=(NO_VERIFY,), first=(NO_VERIFY,))
+    a, moved, unit_id = leave_an_interrupted_move(
+        env, checksums, options=(NO_VERIFY,), first=(NO_VERIFY,)
+    )
     moved.write_bytes(b"changed later copy")
-    checksums.clear()
 
     result = env.run_cli()
 
@@ -1398,7 +1416,7 @@ def test_an_interrupted_move_between_two_verify_false_stages_reads_neither_copy(
 
 
 def test_a_missing_later_copy_still_keeps_the_earlier_one_in_a_verify_false_stage(env, checksums):
-    a, moved, unit_id = leave_an_interrupted_move(env, options=(NO_VERIFY,))
+    a, moved, unit_id = leave_an_interrupted_move(env, checksums, options=(NO_VERIFY,))
     moved.unlink()
 
     result = env.run_cli()
@@ -1408,3 +1426,302 @@ def test_a_missing_later_copy_still_keeps_the_earlier_one_in_a_verify_false_stag
     assert a.exists()
     assert checksums == []
     assert env.query("SELECT count(*) FROM gfs_locations WHERE unit_id=?", unit_id) == [(2,)]
+
+
+# ---- a move within one filesystem is a rename (0.7.4, D6, D7) ---------------------------------
+
+HINT = 'see docs/README_GFS.md, "Final name exists"'
+
+
+@pytest.fixture
+def transfers():
+    """What ``LocalTransport`` is asked to do with a unit: copies (not the ledger snapshot's)
+    and relocations."""
+    calls = SimpleNamespace(copies=[], relocations=[])
+    copy, relocate = actions.LocalTransport.copy, actions.LocalTransport.relocate
+
+    def spy_copy(self, source, temp, on_file):
+        if Path(source).suffix != ".snapshot":
+            calls.copies.append(Path(source))
+        return copy(self, source, temp, on_file)
+
+    def spy_relocate(self, source, final):
+        calls.relocations.append((Path(source), Path(final)))
+        return relocate(self, source, final)
+
+    with (patch.object(actions.LocalTransport, "copy", spy_copy),
+          patch.object(actions.LocalTransport, "relocate", spy_relocate)):
+        yield calls
+
+
+def test_a_move_within_one_filesystem_renames_the_unit(env, checksums, transfers):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    source, inode = a.resolve(), a.stat().st_ino
+    moved = env.abs("NFS/daily/files/a.tar.gz")
+
+    code, output = env.run_api(datetime.now())
+
+    assert code == 0, output
+    assert moved.stat().st_ino == inode and not a.exists()
+    assert transfers.copies == []
+    assert transfers.relocations == [(source, moved)]
+    assert checksums == [source]  # the source stage verifies: one read, no write
+    unit_id, = env.query("SELECT id FROM gfs_units WHERE unit=?", str(source))[0]
+    [(stage_path, path, identities)] = env.query(
+        "SELECT stage_path, path, identities FROM gfs_locations WHERE unit_id=?", unit_id)
+    assert (stage_path, path) == (str(env.abs("NFS/daily")), str(moved))
+    member_id, = env.query("SELECT id FROM backup_runs WHERE unit=?", str(source))[0]
+    assert json.loads(identities) == {str(member_id): artifact_identity(moved)}
+    assert env.query("SELECT action, source, destination, outcome FROM gfs_steps"
+                     " WHERE unit_id=?", unit_id) == [("move", str(source), str(moved), "ok")]
+
+
+def test_a_rename_out_of_a_verify_false_stage_reads_nothing(env, checksums, transfers):
+    env.write([(["BACKUP"], "daily", "5d", NO_VERIFY), *later_stage()[1:]])
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    inode = a.stat().st_ino
+
+    code, output = env.run_api(datetime.now())
+
+    assert code == 0, output
+    assert env.abs("NFS/daily/files/a.tar.gz").stat().st_ino == inode
+    assert transfers.copies == [] and len(transfers.relocations) == 1
+    assert checksums == []
+
+
+def test_a_changed_unit_in_a_verifying_stage_is_refused_and_nothing_is_renamed(
+    env, checksums, transfers
+):
+    # GFS records a unit when it first sees it; the file changes on disk after that
+    a = env.file_unit("a.tar.gz", day=date(2026, 9, 25))
+    env.file_unit("b.tar.gz", day=date(2026, 9, 29))
+    assert env.run_api(datetime(2026, 9, 29, 12))[0] == 0 and a.exists()
+    a.write_bytes(b"changed on disk")
+    checksums.clear()
+
+    code, output = env.run_api(datetime(2026, 10, 2, 12))  # a is now due for NFS/daily
+
+    assert code == 1, output
+    assert "refused: checksum mismatch" in output
+    assert a.read_bytes() == b"changed on disk"
+    assert not (env.root / "NFS/daily/files/a.tar.gz").exists()
+    assert transfers.relocations == [] and transfers.copies == []
+    assert checksums == [a.resolve()]  # the verify step read it; the copy path hashes in the copy
+
+
+def test_exdev_from_the_rename_falls_back_to_the_copy(env, checksums, transfers):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    original, inode, source = a.read_bytes(), a.stat().st_ino, a.resolve()
+    moved = env.abs("NFS/daily/files/a.tar.gz")
+
+    with patch.object(actions.LocalTransport, "relocate", autospec=True,
+                      side_effect=OSError(errno.EXDEV, "Invalid cross-device link")) as relocate:
+        code, output = env.run_api(datetime.now())
+
+    assert code == 0, output
+    assert relocate.call_count == 1
+    assert moved.read_bytes() == original and not a.exists()
+    assert moved.stat().st_ino != inode  # copied, then the source removed
+    assert transfers.copies == [source]
+    assert checksums == [source]  # the one case that reads a verifying stage's unit twice
+    assert "renamed" not in output
+    unit_id, = env.query("SELECT id FROM gfs_units WHERE unit=?", str(source))[0]
+    assert env.query("SELECT path FROM gfs_locations WHERE unit_id=?", unit_id) == [(str(moved),)]
+
+
+def test_a_two_path_target_stage_still_copies(env, checksums, transfers):
+    env.write(TWO_DAILY_PATHS)
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    inode = a.stat().st_ino
+
+    code, output = env.run_api(datetime.now())
+
+    assert code == 0, output
+    assert transfers.relocations == []
+    assert transfers.copies == [a.resolve(), a.resolve()]
+    assert checksums == []
+    assert env.abs("NFS/daily/files/a.tar.gz").stat().st_ino != inode and not a.exists()
+    assert "renamed" not in output
+
+
+def test_a_unit_with_two_locations_still_copies(env, checksums, transfers):
+    first, second, weekly = mirrored_unit(env)
+    transfers.copies.clear()
+    transfers.relocations.clear()
+
+    code, output = env.run_api(datetime(2026, 9, 29, 12))
+
+    assert code == 0, output
+    assert transfers.relocations == []
+    assert transfers.copies == [first.resolve()]
+    assert weekly.exists() and not first.exists() and not second.exists()
+    assert "renamed" not in output
+
+
+def test_an_existing_final_name_is_refused_before_the_rename(env, checksums, transfers):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    original = a.read_bytes()
+    final = env.abs("NFS/daily/files/a.tar.gz")
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"in the way")
+
+    code, output = env.run_api(datetime.now())
+
+    assert code == 1, output
+    assert f"refused: final name exists: {final}; {HINT}" in output
+    assert a.read_bytes() == original and final.read_bytes() == b"in the way"
+    assert transfers.relocations == [] and transfers.copies == [] and checksums == []
+
+
+def test_an_xtrabackup_unit_is_renamed_under_both_root_locks(env, transfers):
+    unit = env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+    before, inode = tree(unit), unit.stat().st_ino
+    source_lock = env.abs("BACKUP/mysql/prod") / ".bdbackup.lock"
+    target_lock = env.abs("NFS/daily/mysql/prod") / ".bdbackup.lock"
+    assert not (env.root / "NFS/daily/mysql").exists()  # the target directory is made on the way
+    held = []
+    relocate = actions.LocalTransport.relocate
+
+    def relocate_under_locks(self, source, final):
+        for lock in (source_lock, target_lock):
+            with pytest.raises(BlockingIOError), process_lock(lock):
+                pass
+            held.append(lock)
+        return relocate(self, source, final)
+
+    with patch.object(actions.LocalTransport, "relocate", relocate_under_locks):
+        code, output = env.run_api(datetime.now())
+
+    moved = env.root / "NFS/daily/mysql/prod" / unit.name
+    assert code == 0, output
+    assert held == [source_lock, target_lock]
+    assert tree(moved) == before and moved.stat().st_ino == inode and not unit.exists()
+    assert transfers.copies == []
+
+
+@pytest.mark.parametrize("busy", ["BACKUP/mysql/prod", "NFS/daily/mysql/prod"],
+                         ids=["source-root", "target-root"])
+def test_a_busy_root_lock_defers_the_rename_of_an_xtrabackup_unit(env, transfers, busy):
+    unit = env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+    before = tree(unit)
+
+    with process_lock(env.abs(busy) / ".bdbackup.lock"):
+        code, output = env.run_api(datetime.now())
+
+    assert code == 3, output
+    assert "deferred: locked" in output
+    assert tree(unit) == before
+    assert transfers.relocations == []
+    assert not (env.root / "NFS/daily/mysql/prod" / unit.name).exists()
+
+
+def test_a_crash_after_the_rename_fails_this_run_and_the_next_one_refuses(env, checksums):
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    original, source = a.read_bytes(), a.resolve()
+    final = env.abs("NFS/daily/files/a.tar.gz")
+
+    with patch.object(runner.store, "record_move", side_effect=OSError("disk full")):
+        code, output = env.run_api(datetime.now())
+
+    assert code == 1, output
+    assert "failed: disk full" in output
+    assert final.read_bytes() == original and not a.exists()  # renamed; the ledger does not know
+    unit_id, = env.query("SELECT id FROM gfs_units WHERE unit=?", str(source))[0]
+    locations = env.query("SELECT path FROM gfs_locations WHERE unit_id=?", unit_id)
+    assert locations == [(str(source),)]
+
+    code, output = env.run_api(datetime.now())
+
+    assert code == 1, output
+    assert f"refused: final name exists: {final}; {HINT}" in output
+    assert final.read_bytes() == original and not a.exists()  # both paths are left as they are
+    assert env.query("SELECT path FROM gfs_locations WHERE unit_id=?", unit_id) == locations
+
+
+def test_the_applied_report_line_ends_renamed_and_the_dry_run_line_is_unchanged(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    move = (r"move files files/a\.tar\.gz \d{4}-\d\d-\d\d "
+            rf"{re.escape(str(env.abs('BACKUP')))} -> {re.escape(str(env.abs('NFS/daily')))} ")
+    env.dry_run = True
+
+    code, output = env.run_api(datetime.now())
+
+    assert code == 0, output
+    assert re.search(rf"^  would {move}\(within 20d\)$", output, re.MULTILINE), output
+
+    env.dry_run = False
+    code, output = env.run_api(datetime.now())
+
+    assert code == 0, output
+    assert re.search(rf"^  {move}\(within 20d, renamed\)$", output, re.MULTILINE), output
+
+
+@pytest.mark.parametrize("taken", ["file", "empty-directory"])
+def test_relocate_refuses_a_final_name_that_exists_and_says_where_to_read(tmp_path, taken):
+    source = tmp_path / "a"
+    source.write_text("unit")
+    final = tmp_path / "stage" / "a"
+    final.parent.mkdir()
+    final.write_text("taken") if taken == "file" else final.mkdir()  # os.rename replaces both
+
+    with pytest.raises(actions.Refusal) as refusal:
+        actions.LocalTransport().relocate(source, final)
+
+    assert refusal.value.reason == f"final name exists: {final}; {HINT}"
+    assert source.read_text() == "unit"
+    assert final.read_text() == "taken" if taken == "file" else final.is_dir()
+
+
+def test_the_copy_path_refusal_of_a_final_name_says_where_to_read_too(tmp_path):
+    temp, final = tmp_path / "temp", tmp_path / "final"
+    temp.write_text("copy")
+    final.write_text("taken")
+
+    with pytest.raises(actions.Refusal) as refusal:
+        actions.LocalTransport().rename(temp, final)
+
+    assert refusal.value.reason == f"final name exists: {final}; {HINT}"
+
+
+def test_relocate_makes_the_parent_renames_and_syncs_both_parents(tmp_path):
+    source = tmp_path / "from" / "files" / "a"
+    source.parent.mkdir(parents=True)
+    source.write_text("unit")
+    inode = source.stat().st_ino
+    final = tmp_path / "to" / "files" / "a"  # neither "to" nor "to/files" exists
+    synced = []
+
+    with patch("bdbackup.gfs.actions._fsync_dir", side_effect=synced.append):
+        actions.LocalTransport().relocate(source, final)
+
+    assert final.exists() and not source.exists(), "the unit was not renamed"
+    assert final.read_text() == "unit" and final.stat().st_ino == inode
+    assert sorted(synced) == sorted([final.parent, source.parent])
+
+
+def test_same_filesystem_compares_the_devices_of_two_live_paths(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    transport = actions.LocalTransport()
+    real = os.stat
+
+    def on_another_device(path, *args, **kwargs):
+        fields = list(real(path, *args, **kwargs))
+        if Path(path) == b:
+            fields[2] += 1  # st_dev
+        return os.stat_result(fields)
+
+    assert transport.same_filesystem(a, b) is True
+    assert transport.same_filesystem(a, tmp_path / "missing") is False
+    with patch("bdbackup.gfs.actions.os.stat", on_another_device):
+        assert transport.same_filesystem(a, b) is False
