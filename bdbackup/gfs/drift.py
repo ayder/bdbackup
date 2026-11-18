@@ -43,11 +43,23 @@ def own_temporary(name):
     return name.startswith(TEMP) or (name.startswith(".") and ".tar.tmp-" in name)
 
 
+def ignored(name):
+    return name == LOCK or name in FILESYSTEM or own_temporary(name)
+
+
+def holds_entries(directory):
+    """Whether a directory holds anything the walk would count. GFS makes the parent directory
+    of a unit and never removes it, so one a unit has left is empty, or has only its lock."""
+    with os.scandir(directory) as scan:
+        return any(not ignored(entry.name) for entry in scan)
+
+
 def walk(root, known, ancestors, skip_at_root):
     """The entries below ``root`` that are neither known nor a directory above a known path.
 
     It never follows a symlink and never enters another device: a directory whose device is
-    not the root's counts as one entry. An unknown entry is one entry, whatever it holds.
+    not the root's counts as one entry. An unknown entry is one entry, whatever it holds. A
+    directory that holds nothing countable is not an entry.
     """
     unknown = 0
     device = device_of(root)
@@ -58,7 +70,7 @@ def walk(root, known, ancestors, skip_at_root):
             for entry in scan:
                 name = entry.name
                 path = os.path.join(directory, name)
-                if name == LOCK or name in FILESYSTEM or own_temporary(name):
+                if ignored(name):
                     continue
                 if top and name in skip_at_root:
                     continue
@@ -69,7 +81,7 @@ def walk(root, known, ancestors, skip_at_root):
                         unknown += 1
                     elif path in ancestors:
                         pending.append((path, False))
-                    else:
+                    elif holds_entries(path):
                         unknown += 1
                 else:
                     unknown += 1
