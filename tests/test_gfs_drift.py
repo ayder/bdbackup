@@ -282,6 +282,19 @@ def test_a_drift_check_that_raises_blocks_nothing_and_changes_no_exit_code(env):
     assert stages(facts) == {2: (False, 0, 0), 3: (False, 0, 0)}
 
 
+def test_a_dry_run_before_any_history_exists_still_checks_the_stage_paths(env):
+    assert not env.database.exists()
+    (env.root / "NFS/daily" / "stray.txt").write_text("x")
+    env.dry_run = True
+
+    code, output, facts = run(env)
+
+    assert code == 0, output
+    assert facts is None
+    assert lines(output, "drift not checked") == []  # no database is no records, not an error
+    assert lines(output) == [f"Drift {env.abs('NFS/daily')}: 0 missing, 1 unknown"]
+
+
 def test_a_dry_run_reports_drift_and_records_no_facts(env):
     moved = placed(env)
     moved.unlink()
