@@ -104,8 +104,11 @@ def _stage(
             f'stage {index}: keep "{keep}" must be longer than "{previous.keep}" '
             "on every calendar"
         )
+    verify = table.get("verify", True)
+    if not isinstance(verify, bool):
+        raise ValueError(f"stage {index}: verify must be true or false")
     resolved = tuple(resolve(base / Path(p).expanduser()) for p in paths)
-    return Stage(resolved, period, keep)
+    return Stage(resolved, period, keep, verify)
 
 
 def parse_gfs_job(
