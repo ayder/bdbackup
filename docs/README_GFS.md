@@ -345,6 +345,10 @@ with its `.bdbackup.lock`. It does not count:
 - `lost+found` and `.snapshot`, by name at any level, which a filesystem or an
   appliance keeps in its directories.
 
+Nothing else is ignored. In particular, the `<archive>.lock` of a file job in a first
+stage that a pgbackrest job feeds counts as unknown, so keep file jobs out of such a
+stage.
+
 The report prints a line for each stage path with a non-zero count, in an applying
 run and in a dry run:
 
