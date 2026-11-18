@@ -32,6 +32,17 @@ GFS_LAST_RUN_UNITS = "bdbackup_gfs_last_run_units"
 GFS_STAGE_INFO = "bdbackup_gfs_stage_info"
 GFS_STAGE_UNITS = "bdbackup_gfs_stage_units"
 GFS_STAGE_BYTES = "bdbackup_gfs_stage_bytes"
+GFS_COVERAGE_EXPECTED = "bdbackup_gfs_coverage_expected_slots"
+GFS_COVERAGE_FILLED = "bdbackup_gfs_coverage_filled_slots"
+GFS_COVERAGE_MISSING = "bdbackup_gfs_coverage_missing_slots"
+GFS_COVERAGE_NEWEST_MISSING = "bdbackup_gfs_coverage_newest_missing_timestamp_seconds"
+GFS_SOURCE_NEWEST = "bdbackup_gfs_source_newest_timestamp_seconds"
+GFS_SOURCE_OLDEST = "bdbackup_gfs_source_oldest_timestamp_seconds"
+GFS_SOURCE_UNITS = "bdbackup_gfs_source_units"
+GFS_SOURCE_BYTES = "bdbackup_gfs_source_bytes"
+
+# Labels of the families kept per stage and per backup job whose units the stage holds.
+GFS_SOURCE = ("job_name", "stage", "source_job")
 
 BUILTIN = (
     Family(LAST_RUN, "End of this metrics run.", ()),
@@ -85,6 +96,37 @@ BUILTIN = (
         GFS_STAGE_UNITS, "Units whose newest location is in the stage.", ("job_name", "stage")
     ),
     Family(GFS_STAGE_BYTES, "Bytes of the units in the stage.", ("job_name", "stage")),
+    Family(
+        GFS_COVERAGE_EXPECTED,
+        "Period slots (days, ISO weeks, months or years) wholly inside the stage's window that "
+        "the backup job's units should fill.",
+        GFS_SOURCE,
+    ),
+    Family(
+        GFS_COVERAGE_FILLED,
+        "Expected slots that hold a unit of the backup job in any stage.",
+        GFS_SOURCE,
+    ),
+    Family(GFS_COVERAGE_MISSING, "Expected slots that hold no unit of the backup job.",
+           GFS_SOURCE),
+    Family(
+        GFS_COVERAGE_NEWEST_MISSING,
+        "Local midnight starting the newest missing slot; absent when no slot is missing.",
+        GFS_SOURCE,
+    ),
+    Family(
+        GFS_SOURCE_NEWEST,
+        "Newest time of the newest unit of the backup job in the stage.",
+        GFS_SOURCE,
+    ),
+    Family(
+        GFS_SOURCE_OLDEST,
+        "Oldest time of the oldest unit of the backup job in the stage.",
+        GFS_SOURCE,
+    ),
+    Family(GFS_SOURCE_UNITS, "Units of the backup job whose newest location is in the stage.",
+           GFS_SOURCE),
+    Family(GFS_SOURCE_BYTES, "Bytes of the backup job's units in the stage.", GFS_SOURCE),
 )
 
 
