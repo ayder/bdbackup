@@ -51,6 +51,57 @@ shaped like `bdbackup/postgres/`, and appending its import path to
 `bdbackup.engines.FAMILIES` — the single deliberate modification point.
 A dry run of a custom engine exits 2: only the built-in types describe their run.
 
+## Metrics collectors
+
+An engine can add its own metrics to `bdbackup metrics` through `EngineInfo.metrics`, an object
+with these methods; see [Prometheus metrics](README_METRICS.md). Without one, the engine's jobs
+have no series of their own, and their backups still count in `bdbackup_history_units`. The
+request, answer and error types are in `bdbackup.metrics.collector`.
+
+- `families()` returns the `Family(name, help, labels)` objects the collector writes. Every
+  name must start with `bdbackup_<engine>_`, the engine name with each character outside
+  `[a-zA-Z0-9_]` replaced by `_` (`mysql-shell` gives `bdbackup_mysql_shell_`). The labels may
+  not include `job` or `instance`.
+- `probes(job, ctx)` returns the filesystem checks it needs as requests:
+  `StatRequest(path, probe="destination")` and
+  `ListPrefixRequest(directory, prefix, probe="repository")`. It never touches the filesystem
+  itself: the probe child processes run the requests, so a share that hangs cannot block the
+  run. It may run a command (the pgbackrest collector makes its `info` call here), limited by
+  `ctx.timeout_seconds`.
+- `collect(job, ctx, results)` yields `Sample(family, value, labels)` from `ctx` (the clock,
+  the jobs, the history records, `last_runs` and the GFS runs, read once per run) and from
+  `results.stat(path)` and `results.listing(directory, prefix)`, the probes' answers. It may
+  also yield `MetricError(engine name, job name, reason)` for a failure of its own source.
+- `describes(facts, record)` is optional: it says whether the facts of the job's last run
+  describe its newest successful record. Without it, they do when both name the same `label`.
+
+```python
+from bdbackup.engines import EngineInfo
+from bdbackup.metrics.registry import Family
+from bdbackup.metrics.render import Sample
+
+class DumpMetrics:
+    def families(self):
+        return [Family("bdbackup_mysql_shell_dumps", "Dumps in the history.", ("job_name",))]
+
+    def probes(self, job, ctx):
+        return []
+
+    def collect(self, job, ctx, results):
+        count = sum(1 for record in ctx.data.records if record.job_name == job.name)
+        yield Sample("bdbackup_mysql_shell_dumps", count, {"job_name": job.name})
+
+ENGINE = EngineInfo(name="mysql-shell", backend=MySQLShellDump, metrics=DumpMetrics())
+```
+
+A collector cannot stop the run. When it raises, or yields a sample that does not fit its
+declared family or whose name is outside its prefix, its samples are dropped and the file gets
+`bdbackup_metrics_error{source="collector",job_name=<job>,reason="failed"}`. When `probes()`
+does not return within `timeout_seconds`, it is abandoned and the file gets
+`bdbackup_metrics_error{source=<engine name>,job_name=<job>,reason="timeout"}`. The other
+collectors still run. A `MetricError` a collector yields must carry its own engine name as
+`source` and its own job; anything else counts as a failure of the collector.
+
 ## Validation
 
 `--validate` of a job whose type is a custom engine reports

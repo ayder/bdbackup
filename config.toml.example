@@ -3,6 +3,7 @@
 # Usage:  bdbackup run -c ~/.config/bdbackup/config.toml -j <job-name> [--dry-run]
 #         bdbackup run -c ~/.config/bdbackup/config.toml -j <xtrabackup job> --incremental
 #         bdbackup run -c ~/.config/bdbackup/config.toml --validate [-j <job-name>]
+#         bdbackup metrics -c ~/.config/bdbackup/config.toml      # Prometheus textfile, read-only
 #
 # All bdbackup settings live under ~/.config/bdbackup/ (honours
 # $XDG_CONFIG_HOME and $BDBACKUP_CONFIG_DIR):
@@ -11,8 +12,8 @@
 #   templates/*.py       user-defined exclusion templates (see below)
 #   engines/*.py         user-defined database engines (see docs/README_ENGINES.md)
 #
-# Except for [history], each top-level table is one job; its name is the table name and it must
-# set `type`: file | mysqldump | xtrabackup | pgbackrest | gfs, or any engine
+# Except for [history] and [metrics], each top-level table is one job; its name is the table
+# name and it must set `type`: file | mysqldump | xtrabackup | pgbackrest | gfs, or any engine
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
 # Any job may set active = false to pause it: `run -j` then refuses it (exit 2)
 # and --validate names it as not checked. Schedule jobs with your own crontab
@@ -45,6 +46,22 @@ restore_root = "/restore/bdbackup"  # default: ./restores beside this config; jo
 #   bdbackup history -c config.toml --create-checksum   # records without a checksum
 #   bdbackup restore -c config.toml
 #   bdbackup restore -c config.toml --backup-id 12 --dst /restore/job-12 --yes
+
+# Optional Prometheus textfile for node_exporter and PMM; see docs/README_METRICS.md.
+# `bdbackup metrics -c config.toml` is read-only and runs from cron every 10 to 15 minutes.
+# It requires [history]. Omit this section to run without it. `metrics` is a reserved table
+# name, not a job.
+# [metrics]
+#
+# The file to write (required): a nonempty path ending in .prom, in a directory that exists and
+# that the OS user running metrics can write. ~ expands and a relative path resolves against
+# this file. For a PMM 3 client the low-resolution textfile directory is
+# /usr/local/percona/pmm/collectors/textfile-collector/low-resolution (check other versions).
+# path = "/var/lib/node_exporter/textfile/bdbackup.prom"
+#
+# The limit of each wait of a metrics run, in seconds: a positive whole number (default: 60).
+# A run takes at most about three times it.
+# timeout_seconds = 60
 
 # ---------------------------------------------------------------------------
 # File backup: tar archive built from a plain-text template of paths.
