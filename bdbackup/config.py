@@ -41,7 +41,7 @@ def supported_types() -> set[str]:
 class Config:
     """Load and validate a TOML job configuration file."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, lexical: bool = False):
         self.path = Path(path).expanduser().resolve()
         self.jobs: dict[str, Job] = {}
         self.history: HistorySettings | None = None
