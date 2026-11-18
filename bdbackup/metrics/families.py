@@ -40,6 +40,9 @@ GFS_SOURCE_NEWEST = "bdbackup_gfs_source_newest_timestamp_seconds"
 GFS_SOURCE_OLDEST = "bdbackup_gfs_source_oldest_timestamp_seconds"
 GFS_SOURCE_UNITS = "bdbackup_gfs_source_units"
 GFS_SOURCE_BYTES = "bdbackup_gfs_source_bytes"
+DESTINATION_SIZE = "bdbackup_destination_size_bytes"
+DESTINATION_FREE = "bdbackup_destination_free_bytes"
+GFS_LEDGER_SNAPSHOT = "bdbackup_gfs_ledger_snapshot_timestamp_seconds"
 GFS_LAST_MOVE = "bdbackup_gfs_last_move_timestamp_seconds"
 GFS_UNMANAGED_UNITS = "bdbackup_gfs_unmanaged_units"
 GFS_UNMANAGED_BYTES = "bdbackup_gfs_unmanaged_bytes"
@@ -153,6 +156,23 @@ BUILTIN = (
         GFS_STAGE_VERIFY,
         "1 when GFS re-reads the checksums of the stage's units, 0 for verify = false.",
         ("job_name", "stage"),
+    ),
+    Family(
+        DESTINATION_SIZE,
+        "Size of the destination's filesystem, f_blocks x f_frsize, where its marker is a file.",
+        ("job_name", "stage", "path"),
+    ),
+    Family(
+        DESTINATION_FREE,
+        "Space available to the OS user on the destination's filesystem, f_bavail x f_frsize, "
+        "where its marker is a file.",
+        ("job_name", "stage", "path"),
+    ),
+    Family(
+        GFS_LEDGER_SNAPSHOT,
+        "Modification time of the gfs job's ledger snapshot on the destination; absent when "
+        "there is none.",
+        ("job_name", "stage", "path"),
     ),
     Family(
         HISTORY_SCHEMA_VERSION,

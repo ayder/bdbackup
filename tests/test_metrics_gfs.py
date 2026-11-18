@@ -1,24 +1,37 @@
 """The GFS families of 0.7.4 that ``metrics`` computes from the history database (spec 16).
 
 Coverage, reach and size per source job, the last move per stage pair, the unmanaged records,
-the stage's verify flag and the schema version (tier A). Dates are local: every test here runs
+the stage's verify flag and the schema version (tier A), and the capacity and ledger snapshot
+time of a destination (tier B, with the probe stubbed). Dates are local: every test here runs
 with ``TZ=UTC``, and the metrics run's "today" is injected as ``now``.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from stat import S_IFREG
 
 import pytest
 
 from bdbackup.config import Config
 from bdbackup.engines import _reset_for_tests
 from bdbackup.gfs import store as gfs_store
+from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History
-from bdbackup.metrics.collector import DESTINATION, Results
+from bdbackup.metrics.collector import (
+    DESTINATION,
+    Failure,
+    MetricError,
+    Results,
+    StatAnswer,
+    StatRequest,
+    StatvfsAnswer,
+    StatvfsRequest,
+)
 from bdbackup.metrics.run import collect_all
 from tests.test_gfs_run import Env
 from tests.test_metrics_collect import epoch, in_process_probe, sql, touch_database, values
@@ -56,9 +69,13 @@ def env(tmp_path):
 
 
 def collect(env, now=TODAY):
+    return collect_with(env, in_process_probe, now)
+
+
+def collect_with(env, probe, now=TODAY):
     config = Config(env.config_path)
     return collect_all(
-        config.jobs, History(config.history), now=now, timeout_seconds=5, probe=in_process_probe
+        config.jobs, History(config.history), now=now, timeout_seconds=5, probe=probe
     )
 
 
@@ -383,3 +400,135 @@ def test_there_is_no_schema_version_before_the_database_exists(env):
     assert not env.database.exists()
 
     assert values(collect(env), "bdbackup_history_schema_version") == {}
+
+
+# ---- capacity and the ledger snapshot time of a destination (spec 5) ---------------------------
+
+VFS = StatvfsAnswer(f_blocks=1000, f_bavail=400, f_frsize=4096)
+SNAPSHOT_NS = 1_794_390_000_123_456_789  # 2026-11-18T09:00:00.12 UTC
+
+
+def file_stat(mtime_ns=0) -> StatAnswer:
+    return StatAnswer(S_IFREG | 0o644, 1, 1, 1, mtime_ns)
+
+
+def share(*, marker=True, snapshots=None, vfs=VFS):
+    """A probe that answers for a share: the markers, the capacity and the ledger snapshots.
+
+    ``snapshots`` maps a snapshot path to its mtime in ns; the others do not exist.
+    """
+    asked = []
+
+    def probe(requests, timeout):
+        asked.extend(requests)
+        answers = {}
+        for request in requests:
+            if isinstance(request, StatvfsRequest):
+                answers[request] = vfs
+            elif request.path.name == MARKER:
+                answers[request] = file_stat() if marker else Failure(errno.ENOENT)
+            elif request.path in (snapshots or {}):
+                answers[request] = file_stat(snapshots[request.path])
+            else:
+                answers[request] = Failure(errno.ENOENT)
+        return Results(answers, {DESTINATION: "ok"})
+
+    probe.asked = asked
+    return probe
+
+
+def by_path(collected, family):
+    found = values(collected, family, "job_name", "stage", "path")
+    return {key[1:]: value for key, value in found.items() if key[0] == JOB}
+
+
+def paths(env):
+    return str(env.abs("NFS/daily")), str(env.abs("NFS/weekly"))
+
+
+def test_a_ready_path_gives_its_size_and_free_bytes(env):
+    daily, weekly = paths(env)
+
+    collected = collect_with(env, share())
+
+    expected = {("2", daily): 1000 * 4096, ("3", weekly): 1000 * 4096}
+    assert by_path(collected, "bdbackup_destination_size_bytes") == expected
+    assert by_path(collected, "bdbackup_destination_free_bytes") == {
+        ("2", daily): 400 * 4096, ("3", weekly): 400 * 4096,
+    }
+    assert by_path(collected, "bdbackup_destination_ready") == {("2", daily): 1, ("3", weekly): 1}
+
+
+def test_a_path_without_its_marker_gives_no_capacity(env):
+    daily, weekly = paths(env)
+
+    collected = collect_with(env, share(marker=False))  # an unmounted mount point
+
+    assert by_path(collected, "bdbackup_destination_ready") == {("2", daily): 0, ("3", weekly): 0}
+    assert by_path(collected, "bdbackup_destination_size_bytes") == {}
+    assert by_path(collected, "bdbackup_destination_free_bytes") == {}
+
+
+def test_a_timeout_gives_no_capacity_or_snapshot_series_and_the_destination_error(env):
+    collected = collect_with(
+        env, lambda requests, timeout: Results({}, {DESTINATION: "timeout"})
+    )
+
+    assert collected.errors == [MetricError("destination", "", "timeout")]
+    for family in ("bdbackup_destination_size_bytes", "bdbackup_destination_free_bytes",
+                   "bdbackup_gfs_ledger_snapshot_timestamp_seconds"):
+        assert by_path(collected, family) == {}
+
+
+def test_a_hang_after_the_marker_keeps_it_ready_and_gives_no_capacity(env):
+    daily, weekly = paths(env)
+
+    def probe(requests, timeout):  # the child answered the first marker, then hung
+        first = requests[0]
+        assert first.path.name == MARKER
+        return Results({first: file_stat()}, {DESTINATION: "timeout"})
+
+    collected = collect_with(env, probe)
+
+    assert collected.errors == [MetricError("destination", "", "timeout")]
+    assert by_path(collected, "bdbackup_destination_ready") == {("2", daily): 1, ("3", weekly): 0}
+    assert by_path(collected, "bdbackup_destination_size_bytes") == {}
+
+
+def test_the_ledger_snapshot_time_is_the_mtime_of_the_snapshot_file(env):
+    daily, weekly = paths(env)
+    snapshot = env.abs("NFS/daily") / "gfs-main.ledger.sqlite3"
+
+    collected = collect_with(env, share(snapshots={snapshot: SNAPSHOT_NS}))
+
+    assert by_path(collected, "bdbackup_gfs_ledger_snapshot_timestamp_seconds") == {
+        ("2", daily): SNAPSHOT_NS // 1_000_000_000  # stage 3 has no snapshot: no series
+    }
+
+
+def test_one_stat_and_one_statvfs_per_destination_path(env):
+    probe = share()
+
+    collect_with(env, probe)
+
+    daily, weekly = env.abs("NFS/daily"), env.abs("NFS/weekly")
+    for path in (daily, weekly):
+        assert StatRequest(path / MARKER) in probe.asked
+        assert StatvfsRequest(path) in probe.asked
+        assert StatRequest(path / "gfs-main.ledger.sqlite3") in probe.asked
+    assert len(probe.asked) == 6  # the first stage is not a destination: nothing is asked of it
+    assert all(request.probe == DESTINATION for request in probe.asked)
+
+
+def test_a_first_stage_a_pgbackrest_job_writes_into_has_capacity_too(env, monkeypatch):
+    def refuse(cmd, **kwargs):  # a pgbackrest job is collected with `pgbackrest info`
+        raise FileNotFoundError(2, "No such file or directory", cmd[0])
+
+    monkeypatch.setattr("bdbackup.postgres.pgbackrest.subprocess.run", refuse)
+    env.feed_first_stage()
+    first = str(env.abs("BACKUP"))
+
+    collected = collect_with(env, share())
+
+    assert by_path(collected, "bdbackup_destination_size_bytes").get(("1", first)) == 1000 * 4096
+    assert by_path(collected, "bdbackup_destination_free_bytes").get(("1", first)) == 400 * 4096

@@ -39,6 +39,14 @@ class StatRequest:
 
 
 @dataclass(frozen=True)
+class StatvfsRequest:
+    """``os.statvfs`` of ``path``, in the probe named ``probe``: the capacity of its filesystem."""
+
+    path: Path
+    probe: str = DESTINATION
+
+
+@dataclass(frozen=True)
 class ListPrefixRequest:
     """The entries of ``directory`` whose name starts with ``prefix``, with their mtimes."""
 
@@ -47,7 +55,7 @@ class ListPrefixRequest:
     probe: str = REPOSITORY
 
 
-Request = StatRequest | ListPrefixRequest
+Request = StatRequest | StatvfsRequest | ListPrefixRequest
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,15 @@ class StatAnswer:
     st_ino: int
     st_size: int
     st_mtime_ns: int
+
+
+@dataclass(frozen=True)
+class StatvfsAnswer:
+    """The facts of a successful ``os.statvfs``; the field names are ``os.statvfs_result``'s."""
+
+    f_blocks: int
+    f_bavail: int
+    f_frsize: int
 
 
 @dataclass(frozen=True)
@@ -84,13 +101,20 @@ class Results:
     or ``failed``.
     """
 
-    answers: Mapping[Request, StatAnswer | ListAnswer | Failure] = field(default_factory=dict)
+    answers: Mapping[Request, StatAnswer | StatvfsAnswer | ListAnswer | Failure] = field(
+        default_factory=dict
+    )
     status: Mapping[str, str] = field(default_factory=dict)
 
     def stat(self, path: Path, probe: str = DESTINATION) -> StatAnswer | None:
         """The stat facts of ``path``; ``None`` when it is missing, refused or never reported."""
         answer = self.answers.get(StatRequest(path, probe))
         return answer if isinstance(answer, StatAnswer) else None
+
+    def statvfs(self, path: Path, probe: str = DESTINATION) -> StatvfsAnswer | None:
+        """The capacity facts of ``path``; ``None`` when it failed or never reported."""
+        answer = self.answers.get(StatvfsRequest(path, probe))
+        return answer if isinstance(answer, StatvfsAnswer) else None
 
     def listing(self, directory: Path, prefix: str, probe: str = REPOSITORY) -> ListAnswer | None:
         """The matching entries of ``directory``; ``None`` when it failed or never reported."""

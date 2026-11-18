@@ -28,6 +28,7 @@ from bdbackup.metrics.collector import (
     MetricError,
     StatAnswer,
     StatRequest,
+    StatvfsRequest,
 )
 from bdbackup.metrics.probe import CHILD_SOURCE, run_probes
 from bdbackup.metrics.run import collect_all
@@ -127,6 +128,20 @@ def test_stat_facts_of_a_file_a_directory_a_link_and_a_missing_path(tmp_path):
     assert results.answers.get(StatRequest(missing)) == Failure(errno.ENOENT)
     assert results.probe_status(DESTINATION) == "ok"
     assert results.probe_status(REPOSITORY) is None  # that probe did not run
+
+
+def test_the_child_answers_a_real_statvfs_request(tmp_path):
+    missing = tmp_path / "missing"
+
+    results = run_probes([StatvfsRequest(tmp_path), StatvfsRequest(missing)], 10)
+
+    answer, real = results.statvfs(tmp_path), os.statvfs(tmp_path)
+    assert answer is not None
+    assert (answer.f_blocks, answer.f_frsize) == (real.f_blocks, real.f_frsize)
+    assert 0 < answer.f_bavail <= answer.f_blocks  # free space moves between the two calls
+    assert results.statvfs(missing) is None
+    assert results.answers.get(StatvfsRequest(missing)) == Failure(errno.ENOENT)
+    assert results.probe_status(DESTINATION) == "ok"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root searches any directory")
@@ -319,9 +334,13 @@ def run_for(env, **kwargs):
     return collect_all(config.jobs, History(config.history), now=NOW, timeout_seconds=10, **kwargs)
 
 
+VOLATILE = "bdbackup_destination_free_bytes"  # the disk's free space moves between two calls
+
+
 def comparable(collected):
     return sorted(
-        (s.family, tuple(sorted(s.labels.items())), s.value) for s in collected.samples
+        (s.family, tuple(sorted(s.labels.items())), None if s.family == VOLATILE else s.value)
+        for s in collected.samples
     )
 
 
@@ -345,6 +364,10 @@ def test_the_collectors_use_the_real_probe_by_default(env):
         config.jobs, History(config.history), now=NOW, timeout_seconds=10, probe=in_process_probe
     )
     assert comparable(collected) == comparable(in_process)
+    size = values(collected, "bdbackup_destination_size_bytes", "job_name", "stage")
+    free = values(collected, VOLATILE, "job_name", "stage")
+    assert set(size) == set(free) == {("gfs-main", "2")}  # the weekly stage lost its marker
+    assert 0 < free[("gfs-main", "2")] <= size[("gfs-main", "2")]
 
 
 def test_a_hung_destination_is_one_error_and_the_rest_is_still_written(env, monkeypatch):

@@ -20,6 +20,7 @@ from bdbackup.metrics.collector import (
     Results,
     StatAnswer,
     StatRequest,
+    StatvfsRequest,
 )
 
 # The child reads the requests as JSON on stdin and prints one JSON line per request, in order,
@@ -64,6 +65,8 @@ def _child_argv() -> list[str]:
 def _wire(request: Request) -> dict:
     if isinstance(request, StatRequest):
         return {"kind": "stat", "path": str(request.path)}
+    if isinstance(request, StatvfsRequest):
+        return {"kind": "statvfs", "path": str(request.path)}
     return {"kind": "list", "directory": str(request.directory), "prefix": request.prefix}
 
 
