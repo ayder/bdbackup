@@ -230,6 +230,19 @@ The status is `running` while the run works, `completed` once it reaches its rep
 (Known limits below). Each `gfs_steps` row names its run in `run_id`. A dry run
 records nothing.
 
+Every such run also records its outcome in the `last_runs` table (history schema 6), one row
+per job: its end, its exit code and a result. The results are `completed` (exit 0), `failed`
+(exit 1), `deferred` (exit 3, only deferred work remained), `locked` (exit 3, another run of
+the job is in progress) and `error` (the run raised). A run that finds the job lock busy
+records `locked` and changes nothing else.
+
+## Metrics
+
+`bdbackup metrics` writes a Prometheus textfile with the last run of each gfs job, the units
+in each stage, the stage settings and the readiness of every destination. The stage figures
+come from the history database and equal the `Stage` lines of the run's report. See
+[Prometheus metrics](README_METRICS.md#gfs).
+
 ## Running backups
 
 While a job has a backup in state `running` in the
@@ -293,7 +306,9 @@ so a remount or a reboot can change it. This affects every NFS stage, not only
 pgbackrest tars. It is documented, not fixed:
 
 - `bdbackup history` shows the units on the share as `unavailable`, and history
-  restore refuses them. Restore a tar with `bdbackup restore --archive` and an
+  restore refuses them. `bdbackup_history_units{state="unavailable"}` counts them in the
+  metrics, so a remount is visible in monitoring (see
+  [Prometheus metrics](README_METRICS.md#history-units)). Restore a tar with `bdbackup restore --archive` and an
   xtrabackup directory with `bdbackup restore --backup`; for a pgBackRest tar,
   `--archive` also prints the restore command (see
   [the pgbackrest document](README_PGBACKREST.md#when-the-repository-host-is-lost)).

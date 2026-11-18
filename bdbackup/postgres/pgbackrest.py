@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from bdbackup.backends import BackupError, BackupResult
 from bdbackup.engines import EngineInfo
 from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History
+from bdbackup.postgres.metrics import PgBackRestCollector
 from bdbackup.postgres.repository import (
     ENCRYPTED,
     LABEL,
@@ -45,6 +47,35 @@ class Choice:
 
     full: FullBackup
     new: bool
+
+
+@dataclass
+class ExportProgress:
+    """How far an export got, and how long its phases took; ``PgBackRest.export`` fills it in.
+
+    ``step`` is the phase the export is in, and after a failure the phase it failed in:
+    ``start``, ``destination``, ``write``, ``verify``, ``publish`` or ``done``.
+    """
+
+    step: str = "start"
+    write_seconds: float | None = None
+    verify_seconds: float | None = None
+
+
+_clock = time.monotonic  # the export's timer, a module attribute so tests can set it
+
+
+class PgBackRestError(BackupError):
+    """A pgBackRest command that failed, and why.
+
+    ``reason`` is ``binary_missing`` (not found, or not executable), ``failed`` (an exit
+    status, or any other failure to start it), ``timeout`` or ``output_invalid`` (``info``
+    printed something that is not a JSON list of stanzas).
+    """
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _whole_number(value: object, minimum: int) -> bool:
@@ -95,17 +126,45 @@ class PgBackRest:
             *args,
         ]
 
-    def _run(self, cmd: list[str], name: str) -> str:
-        """Run ``cmd`` and return its stdout; a failure carries pgBackRest's last stderr line."""
+    def _run(self, cmd: list[str], name: str, timeout: float | None = None) -> str:
+        """Run ``cmd`` and return its stdout; a failure carries pgBackRest's last stderr line.
+
+        Every failure is a :class:`PgBackRestError`, a BackupError that says why: a binary that
+        cannot be started is never an OSError. ``timeout`` (seconds) is passed to the command
+        only when given.
+        """
+        options = {} if timeout is None else {"timeout": timeout}
         try:
             completed = subprocess.run(  # noqa: S603
-                cmd, check=True, capture_output=True, text=True
+                cmd, check=True, capture_output=True, text=True, **options
             )
         except subprocess.CalledProcessError as exc:
             lines = (exc.stderr or "").strip().splitlines()
             detail = lines[-1].strip() if lines else f"exit status {exc.returncode}"
-            raise BackupError(f"pgbackrest {name} failed: {detail}") from exc
+            raise PgBackRestError(f"pgbackrest {name} failed: {detail}", "failed") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise PgBackRestError(
+                f"pgbackrest {name} timed out after {timeout} seconds", "timeout"
+            ) from exc
+        except OSError as exc:
+            raise self._start_failure(cmd[0], name, exc) from exc
         return completed.stdout
+
+    @staticmethod
+    def _start_failure(binary: str, name: str, exc: OSError) -> PgBackRestError:
+        """The error for a pgBackRest command that could not be started."""
+        if isinstance(exc, FileNotFoundError):
+            return PgBackRestError(
+                f"pgbackrest binary not found: {binary} "
+                "(set the job's binary key to its full path)",
+                "binary_missing",
+            )
+        if isinstance(exc, PermissionError):
+            return PgBackRestError(
+                f"pgbackrest binary is not executable: {binary} (check its permissions)",
+                "binary_missing",
+            )
+        return PgBackRestError(f"pgbackrest {name} failed: {exc.strerror or exc}", "failed")
 
     def version(self) -> str:
         """The pgBackRest version, for example ``2.58.0`` from ``pgBackRest 2.58.0``."""
@@ -115,15 +174,20 @@ class PgBackRest:
             raise BackupError(f"unexpected pgbackrest version output: {text!r}")
         return match.group(1)
 
-    def info(self) -> list[dict]:
-        """The ``info --output=json`` document: one entry per stanza of the repository."""
-        text = self._run(self.command("info", "--output=json"), "info")
+    def info(self, timeout: float | None = None) -> list[dict]:
+        """The ``info --output=json`` document: one entry per stanza of the repository.
+
+        ``timeout`` (seconds) limits the command; ``None`` lets it run as long as it takes.
+        """
+        text = self._run(self.command("info", "--output=json"), "info", timeout)
         try:
             document = json.loads(text)
         except ValueError:
             document = None
         if not isinstance(document, list) or not all(isinstance(s, dict) for s in document):
-            raise BackupError("pgbackrest info did not print a JSON list of stanzas")
+            raise PgBackRestError(
+                "pgbackrest info did not print a JSON list of stanzas", "output_invalid"
+            )
         return document
 
     def choose(self, history: History, job_name: str) -> Choice:
@@ -216,9 +280,11 @@ class PgBackRest:
         try:
             return call(), None
         except BackupError as exc:
+            # A binary that cannot be started is reported as the OS says it, as it always was
+            # here; ``run`` names the binary and the fix instead.
+            if isinstance(exc.__cause__, OSError):
+                return None, f"pgbackrest {name} failed: {exc.__cause__.strerror or exc.__cause__}"
             return None, str(exc)
-        except OSError as exc:  # the binary is missing or cannot be run
-            return None, f"pgbackrest {name} failed: {exc.strerror or exc}"
 
     def _binary_line(self) -> tuple[str, str]:
         found = shutil.which(self.binary)
@@ -302,24 +368,33 @@ class PgBackRest:
             return "OK", f"{subject} does not exist; {target} is writable, so it can be created"
         return "FAIL", f"{subject} does not exist and {target} is not a writable directory"
 
-    def export(self, full: FullBackup, *, verify: bool = True) -> BackupResult:
+    def export(
+        self, full: FullBackup, *, verify: bool = True,
+        progress: ExportProgress | None = None,
+    ) -> BackupResult:
         """Write ``full`` as one tar in ``out_dir``, hashing its bytes as they are written.
 
         With ``verify`` the temporary file is read back once before it gets its final name.
         Nothing is published unless the whole tar was written, synced and, with ``verify``,
         read back; on any failure the temporary file is removed. Every file under
         ``repo_path`` is opened read-only.
+
+        ``progress``, when given, is updated as the export goes, so its caller can tell after
+        a failure which phase failed and what the phases took (:class:`ExportProgress`).
         """
+        progress = progress if progress is not None else ExportProgress()
+        progress.step = "destination"
         self.require_marker()
         try:
-            return self._export(full, verify)
+            return self._export(full, verify, progress)
         except OSError as exc:
             # Not left as an OSError: BlockingIOError would read as a busy lock (exit 3).
             raise BackupError(
                 f"cannot export {full.label} to {self.out_dir}: {exc.strerror or exc}"
             ) from exc
 
-    def _export(self, full: FullBackup, verify: bool) -> BackupResult:
+    def _export(self, full: FullBackup, verify: bool, progress: ExportProgress) -> BackupResult:
+        progress.step = "write"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._remove_stale_temps()
         final = self.unit_path(full.label)
@@ -329,14 +404,20 @@ class PgBackRest:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         writer = _HashingWriter(fd)
         try:
+            started = _clock()
             names = self._write_tar(writer, full.label)
             os.fsync(fd)
             # Cleared before the close: a failed close has still released the descriptor.
             closing, fd = fd, None
             os.close(closing)
+            progress.write_seconds = _clock() - started
             if verify:
+                progress.step = "verify"
+                started = _clock()
                 # As FileBackup.close_archive does: a tar that fails is never published.
                 self._read_back(temp, final, writer.sha256.hexdigest(), names)
+                progress.verify_seconds = _clock() - started
+            progress.step = "publish"
             os.rename(temp, final)
         except BaseException:
             # A failed tar stream flushes its buffer again when it is collected; that write
@@ -347,6 +428,7 @@ class PgBackRest:
             temp.unlink(missing_ok=True)
             raise
         _fsync_dir(self.out_dir)
+        progress.step = "done"
         return BackupResult(
             final, size_bytes=writer.size, success=True, checksum=writer.sha256.hexdigest()
         )
@@ -533,4 +615,5 @@ ENGINE = EngineInfo(
     backend=PgBackRest,
     description="pgBackRest full backups exported as one tar",
     family="postgres",
+    metrics=PgBackRestCollector(),
 )

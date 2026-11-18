@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ from bdbackup.engines import _reset_for_tests, get_engine, list_engines
 from bdbackup.gfs.stages import MARKER, fed_first_stages, pgbackrest_first_stage
 from bdbackup.history import History, HistorySettings
 from bdbackup.postgres import PgBackRest
-from bdbackup.postgres.pgbackrest import ENGINE, TESTED_VERSIONS, Choice
+from bdbackup.postgres.pgbackrest import ENGINE, TESTED_VERSIONS, Choice, PgBackRestError
 from bdbackup.postgres.repository import FullBackup, RepositoryError
 from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo, missing_stanza_info
 
@@ -493,6 +494,135 @@ def test_a_failing_command_without_stderr_still_says_why(tmp_path):
 
     with patch(RUN, run), pytest.raises(BackupError, match="exit status 2"):
         engine.version()
+
+
+# ---- why a command failed (the reason the metrics command reports) --------------------------
+
+
+def raised(call):
+    """The exception ``call`` raises, so a test can assert on its class and its reason."""
+    try:
+        call()
+    except Exception as exc:
+        return exc
+    raise AssertionError("the call raised nothing")
+
+
+def failing(error):
+    def run(cmd, **kwargs):
+        raise error
+
+    return run
+
+
+@pytest.mark.parametrize(
+    ("error", "reason", "message"),
+    [
+        pytest.param(
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+            "binary_missing",
+            "pgbackrest binary not found: pgbackrest (set the job's binary key to its full path)",
+            id="binary-missing",
+        ),
+        pytest.param(
+            PermissionError(errno.EACCES, "Permission denied"),
+            "binary_missing",
+            "pgbackrest binary is not executable: pgbackrest (check its permissions)",
+            id="binary-not-executable",
+        ),
+        pytest.param(
+            OSError(errno.ENOEXEC, "Exec format error"),
+            "failed",
+            "pgbackrest info failed: Exec format error",
+            id="cannot-start",
+        ),
+        pytest.param(
+            subprocess.CalledProcessError(
+                55, ["pgbackrest"], output="", stderr="P00   INFO: x\nP00  ERROR: [055]: bad\n"
+            ),
+            "failed",
+            "pgbackrest info failed: P00  ERROR: [055]: bad",
+            id="exit-status",
+        ),
+        pytest.param(
+            subprocess.TimeoutExpired(["pgbackrest"], 30),
+            "timeout",
+            "pgbackrest info timed out after 30 seconds",
+            id="timeout",
+        ),
+    ],
+)
+def test_a_failed_command_carries_its_reason(tmp_path, error, reason, message):
+    engine = make_engine(tmp_path)
+
+    with patch(RUN, failing(error)):
+        caught = raised(lambda: engine.info(timeout=30))
+
+    assert isinstance(caught, PgBackRestError), repr(caught)
+    assert isinstance(caught, BackupError)
+    assert caught.reason == reason
+    assert str(caught) == message
+
+
+@pytest.mark.parametrize("output", ["not json", '{"name": "main"}', "[1]"])
+def test_output_that_is_not_the_info_document_has_the_output_invalid_reason(tmp_path, output):
+    engine = make_engine(tmp_path)
+    produced = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+
+    with patch(RUN, return_value=produced):
+        caught = raised(engine.info)
+
+    assert isinstance(caught, PgBackRestError), repr(caught)
+    assert caught.reason == "output_invalid"
+    assert str(caught) == "pgbackrest info did not print a JSON list of stanzas"
+
+
+def test_info_passes_its_timeout_to_the_command(tmp_path):
+    seen = []
+
+    def run(cmd, **kwargs):
+        seen.append(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+    with patch(RUN, run):
+        make_engine(tmp_path).info(timeout=7)
+
+    assert seen == [{"check": True, "capture_output": True, "text": True, "timeout": 7}]
+
+
+def test_info_without_a_timeout_passes_no_timeout_to_the_command(tmp_path):
+    seen = []
+
+    def run(cmd, **kwargs):
+        seen.append(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+    with patch(RUN, run):
+        make_engine(tmp_path).info()
+
+    assert seen == [{"check": True, "capture_output": True, "text": True}]
+
+
+def test_failure_messages_are_the_ones_they_always_were(tmp_path):
+    engine = make_engine(tmp_path)
+    stderr = "P00   INFO: info command begin\nP00  ERROR: [055]: unable to open file\n\n"
+    cases = [
+        (
+            engine.version,
+            subprocess.CalledProcessError(55, ["pgbackrest"], output="", stderr=stderr),
+            "pgbackrest version failed: P00  ERROR: [055]: unable to open file",
+        ),
+        (
+            engine.version,
+            subprocess.CalledProcessError(2, ["pgbackrest"], output="", stderr=""),
+            "pgbackrest version failed: exit status 2",
+        ),
+    ]
+    for call, error, message in cases:
+        with patch(RUN, failing(error)):
+            caught = raised(call)
+        assert isinstance(caught, BackupError)
+        assert str(caught) == message
 
 
 # ---- restore info ---------------------------------------------------------------------------

@@ -4,7 +4,8 @@ A pgbackrest job copies the newest full backup of one pgBackRest stanza into the
 stage of a GFS job as a single tar file. GFS then ages the tars, for example 14 days on an
 NFS share. Each tar restores on its own, without the WAL archive or any other backup. This
 page covers the job keys, how to take the fulls, a worked example, the first stage, what a
-run does, the dry run and validation, history and restore, and the known limits.
+run does, what a run records for the metrics, the dry run and validation, history and restore,
+and the known limits.
 
 Part of the [bdbackup documentation](../README.md).
 
@@ -172,6 +173,10 @@ the share is mounted.
    export (see below). Otherwise write the tar, read it back once to verify it, and record
    the run in the history.
 
+A history row or record on this page is a backup record, the kind `bdbackup history` lists and
+GFS manages. The outcome of the run is kept apart from it, see
+[Run outcome and metrics](#run-outcome-and-metrics).
+
 The tar is `<out_dir>/<stanza>-<label>.tar`, for example
 `/mnt/backup/pg/main/main-20261109-010203F.tar`. It is not compressed: the repository's own
 compression stays as pgBackRest wrote it. Its members have paths relative to `repo_path`,
@@ -205,7 +210,44 @@ while writing. `--no-verify` skips the read-back.
 
 A failure after the full was chosen (the marker check, the write, the read-back, a full
 that changed) records a `failed` row and exits 1. It does not count as exported, so the
-next run tries the same full again. A refusal records nothing.
+next run tries the same full again. A refusal writes no backup record.
+
+A `binary` that cannot be started is reported, not raised. The run fails with exit 1, writes
+no history row and logs one of these, and `--dry-run` reports the same:
+
+```
+pgbackrest binary not found: pgbackrest (set the job's binary key to its full path)
+pgbackrest binary is not executable: /usr/local/bin/pgbackrest (check its permissions)
+```
+
+`--validate` reports the same binary as FAIL lines, for example
+`pgbackrest version failed: No such file or directory`.
+
+## Run outcome and metrics
+
+Every run that is not a dry run records its outcome in the `last_runs` table of the history
+database (schema 6), one row per job, whether or not it wrote a backup record. The row holds
+the end of the run, its exit code and one of these results:
+
+| Result | Meaning |
+|--------|---------|
+| `exported` | A new full was exported. |
+| `no_new_full` | The newest full was already exported (exit 0). |
+| `full_too_old` | No new full, and the newest is older than `max_full_age_hours` (exit 1). |
+| `locked` | Another run of the job holds its lock (exit 3). |
+| `destination_not_ready` | The first stage's marker is missing. |
+| `export_failed` | Writing or publishing the tar failed. |
+| `verify_failed` | The read-back of the tar failed. |
+| `failed` | Anything else: a failed `pgbackrest` command, a refusal (an encrypted repository, no full, a full without archive-copy) or a usage error. |
+
+An `exported` run also keeps the time of the write and of the read-back, the label, the size
+and the age of the full; the other results leave that part as the last export wrote it. A run
+refused for root records nothing, so it never leaves a history database owned by root.
+
+`bdbackup metrics` reads this table and `pgbackrest info` to write the Prometheus metrics of
+the job: the last run, the last export, the repository's backups and the WAL archive. See
+[Prometheus metrics](README_METRICS.md#pgbackrest). A nightly job that finds no new full
+every night exits 0, so alert on the age of the last export as well.
 
 ## When there is no new full
 
@@ -216,8 +258,9 @@ label and the age of that full, then exits 0:
 no new full: newest 20261109-010203F, 2 hours old
 ```
 
-Nothing is recorded for such a run. A nightly export that finds no new full every night
-would therefore look healthy, so set `max_full_age_hours`. When the newest full is more
+No backup record is written for such a run (its outcome is recorded, see
+[Run outcome and metrics](#run-outcome-and-metrics)). A nightly export that finds no new full
+every night would therefore look healthy, so set `max_full_age_hours`. When the newest full is more
 than that many hours old, the same message gets a suffix and the run exits 1 instead:
 
 ```

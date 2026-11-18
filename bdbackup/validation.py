@@ -283,6 +283,22 @@ def _mysql(report: Report, backend) -> None:
         _grant_help(report, backend, account, requirements)
 
 
+def _metrics(report: Report, path: Path) -> None:
+    """The metrics file is replaced whole, so its directory is what needs write access."""
+    first = len(report.lines)
+    _directory(report, path.parent, "Metrics directory", write=True)
+    if not report.lines[first].startswith("[OK]"):
+        return
+    if path.is_dir():
+        report.add("FAIL", f"Metrics file: {path} is a directory; the file cannot replace it.")
+    elif path.exists():
+        report.add(
+            "OK",
+            f"Metrics file: {path} exists; it is replaced whole, so only its directory "
+            "needs write access.",
+        )
+
+
 def _gfs(report: Report, job: Job, config_path: Path, fed: bool) -> None:
     """Check the later stages, and the first one when a pgbackrest job writes into it."""
     for stage in job.params["stage"] if fed else job.params["stage"][1:]:
@@ -312,6 +328,8 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
         if db.exists():
             _file(report, db, "SQLite history", write=True)
         _directory(report, config.history.restore_root, "Recovery root", write=True, create=True)
+    if config.metrics is not None:
+        _metrics(report, config.metrics.path)
     for job in jobs:
         if not job.active:
             report.lines.append(

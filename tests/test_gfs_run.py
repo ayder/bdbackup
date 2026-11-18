@@ -3,6 +3,7 @@
 import errno
 import hashlib
 import io
+import logging
 import os
 import re
 import shutil
@@ -21,7 +22,7 @@ from bdbackup.backends import BackupResult
 from bdbackup.cli import main
 from bdbackup.config import Config
 from bdbackup.gfs import actions, runner
-from bdbackup.history import History
+from bdbackup.history import History, HistoryError
 from bdbackup.ledger import checksum
 from bdbackup.mysql import XtraBackup
 from bdbackup.recovery import backup_restore_info
@@ -653,18 +654,25 @@ def test_running_backup_defers_its_job(env):
     assert not c.exists()
 
 
+def ledger_dump(env):
+    """Every statement that rebuilds the history database, but those for ``last_runs``."""
+    with closing(sqlite3.connect(env.database)) as db:
+        return [line for line in db.iterdump() if "last_runs" not in line]
+
+
 def test_second_run_exits_3(env):
     env.file_unit("a.tar.gz", days_ago=7)
     env.file_unit("b.tar.gz", days_ago=0)
     config = Config(env.config_path)
     before_tree = tree(env.root, exclude=("state",))
-    before_db = env.database.read_bytes()
+    before_ledger = ledger_dump(env)
     with process_lock(runner.job_lock_path(config, "gfs-main")):
         result = env.run_cli()
     assert result.exit_code == 3, result.output
     assert "another run of gfs-main is in progress" in result.output
     assert tree(env.root, exclude=("state",)) == before_tree
-    assert env.database.read_bytes() == before_db
+    # The run only notes in last_runs that it found the job locked.
+    assert ledger_dump(env) == before_ledger
 
 
 def test_interrupted_move_completes(env):
@@ -1041,3 +1049,140 @@ def test_report_lists_per_stage_totals(env, tmp_path):
             f"Stage {run.abs('NFS/daily')}: 1 unit ({sizes['a']} bytes)",
             f"Stage {run.abs('NFS/weekly')}: 0 units (0 bytes)",
         ], result.output
+
+
+# ---- the outcome of each run, kept for the metrics command ------------------------------------
+
+
+def last_run(env):
+    runs = env.history.last_runs()
+    assert "gfs-main" in runs, f"the run recorded no last_runs row: {sorted(runs)}"
+    return runs["gfs-main"]
+
+
+def test_last_run_of_a_completed_gfs_run(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    result = env.run_cli()
+
+    assert result.exit_code == 0, result.output
+    row = last_run(env)
+    assert (row.job_type, row.result, row.exit_code, row.facts) == ("gfs", "completed", 0, None)
+    assert datetime.fromisoformat(row.finished_at).utcoffset() == timedelta(0)
+
+
+def test_last_run_of_a_gfs_run_with_a_failure_is_failed(env):
+    (env.root / "NFS/weekly/.bdbackup-destination").unlink()  # the snapshot copy fails
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    result = env.run_cli()
+
+    assert result.exit_code == 1, result.output
+    row = last_run(env)
+    assert (row.result, row.exit_code) == ("failed", 1)
+
+
+def defer_a_unit(env):
+    """A unit whose job is still backing up: the run defers it and exits 3."""
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    with closing(sqlite3.connect(env.database)) as db, db:
+        db.execute(
+            "INSERT INTO backup_runs (job_name, backup_type, started_at, status, restore_info)"
+            " VALUES ('files', 'file', ?, 'running', '{}')", (datetime.now(UTC).isoformat(),),
+        )
+
+
+def test_last_run_of_a_gfs_run_with_deferred_work_is_deferred(env):
+    defer_a_unit(env)
+
+    result = env.run_cli()
+
+    assert result.exit_code == 3, result.output
+    row = last_run(env)
+    assert (row.result, row.exit_code) == ("deferred", 3)
+
+
+def test_last_run_of_a_busy_job_lock_is_locked(env):
+    env.file_unit("a.tar.gz", days_ago=0)
+    config = Config(env.config_path)
+
+    with process_lock(runner.job_lock_path(config, "gfs-main")):
+        result = env.run_cli()
+
+    assert result.exit_code == 3, result.output
+    row = last_run(env)
+    assert (row.result, row.exit_code, row.facts) == ("locked", 3, None)
+
+
+def test_last_run_of_a_gfs_run_that_raises_is_error_and_it_still_raises(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    with patch("bdbackup.gfs.runner.decide", side_effect=RuntimeError("injected")):
+        result = env.run_cli()
+
+    assert isinstance(result.exception, RuntimeError), result.output
+    assert result.exit_code == 1
+    row = last_run(env)
+    assert (row.result, row.exit_code) == ("error", 1)
+
+
+def test_a_gfs_dry_run_leaves_the_last_run_alone(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    before = last_run(env)
+    env.dry_run = True
+
+    result = env.run_cli()
+
+    assert result.exit_code == 0, result.output
+    assert env.history.last_runs()["gfs-main"] == before
+
+
+@pytest.mark.parametrize("error", [HistoryError("disk full"), OSError("read-only")],
+                         ids=["history", "os"])
+def test_a_gfs_last_run_recording_failure_is_a_warning_and_changes_nothing_else(env, caplog, error):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    caplog.set_level(logging.WARNING)
+
+    with patch.object(History, "record_last_run", side_effect=error):
+        result = env.run_cli()
+
+    assert result.exit_code == 0, result.output
+    assert "GFS run gfs-main" in result.output
+    warnings = [r for r in caplog.records
+                if r.levelno == logging.WARNING and r.name == "bdbackup.cli"]
+    assert len(warnings) == 1, caplog.text
+    assert "last run" in warnings[0].getMessage()
+    assert str(error) in warnings[0].getMessage()
+
+
+def test_last_run_needs_run_job_to_say_whether_exit_3_is_a_busy_lock_or_deferred_work(env):
+    config = Config(env.config_path)
+    job = config.get("gfs-main")
+    quiet = {"out": lambda _line: None}
+
+    busy = runner.RunOutcome()
+    with process_lock(runner.job_lock_path(config, "gfs-main")):
+        assert runner.run_job(config, job, outcome=busy, **quiet) == 3
+    assert busy.locked is True
+
+    defer_a_unit(env)
+    deferred = runner.RunOutcome()
+    assert runner.run_job(config, job, outcome=deferred, **quiet) == 3
+    assert deferred.locked is False
+
+
+def test_last_run_needs_no_outcome_from_run_job_it_returns_what_it_always_did(env):
+    config = Config(env.config_path)
+    job = config.get("gfs-main")
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert runner.run_job(config, job, out=lambda _line: None) == 0
+    with process_lock(runner.job_lock_path(config, "gfs-main")):
+        assert runner.run_job(config, job, out=lambda _line: None) == 3

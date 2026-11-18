@@ -31,6 +31,10 @@ run from cron.
   SHA-256 checksums in SQLite.
 - [Configuration validation](#validate-configuration-and-permissions) of
   settings, filesystem permissions and MySQL grants, without running a backup.
+- [Prometheus metrics](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md): a read-only
+  `bdbackup metrics` writes a textfile for node_exporter and PMM with the last run of each
+  pgbackrest and gfs job, the history, the GFS stages, the destinations and the pgBackRest
+  repository.
 - [Custom backup engines](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) as plugins.
 
 ## Documentation
@@ -42,7 +46,8 @@ run from cron.
 | [MySQL and MariaDB physical backups with Percona XtraBackup and MariaDB Backup](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) | xtrabackup jobs, full and incremental backups, encryption, preparing a recovery copy, engine pruning |
 | [PostgreSQL pgBackRest backups: nightly fulls exported to a GFS stage](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md) | pgbackrest jobs, taking fulls with archive-copy, the first stage, no new full and `max_full_age_hours`, restore and the printed pgBackRest command, the repository host lost, known limits |
 | [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, preparing stage directories, safety rules, run and step logs, ledger copies |
-| [Custom backup engines (plugins)](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) | the engine registry and writing your own engine |
+| [Prometheus metrics: `bdbackup metrics`](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md) | the metrics command and `[metrics]`, the textfile for node_exporter and PMM, every metric, alerting, hangs and outages, known limits |
+| [Custom backup engines (plugins)](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) | the engine registry, writing your own engine and its metrics collector |
 | [Running xtrabackup jobs with systemd timers](https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md) | service and timer templates, the mysql account, schedules, CPU, I/O and memory limits |
 | [Annotated configuration](https://github.com/ayder/bdbackup/blob/master/config.toml.example) | every config key with a comment |
 
@@ -90,7 +95,7 @@ pip install -e ".[dev]"
 
 ## Commands
 
-`bdbackup` has three commands; everything else is an option:
+`bdbackup` has four commands; everything else is an option:
 
 ```bash
 bdbackup run      -c CONFIG -j JOB [--full | --incremental] [--no-verify] [--dry-run]
@@ -100,6 +105,7 @@ bdbackup restore  -c CONFIG [--backup-id N] [--job JOB] [-y] [-d DIR] [--encrypt
 bdbackup restore  --archive ARCHIVE -d DIR
 bdbackup restore  --backup BACKUP --root ROOT -d DIR [--binary BINARY] [--encrypt-key-file KEY]
 bdbackup history  -c CONFIG [--job JOB] [--successful | --create-checksum]
+bdbackup metrics  -c CONFIG
 ```
 
 `-c` is `--config` on every command; `-j` is the short form of `--job` on `run`
@@ -108,14 +114,17 @@ only (`restore` and `history` take `--job`). `bdbackup` itself takes only
 `bdbackup --logging DEBUG run -c config.toml -j files-daily`. Levels: `DEBUG`,
 `INFO`, `WARNING`, `ERROR`.
 
+When the program reading a command's output exits early (`bdbackup history -c config.toml | head`),
+the rest of the output is dropped and the command ends quietly with the exit code it would have had.
+
 The CLI uses these exit codes:
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Backup/verify failure (including a job whose backend rejects its settings in a real run, except a pgbackrest job: exit 2), or validation checks failed/incomplete |
+| 1 | Backup/verify failure (including a job whose backend rejects its settings in a real run, except a pgbackrest job: exit 2), or validation checks failed/incomplete; for `metrics`, the file was written with an error series or could not be written |
 | 2 | Usage error, an inactive job, or a configuration error found when the config loads or by `--dry-run` |
-| 3 | Lock held; for GFS, another run of the job is in progress or only deferred work remains |
+| 3 | Lock held; for GFS, another run of the job is in progress or only deferred work remains; for `metrics`, another metrics run holds its lock |
 
 ## Config-driven jobs
 
@@ -155,7 +164,7 @@ config file's directory. Template entries and `exclude` entries resolve against
 mysqldump job, set `database = "mydatabase"`; for all databases include
 `--all-databases` in `options`.
 
-Except for the optional `[history]` settings, each top-level table is one job;
+Except for the optional `[history]` and `[metrics]` settings, each top-level table is one job;
 its keys (except `type`, `active` and `restore_root`) are passed
 to the backend constructor, so they use Python-style underscores
 (`exclude_templates`). See [config.toml.example](https://github.com/ayder/bdbackup/blob/master/config.toml.example)
@@ -211,6 +220,14 @@ the backups:
 Times use the cron daemon's timezone, and separate lines do not wait for each
 other: leave enough time for backups before GFS. Add `--dry-run` to the GFS line
 until its report looks right.
+
+`bdbackup metrics` writes the Prometheus textfile and runs every 10 to 15 minutes, as the
+OS account that owns the history database; see
+[Prometheus metrics](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md):
+
+```cron
+*/10 * * * * bdbackup metrics -c /opt/dbs/config.toml
+```
 
 xtrabackup jobs can run from systemd timers instead, which also stop the backup
 tool if bdbackup dies and add per-job limits: see
@@ -328,8 +345,10 @@ missing or was replaced, or `<id>: skipped: unexpected unit` for a physical back
 outside its dated layout, and then exits 1. A checksum already recorded is never
 changed. `--create-checksum` cannot be combined with `--successful`. The checksum lives in the `checksum` column of the `backup_runs` table.
 
-History uses schema version 5. A database at an older schema upgrades on the next
-write; bdbackup 0.6.2 or earlier refuses a version-5 database.
+History uses schema version 6, from bdbackup 0.7.3. A database at an older schema upgrades
+on the next write; bdbackup 0.7.2 or earlier refuses a version-6 database. Version 6 adds the
+`last_runs` table: the outcome of the last run of each pgbackrest and gfs job, which
+`bdbackup metrics` reads.
 
 History is written before work starts, and success only after the backup and its
 requested verification finish. If history cannot be written, the command fails;
@@ -402,10 +421,24 @@ python scripts/integration_physical.py percona-encrypted # AES256 + zstd recover
 python scripts/integration_physical.py mariadb # mariadb:11.4
 python scripts/integration_pgbackrest.py pg16-2.58 # bdbackup-pgbackrest:16-2.58.0
 python scripts/integration_pgbackrest.py pg18-2.60 # bdbackup-pgbackrest:18-2.60.0
+python scripts/integration_nfs_outage.py # bdbackup-nfs-outage:test, privileged
 ```
 
 The pgBackRest images have no official source; build them from
-`scripts/docker/pgbackrest.Dockerfile` with the commands in `tests/AGENTS.md`.
+`scripts/docker/pgbackrest.Dockerfile` with the commands in `tests/AGENTS.md`. The NFS
+outage test runs `bdbackup metrics` against a hard NFS mount whose server stops answering. Its
+image installs bdbackup from a wheel built on the host, and the script refuses an image built
+from other sources:
+
+```bash
+rm -rf dist && python -m build -q
+docker build -f scripts/docker/nfs-outage.Dockerfile \
+  --build-arg SOURCE_HASH="$(python scripts/integration_nfs_outage.py --source-hash)" \
+  -t bdbackup-nfs-outage:test dist
+```
+
+It runs a container with `--privileged --network none`, so it needs a Linux kernel with an NFS
+server and iptables.
 
 Physical recovery returns a prepared data directory; copying it into a server's
 data directory, assigning ownership to the server user, and starting that server

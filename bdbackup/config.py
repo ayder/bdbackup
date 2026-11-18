@@ -11,6 +11,8 @@ from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
+from bdbackup.metrics.settings import MetricsSettings, parse_metrics
+from bdbackup.utils import lexical_path, real_path
 
 
 @dataclass
@@ -38,12 +40,21 @@ def supported_types() -> set[str]:
 
 
 class Config:
-    """Load and validate a TOML job configuration file."""
+    """Load and validate a TOML job configuration file.
 
-    def __init__(self, path: str | Path):
+    With ``lexical`` the paths of the shares (gfs stages, engine outputs, ``repo_path``,
+    ``out_dir`` and the restore roots) are normalised from their text and never resolved, so
+    loading makes no filesystem call on a share that may hang. ``bdbackup metrics`` reads its
+    configuration so; a path written through a link then stays as written. The configuration
+    file itself and ``[history] database`` are local and always resolved.
+    """
+
+    def __init__(self, path: str | Path, *, lexical: bool = False):
+        self._resolve = lexical_path if lexical else real_path
         self.path = Path(path).expanduser().resolve()
         self.jobs: dict[str, Job] = {}
         self.history: HistorySettings | None = None
+        self.metrics: MetricsSettings | None = None
         self._load()
 
     def _load(self) -> None:
@@ -64,8 +75,19 @@ class Config:
                 value = section.get(key, default)
                 if not isinstance(value, str) or not value.strip() or value == ":memory:":
                     raise ConfigError(f"[history] {key} must be a nonempty filesystem path")
-                paths[key] = (self.path.parent / Path(value).expanduser()).resolve()
+                resolve = real_path if key == "database" else self._resolve
+                paths[key] = resolve(self.path.parent / Path(value).expanduser())
             self.history = HistorySettings(**paths)
+
+        if "metrics" in data:
+            section = data.pop("metrics")
+            try:
+                settings = parse_metrics(section, self.path.parent)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
+            if self.history is None:
+                raise ConfigError("[metrics] requires a [history] section")
+            self.metrics = settings
 
         for name, section in data.items():
             if not isinstance(section, dict):
@@ -85,7 +107,7 @@ class Config:
                 raise ConfigError(f"Job {name!r}: active must be true or false")
             if job_type == "gfs":
                 try:
-                    params = parse_gfs_job(section, self.path.parent)
+                    params = parse_gfs_job(section, self.path.parent, self._resolve)
                 except ValueError as exc:
                     raise ConfigError(f"Job {name!r}: {exc}") from exc
                 self.jobs[name] = Job(name=name, type=job_type, params=params, active=active)
@@ -97,7 +119,7 @@ class Config:
                     raise ConfigError(f"Job {name!r}: restore_root must be a nonempty path string")
                 if self.history is None:
                     raise ConfigError(f"Job {name!r}: restore_root requires a [history] section")
-                restore_root = (self.path.parent / Path(value).expanduser()).resolve()
+                restore_root = self._resolve(self.path.parent / Path(value).expanduser())
             params = {k: v for k, v in section.items() if k not in {"type", "restore_root"}}
             # Config paths are relative to the config file; file-template entries
             # and excludes remain relative to the explicitly selected source path.
@@ -116,6 +138,8 @@ class Config:
                         params[key] = self.path.parent / Path(params[key]).expanduser()
                     except TypeError as exc:
                         raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
+                    if self._resolve is lexical_path:
+                        params[key] = lexical_path(params[key])
             self.jobs[name] = Job(
                 name=name, type=job_type, params=params, restore_root=restore_root,
                 active=active,
@@ -123,7 +147,7 @@ class Config:
 
         if any(job.type == "gfs" for job in self.jobs.values()):
             try:
-                check_gfs_config(self.jobs, self.history)
+                check_gfs_config(self.jobs, self.history, self._resolve)
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
         self._check_pgbackrest()
@@ -146,7 +170,7 @@ class Config:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                     raise ConfigError(f"Job {name!r}: {key} must be {rule}")
             try:
-                job.params["first_stage"] = pgbackrest_first_stage(job, self.jobs)
+                job.params["first_stage"] = pgbackrest_first_stage(job, self.jobs, self._resolve)
             except ValueError as exc:
                 raise ConfigError(f"Job {name!r}: {exc}") from exc
             self._check_pgbackrest_layout(name, job)
@@ -164,7 +188,7 @@ class Config:
             stanza = job.params.get("stanza")
             if job.type != "pgbackrest" or not isinstance(stanza, str):
                 continue  # the engine refuses a stanza that is not a string when it is built
-            key = (Path(job.params["out_dir"]).expanduser().resolve(), stanza)
+            key = (self._resolve(Path(job.params["out_dir"])), stanza)
             if key in seen:
                 raise ConfigError(
                     f"Job {name!r}: job {seen[key]!r} already exports stanza {stanza!r} into "
@@ -180,8 +204,8 @@ class Config:
         """
         if "repo_path" not in job.params:
             return  # the engine refuses the job when it is built
-        repo = Path(job.params["repo_path"]).expanduser().resolve()
-        out_dir = Path(job.params["out_dir"]).expanduser().resolve()
+        repo = self._resolve(Path(job.params["repo_path"]))
+        out_dir = self._resolve(Path(job.params["out_dir"]))
         if out_dir.is_relative_to(repo):
             raise ConfigError(f"Job {name!r}: out_dir must be outside repo_path")
         # Both [history] paths are resolved when the section is read.

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,8 +22,10 @@ from bdbackup.gfs import runner as gfs_runner
 from bdbackup.gfs import store as gfs_store
 from bdbackup.gfs import structure as gfs_structure
 from bdbackup.gfs.stages import fed_first_stages
-from bdbackup.history import History
+from bdbackup.history import History, HistoryError
+from bdbackup.metrics_command import run_metrics
 from bdbackup.mysql import MySQLBackup, XtraBackup
+from bdbackup.postgres.pgbackrest import ExportProgress
 from bdbackup.postgres.restore import describe_unit, restore_lines
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
 from bdbackup.templates import TemplateError
@@ -57,6 +61,32 @@ def main(log_level: str) -> None:
     File and MySQL/MariaDB backups with verification, retention, and guided recovery.
     """
     setup_logging(getattr(logging, log_level.upper(), logging.INFO))
+
+
+def _echo(message: str = "") -> None:
+    """Print one line; a reader that went away discards the rest of the output, not the run.
+
+    On the first ``BrokenPipeError`` (``bdbackup history | head``) stdout is pointed at
+    ``/dev/null``. That line, every later one and Python's flush at exit then succeed, so the
+    command finishes its work and exits with the code it would have had.
+    """
+    try:
+        click.echo(message)
+    except BrokenPipeError:
+        _discard_stdout()
+
+
+def _discard_stdout() -> None:
+    """Point stdout's file descriptor at ``/dev/null``; a stream without one is left alone."""
+    try:
+        descriptor = sys.stdout.fileno()
+    except (OSError, ValueError, AttributeError):  # a captured stream, or no stdout
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, descriptor)
+    finally:
+        os.close(devnull)
 
 
 def _load_config(path: Path) -> Config:
@@ -129,23 +159,117 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
     if isinstance(backend, FileBackup):
         _protect_history(backend, config)
         backend.backup(dry_run=True)
-        click.echo(f"Dry run; would create: {backend.tar_filename}")
+        _echo(f"Dry run; would create: {backend.tar_filename}")
     elif isinstance(backend, MySQLBackup):
-        click.echo(f"Dry run; would dump {backend.selection()} into {backend.out_dir}")
+        _echo(f"Dry run; would dump {backend.selection()} into {backend.out_dir}")
     elif isinstance(backend, XtraBackup) and incremental:
-        click.echo(f"Dry run; would take an incremental of {backend.incremental_parent()} "
+        _echo(f"Dry run; would take an incremental of {backend.incremental_parent()} "
                    f"under {backend.backup_root}")
     elif isinstance(backend, XtraBackup):
-        click.echo(f"Dry run; would take a full backup under {backend.backup_root}")
+        _echo(f"Dry run; would take a full backup under {backend.backup_root}")
     else:
         raise click.UsageError(f"--dry-run is not supported for job type {job.type!r}")
 
 
-def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) -> int:
+@dataclass
+class _Outcome:
+    """What a pgbackrest or gfs run decided; ``_last_run`` turns it into a ``last_runs`` row.
+
+    A run sets ``result`` and ``facts`` where it decides them. What it leaves unset is worked
+    out from the exit code and from how far an export got (``progress``), or, for a gfs run,
+    from ``gfs`` and ``raised``.
+    """
+
+    result: str | None = None
+    facts: dict | None = None
+    progress: ExportProgress = field(default_factory=ExportProgress)
+    gfs: gfs_runner.RunOutcome = field(default_factory=gfs_runner.RunOutcome)
+    raised: bool = False
+
+
+# The result of a failed pgbackrest run, by the step its export reached.
+_FAILED_AT = {
+    "destination": "destination_not_ready",
+    "write": "export_failed",
+    "publish": "export_failed",
+    "verify": "verify_failed",
+}
+
+
+def _result_of(job: Job, outcome: _Outcome, code: int) -> str:
+    """The ``last_runs`` result word of a run that ended with exit code ``code``."""
+    if job.type == "gfs":
+        if outcome.raised:
+            return "error"
+        if code == EXIT_OK:
+            return "completed"
+        if code == EXIT_LOCKED:
+            return "locked" if outcome.gfs.locked else "deferred"
+        return "failed"
+    if outcome.result is not None:
+        return outcome.result
+    if code == EXIT_LOCKED:
+        return "locked"
+    return _FAILED_AT.get(outcome.progress.step, "failed")
+
+
+@contextmanager
+def _last_run(config: Config, job: Job, outcome: _Outcome):
+    """Record the run in the block in ``last_runs`` when it ends, however it ends.
+
+    The exit code is the one the block exits with (click's ``Exit``, or a ``ClickException``
+    such as a usage error); an exception that escapes counts as 1. Whatever ended the block is
+    raised again. A failure to record is a warning: it never changes the exit code or the output.
+    """
+    code = EXIT_OK
+    # A pgbackrest run is refused for root so that nothing is left owned by root: no database,
+    # no directory for it, and no row in one that exists.
+    record = not (job.type == "pgbackrest" and os.geteuid() == 0)
+    try:
+        yield
+    except click.exceptions.Exit as exc:
+        code = exc.exit_code
+        raise
+    except click.ClickException as exc:
+        code = exc.exit_code
+        raise
+    except BaseException:
+        code = EXIT_BACKUP_FAILED
+        outcome.raised = True
+        raise
+    finally:
+        if record:
+            try:
+                History(config.history).record_last_run(
+                    job.name, job.type, code, _result_of(job, outcome, code), outcome.facts
+                )
+            except (HistoryError, OSError) as exc:
+                logging.getLogger("bdbackup.cli").warning(
+                    "Could not record the last run of job %r: %s", job.name, exc
+                )
+
+
+def _export_facts(full, result, progress: ExportProgress, started: datetime) -> dict:
+    """The facts an export leaves in ``last_runs``: its phases, label, size and the full's age."""
+    phases = {"write": progress.write_seconds}
+    if progress.verify_seconds is not None:
+        phases["verify"] = progress.verify_seconds
+    return {
+        "phases": phases,
+        "label": full.label,
+        "bytes": result.size_bytes,
+        "full_age_seconds": max(0, int((started - full.stop).total_seconds())),
+    }
+
+
+def _run_pgbackrest(
+    config: Config, job: Job, *, verify: bool, dry_run: bool, outcome: _Outcome
+) -> int:
     """Export the newest pgBackRest full of the job's stanza as one tar; return the exit code.
 
     A real run holds the job lock from before the full is chosen until the export is published.
-    A dry run takes no lock and writes nothing. When there is no new full nothing is recorded.
+    A dry run takes no lock and writes nothing. When there is no new full nothing is recorded in
+    the history of backups. The result a run decides is set on ``outcome``.
     """
     engine = build_backend(job)
     engine.refuse_root()
@@ -153,7 +277,7 @@ def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) ->
         choice = engine.choose(History(config.history), job.name)
         full = choice.full
         if full.page_errors:
-            click.echo(
+            _echo(
                 f"WARNING: full {full.label} has page checksum errors; it is exported, "
                 "and restoring it needs checksum-page-error=n"
             )
@@ -162,23 +286,31 @@ def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) ->
             message = f"no new full: newest {full.label}, {hours} hours old"
             limit = engine.max_full_age_hours
             if limit is not None and hours > limit:
-                click.echo(f"{message} (older than max_full_age_hours = {limit})")
+                _echo(f"{message} (older than max_full_age_hours = {limit})")
+                outcome.result = "full_too_old"
                 return EXIT_BACKUP_FAILED
-            click.echo(message)
+            _echo(message)
+            outcome.result = "no_new_full"
             return EXIT_OK
         if dry_run:
             engine.require_marker()
-            click.echo(
+            _echo(
                 f"Dry run; would export {full.label} ({full.repo_bytes} bytes) "
                 f"of stanza {engine.stanza} to {engine.unit_path(full.label)}"
             )
             return EXIT_OK
 
         info = engine.restore_info(full, engine.version())
-        result = _tracked_backup(
-            config, job.name, "pgbackrest-full", lambda: engine.export(full, verify=verify), info
-        )
-    click.echo(f"Job {job.name}: {result.path}")
+        began = []
+
+        def export():
+            began.append(_now())
+            return engine.export(full, verify=verify, progress=outcome.progress)
+
+        result = _tracked_backup(config, job.name, "pgbackrest-full", export, info)
+    outcome.result = "exported"
+    outcome.facts = _export_facts(full, result, outcome.progress, began[0])
+    _echo(f"Job {job.name}: {result.path}")
     return EXIT_OK
 
 
@@ -246,13 +378,13 @@ def run(
         if job.type != "gfs":
             raise click.UsageError(f"--initialize-structure applies only to gfs jobs: {job.name}")
         fed = job.params["stage"][0].paths[0] in fed_first_stages(config.jobs)
-        ctx.exit(gfs_structure.initialize(job, click.echo, fed))
+        ctx.exit(gfs_structure.initialize(job, _echo, fed))
     if validate_only:
         jobs = [job] if job else list(config.jobs.values())
         if not jobs:
             raise click.UsageError("No configured jobs selected")
         lines, ok = validate_config(config, jobs)
-        click.echo("\n".join(lines))
+        _echo("\n".join(lines))
         ctx.exit(EXIT_OK if ok else EXIT_BACKUP_FAILED)
     if job is None:
         raise click.UsageError("Provide --job NAME or --validate")
@@ -261,10 +393,18 @@ def run(
     logger = logging.getLogger("bdbackup.cli")
     logger.info("Running job %r (%s)%s", job.name, job.type, " as a dry run" if dry_run else "")
     if job.type == "gfs":
-        code = gfs_runner.run_job(config, job, out=click.echo, dry_run=dry_run)
-        ctx.exit(code if code in (EXIT_OK, EXIT_LOCKED) else EXIT_BACKUP_FAILED)
+        outcome = _Outcome()
+        with nullcontext() if dry_run else _last_run(config, job, outcome):
+            code = gfs_runner.run_job(
+                config, job, out=_echo, dry_run=dry_run, outcome=outcome.gfs
+            )
+            ctx.exit(code if code in (EXIT_OK, EXIT_LOCKED) else EXIT_BACKUP_FAILED)
     if job.type == "pgbackrest":
-        ctx.exit(_handle_errors(_run_pgbackrest, config, job, verify=verify, dry_run=dry_run))
+        outcome = _Outcome()
+        with nullcontext() if dry_run else _last_run(config, job, outcome):
+            ctx.exit(_handle_errors(
+                _run_pgbackrest, config, job, verify=verify, dry_run=dry_run, outcome=outcome
+            ))
     if dry_run:
         return _handle_errors(_dry_run, config, job, incremental)
     info = {}
@@ -297,7 +437,7 @@ def run(
     except Exception as exc:
         logger.error("Job %r failed: %s", job.name, exc)
         ctx.exit(EXIT_BACKUP_FAILED)
-    click.echo(f"Job {job.name}: {result.path}")
+    _echo(f"Job {job.name}: {result.path}")
     return EXIT_OK
 
 
@@ -332,7 +472,7 @@ def _echo_restore_command(directory: Path) -> None:
     facts = describe_unit(directory)
     if facts is not None:
         for line in restore_lines(facts, directory.expanduser().absolute()):
-            click.echo(line)
+            _echo(line)
 
 
 @main.command()
@@ -375,13 +515,13 @@ def restore(
     def _run():
         if mode == "archive":
             restored = FileBackup.restore_archive(archive, dst)
-            click.echo(f"Restored to: {restored}")
+            _echo(f"Restored to: {restored}")
             _echo_restore_command(restored)
             return
         if mode == "backup":
             xb = XtraBackup(backup_root=root, binary=binary or "xtrabackup",
                             encrypt_key_file=encrypt_key_file)
-            click.echo(f"Prepared recovery directory: {xb.prepare(backup, dst)}")
+            _echo(f"Prepared recovery directory: {xb.prepare(backup, dst)}")
             return
         config = _history_config(config_path)
         history = History(config.history)
@@ -400,9 +540,9 @@ def restore(
                        if gfs_store.available(r, known)]
             if not records:
                 raise BackupError("No successful, available backups found")
-            click.echo("Successful backups (newest first):")
+            _echo("Successful backups (newest first):")
             for record in records:
-                click.echo(
+                _echo(
                     f"{record.id}: {record.job_name} | {record.backup_type} | "
                     f"{record.started_at} | "
                     f"{'encrypted' if record.encrypted else 'unencrypted'} | {shown(record)}"
@@ -427,27 +567,27 @@ def restore(
         destination = dst or suggested_destination(record, restore_root)
         if managed:
             # `Backup:` follows once restore has chosen the copy it restores from.
-            click.echo("Locations: " + ", ".join(
+            _echo("Locations: " + ", ".join(
                 str(p.member) for p in known[record.id] if gfs_store.place_available(p)))
         else:
-            click.echo(f"Backup: {record.path}")
+            _echo(f"Backup: {record.path}")
         if dst is None and not yes:
             destination = Path(click.prompt("Restore destination", default=str(destination)))
-        click.echo(f"Recovery destination: {destination}")
+        _echo(f"Recovery destination: {destination}")
         if not yes:
             click.confirm("Restore this backup?", abort=True)
         if encrypt_key_file is not None and not record.backup_type.startswith("xtrabackup"):
             raise click.UsageError("--encrypt-key-file requires a physical backup")
         restored = restore_record(record, destination, encrypt_key_file=encrypt_key_file,
                                   history=history,
-                                  on_source=(lambda path: click.echo(f"Backup: {path}"))
+                                  on_source=(lambda path: _echo(f"Backup: {path}"))
                                   if managed else None)
         if record.backup_type == "mysqldump":
-            click.echo(f"SQL recovered to: {restored / 'backup.sql'} (not imported into a server)")
+            _echo(f"SQL recovered to: {restored / 'backup.sql'} (not imported into a server)")
         elif record.backup_type.startswith("xtrabackup"):
-            click.echo(f"Prepared recovery directory: {restored}")
+            _echo(f"Prepared recovery directory: {restored}")
         else:
-            click.echo(f"Restored to: {restored}")
+            _echo(f"Restored to: {restored}")
         if record.backup_type == "pgbackrest-full":
             _echo_restore_command(restored)
 
@@ -470,7 +610,7 @@ def history_cmd(config_path: Path, job: str | None, successful: bool,
     def _checksums():
         config = _history_config(config_path)
         for record_id, outcome in History(config.history).record_checksums(job):
-            click.echo(f"{record_id}: {outcome}")
+            _echo(f"{record_id}: {outcome}")
             if outcome == "skipped: unexpected unit":
                 unexpected.append(record_id)
 
@@ -481,10 +621,10 @@ def history_cmd(config_path: Path, job: str | None, successful: bool,
         suffixes = gfs_store.listing_suffixes(history)
         known = gfs_store.places(history)
         if not records:
-            click.echo("No backup history found.")
+            _echo("No backup history found.")
         for record in records:
             available = "available" if gfs_store.available(record, known) else "unavailable"
-            click.echo(
+            _echo(
                 f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
                 f"{record.status} | {available} | "
                 f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path or '-'}"
@@ -496,6 +636,16 @@ def history_cmd(config_path: Path, job: str | None, successful: bool,
     if unexpected:
         click.get_current_context().exit(EXIT_BACKUP_FAILED)
     return EXIT_OK
+
+
+@main.command(name="metrics")
+@config_option(required=True)
+def metrics_cmd(config_path: Path) -> None:
+    """Write the Prometheus textfile of the jobs, the history and the pgBackRest repository.
+
+    Read-only: it never backs up, prunes or writes the history. Run it from cron.
+    """
+    click.get_current_context().exit(run_metrics(config_path))
 
 
 if __name__ == "__main__":
