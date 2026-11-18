@@ -332,8 +332,10 @@ report, and never changes the exit code or stops an action.
 
 The walk never follows a symlink: a link is one entry. It never enters another
 device: a directory on another mount is one entry. It never enters a unit the ledger
-lists, and it counts a stray directory as one entry, not its contents. It does not
-count:
+lists, and it counts a stray directory as one entry, not its contents. A directory
+that holds nothing it would count is not an entry: GFS makes the parent directory of
+a unit and never removes it, so the parent of a unit that moved on stays, empty or
+with its `.bdbackup.lock`. It does not count:
 
 - the marker `.bdbackup-destination` and the ledger copy `<job>.ledger.sqlite3`;
 - `.bdbackup.lock` and bdbackup's temporary names (`.gfs-tmp-*`, and the temporary tar of a
@@ -355,9 +357,12 @@ The second form is a first stage that is not walked. The lines follow the `Stage
 lines. A dry run writes no facts. The counts go to the metrics (see
 [Prometheus metrics](README_METRICS.md#gfs-last-run-facts-and-drift)).
 
-A path without its marker, such as an unmounted share, is not checked, and prints
-no line, so an unmounted share is never read as every unit missing. A path that
-cannot be read prints `drift not checked: <path>: <reason>` and is not counted.
+A path that should carry its marker and lacks it, such as an unmounted share, is not
+checked and prints no line, so an unmounted share is not read as every unit missing.
+A first stage that no pgbackrest job writes into has no marker to tell: if it is a
+share that is not mounted, its units read as missing. Keep that stage on local disk,
+or mount it. A path that cannot be read prints `drift not checked: <path>: <reason>`
+and is not counted.
 
 The check runs in a child process under one deadline: `[metrics] timeout_seconds`
 when the config has `[metrics]`, 60 seconds otherwise. When it passes, the child is
