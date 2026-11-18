@@ -23,6 +23,7 @@ from bdbackup.gfs import store as gfs_store
 from bdbackup.gfs import structure as gfs_structure
 from bdbackup.gfs.stages import fed_first_stages
 from bdbackup.history import History, HistoryError
+from bdbackup.metrics_command import run_metrics
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.postgres.pgbackrest import ExportProgress
 from bdbackup.postgres.restore import describe_unit, restore_lines
@@ -635,6 +636,16 @@ def history_cmd(config_path: Path, job: str | None, successful: bool,
     if unexpected:
         click.get_current_context().exit(EXIT_BACKUP_FAILED)
     return EXIT_OK
+
+
+@main.command(name="metrics")
+@config_option(required=True)
+def metrics_cmd(config_path: Path) -> None:
+    """Write the Prometheus textfile of the jobs, the history and the pgBackRest repository.
+
+    Read-only: it never backs up, prunes or writes the history. Run it from cron.
+    """
+    click.get_current_context().exit(run_metrics(config_path))
 
 
 if __name__ == "__main__":

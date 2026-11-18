@@ -58,11 +58,12 @@ def snapshot(root):
     ]
 
 
-def test_top_level_lists_three_commands():
+def test_top_level_lists_four_commands():
     result = invoke("--help")
     assert result.exit_code == 0, result.output
     commands = result.output.split("Commands:", 1)[1]
-    assert set(re.findall(r"^  (\S+)", commands, re.MULTILINE)) == {"history", "restore", "run"}
+    found = set(re.findall(r"^  (\S+)", commands, re.MULTILINE))
+    assert found == {"history", "metrics", "restore", "run"}
 
 
 @pytest.mark.parametrize("option", ["config", "validate", "cron"])
