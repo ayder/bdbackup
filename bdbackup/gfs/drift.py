@@ -28,6 +28,9 @@ import json, os, stat, sys
 
 LOCK = ".bdbackup.lock"
 TEMP = ".gfs-tmp-"
+# What a filesystem or an appliance keeps in a directory of its own: lost+found at the root of
+# a local filesystem, and .snapshot, which some appliances show in every directory of an export.
+FILESYSTEM = {"lost+found", ".snapshot"}
 
 
 def device_of(path):
@@ -54,7 +57,9 @@ def walk(root, known, ancestors, skip_at_root):
             for entry in scan:
                 name = entry.name
                 path = os.path.join(directory, name)
-                if name == LOCK or own_temporary(name) or (top and name in skip_at_root):
+                if name == LOCK or name in FILESYSTEM or own_temporary(name):
+                    continue
+                if top and name in skip_at_root:
                     continue
                 if path in known:
                     continue
