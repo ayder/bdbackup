@@ -61,6 +61,22 @@ class BackupRecord:
             return False
 
 
+@dataclass(frozen=True)
+class LastRun:
+    """The outcome of a job's newest run that was not a dry run (schema 6, ``last_runs``).
+
+    ``facts`` is the JSON object the job type stores: ``{"phases": {...}, <job-type keys>}``;
+    it is kept from the last run that wrote some, and is ``None`` when none ever did.
+    """
+
+    job_name: str
+    job_type: str
+    finished_at: str
+    exit_code: int
+    result: str
+    facts: dict | None = None
+
+
 class History:
     """Record attempts before work starts; mark success only after verification."""
 
@@ -276,6 +292,16 @@ class History:
                 )
             outcomes.append((record.id, "recorded"))
         return outcomes
+
+    def record_last_run(
+        self, job_name: str, job_type: str, exit_code: int, result: str,
+        facts: dict | None = None,
+    ) -> None:
+        """Not yet."""
+
+    def last_runs(self) -> dict[str, LastRun]:
+        """Not yet."""
+        return {}
 
     def records(self, *, job: str | None = None, successful: bool = False) -> list[BackupRecord]:
         with self._connect() as db:
