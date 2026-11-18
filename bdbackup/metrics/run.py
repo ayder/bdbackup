@@ -22,6 +22,7 @@ from bdbackup.metrics.collector import (
     Request,
     Results,
     StatRequest,
+    StatvfsRequest,
 )
 from bdbackup.metrics.data import HistoryData, read_history
 from bdbackup.metrics.gfs import GfsCollector
@@ -101,7 +102,7 @@ def _run_probes_phase(units: list[_Unit], ctx: Context, timeout_seconds: float) 
         try:
             asked = list(unit.collector.probes(unit.job, ctx))
             for request in asked:
-                if not isinstance(request, StatRequest | ListPrefixRequest):
+                if not isinstance(request, StatRequest | StatvfsRequest | ListPrefixRequest):
                     raise ValueError(f"not a probe request: {request!r}")
         except Exception as exc:
             outcomes[id(unit)] = (False, exc)

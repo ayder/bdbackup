@@ -12,9 +12,10 @@ from stat import S_ISREG
 from typing import TYPE_CHECKING
 
 from bdbackup.gfs.policy import bucket_span
+from bdbackup.gfs.runner import snapshot_name
 from bdbackup.gfs.stages import MARKER, Stage
 from bdbackup.metrics import families as f
-from bdbackup.metrics.collector import Context, Request, Results, StatRequest
+from bdbackup.metrics.collector import Context, Request, Results, StatRequest, StatvfsRequest
 from bdbackup.metrics.data import GFS_COUNTS, HistoryData
 from bdbackup.metrics.jobs import epoch
 from bdbackup.metrics.render import Sample
@@ -213,7 +214,14 @@ class GfsCollector:
         return ()
 
     def probes(self, job: Job | None, ctx: Context) -> list[Request]:
-        return [StatRequest(path / MARKER) for _, path in _destination_paths(job, ctx)]
+        """Per destination path: its marker, its capacity and its ledger snapshot (spec 5)."""
+        requests: list[Request] = []
+        for _, path in _destination_paths(job, ctx):
+            requests += [
+                StatRequest(path / MARKER), StatvfsRequest(path),
+                StatRequest(path / snapshot_name(job)),
+            ]
+        return requests
 
     def collect(self, job: Job | None, ctx: Context, results: Results) -> Iterator[Sample]:
         name = job.name
@@ -253,10 +261,16 @@ class GfsCollector:
         for index, path in _destination_paths(job, ctx):
             marker = results.stat(path / MARKER)
             ready = 1 if marker is not None and S_ISREG(marker.st_mode) else 0
-            yield Sample(
-                f.DESTINATION_READY, ready,
-                {"job_name": name, "stage": str(index), "path": str(path)},
-            )
+            labels = {"job_name": name, "stage": str(index), "path": str(path)}
+            yield Sample(f.DESTINATION_READY, ready, labels)
+            # An unmounted mount point answers with the local disk: capacity needs the marker.
+            capacity = results.statvfs(path) if ready else None
+            if capacity is not None:
+                yield Sample(f.DESTINATION_SIZE, capacity.f_blocks * capacity.f_frsize, labels)
+                yield Sample(f.DESTINATION_FREE, capacity.f_bavail * capacity.f_frsize, labels)
+            snapshot = results.stat(path / snapshot_name(job))
+            if snapshot is not None:
+                yield Sample(f.GFS_LEDGER_SNAPSHOT, snapshot.st_mtime_ns // 1_000_000_000, labels)
 
     @staticmethod
     def _sources(job: Job, ctx: Context, facts: list[_Fact]) -> Iterator[Sample]:
