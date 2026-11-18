@@ -41,6 +41,7 @@ class RunOutcome:
     """
 
     locked: bool = False
+    facts: dict | None = None  # stub: nothing computes them yet
 
 
 def job_lock_path(config: Config, name: str) -> Path:

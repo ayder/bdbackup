@@ -43,6 +43,9 @@ GFS_SOURCE_BYTES = "bdbackup_gfs_source_bytes"
 DESTINATION_SIZE = "bdbackup_destination_size_bytes"
 DESTINATION_FREE = "bdbackup_destination_free_bytes"
 GFS_LEDGER_SNAPSHOT = "bdbackup_gfs_ledger_snapshot_timestamp_seconds"
+GFS_FACTS_TIMESTAMP = "bdbackup_gfs_facts_timestamp_seconds"
+GFS_LAST_RUN_REASON_UNITS = "bdbackup_gfs_last_run_reason_units"
+GFS_LAST_RUN_MOVES = "bdbackup_gfs_last_run_moves"
 GFS_LAST_MOVE = "bdbackup_gfs_last_move_timestamp_seconds"
 GFS_UNMANAGED_UNITS = "bdbackup_gfs_unmanaged_units"
 GFS_UNMANAGED_BYTES = "bdbackup_gfs_unmanaged_bytes"
@@ -173,6 +176,23 @@ BUILTIN = (
         "Modification time of the gfs job's ledger snapshot on the destination; absent when "
         "there is none.",
         ("job_name", "stage", "path"),
+    ),
+    Family(
+        GFS_FACTS_TIMESTAMP,
+        "When the gfs job's newest finished run computed the facts behind the last_run and drift "
+        "families; a run that was locked or raised leaves them, and this time, as they were.",
+        ("job_name",),
+    ),
+    Family(
+        GFS_LAST_RUN_REASON_UNITS,
+        "Units the gfs job's last run held, deferred, refused or failed, by stage (0: not in a "
+        "configured stage), outcome and reason class.",
+        ("job_name", "stage", "outcome", "reason"),
+    ),
+    Family(
+        GFS_LAST_RUN_MOVES,
+        "Moves of the gfs job's last run, by method: rename or copy.",
+        ("job_name", "method"),
     ),
     Family(
         HISTORY_SCHEMA_VERSION,

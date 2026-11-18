@@ -553,3 +553,119 @@ def test_there_is_no_schema_version_when_the_file_is_not_a_database(env):
 
     assert collected.errors == [MetricError("history", "", "unreadable")]
     assert values(collected, "bdbackup_history_schema_version") == {}
+
+
+# ---- the facts of the last run (spec 6) --------------------------------------------------------
+
+FACTS = {
+    "computed_at": "2026-11-18T02:04:11+00:00",
+    "reasons": [
+        {"stage": 2, "outcome": "refused", "reason": "checksum_mismatch", "units": 1},
+        {"stage": 0, "outcome": "refused", "reason": "stage_not_configured", "units": 2},
+        {"stage": 1, "outcome": "deferred", "reason": "locked", "units": 3},
+    ],
+    "moves": {"rename": 3, "copy": 1},
+    "drift": [],
+}
+
+
+def record_facts(env, facts, *, code=0, result="completed"):
+    env.history.record_last_run(JOB, "gfs", code, result, facts)
+
+
+def test_the_facts_of_the_last_run_become_series(env):
+    record_facts(env, FACTS)
+
+    collected = collect(env)
+
+    reasons = values(collected, "bdbackup_gfs_last_run_reason_units",
+                     "job_name", "stage", "outcome", "reason")
+    assert reasons == {
+        (JOB, "2", "refused", "checksum_mismatch"): 1,
+        (JOB, "0", "refused", "stage_not_configured"): 2,
+        (JOB, "1", "deferred", "locked"): 3,
+    }
+    assert values(collected, "bdbackup_gfs_last_run_moves", "job_name", "method") == {
+        (JOB, "rename"): 3, (JOB, "copy"): 1,
+    }
+    assert values(collected, "bdbackup_gfs_facts_timestamp_seconds", "job_name") == {
+        (JOB,): epoch("2026-11-18T02:04:11+00:00")
+    }
+
+
+def test_a_run_with_no_reason_still_writes_both_move_methods(env):
+    record_facts(env, {**FACTS, "reasons": [], "moves": {"rename": 0, "copy": 0}})
+
+    collected = collect(env)
+
+    assert values(collected, "bdbackup_gfs_last_run_reason_units",
+                  "job_name", "stage", "outcome", "reason") == {}
+    assert values(collected, "bdbackup_gfs_last_run_moves", "job_name", "method") == {
+        (JOB, "rename"): 0, (JOB, "copy"): 0,
+    }
+
+
+def test_a_gfs_job_without_facts_has_no_tier_c_series(env):
+    env.history.record_last_run(JOB, "gfs", 3, "locked")  # a row, and no facts
+
+    collected = collect(env)
+
+    for family in ("bdbackup_gfs_facts_timestamp_seconds", "bdbackup_gfs_last_run_reason_units",
+                   "bdbackup_gfs_last_run_moves"):
+        assert values(collected, family, "job_name") == {}
+        assert not [s for s in collected.samples if s.family == family]
+
+
+def test_facts_a_later_locked_run_left_alone_keep_their_own_time(env):
+    record_facts(env, FACTS)
+    env.history.record_last_run(JOB, "gfs", 3, "locked")  # keeps the facts, not their time
+
+    collected = collect(env)
+
+    assert values(collected, "bdbackup_gfs_facts_timestamp_seconds", "job_name") == {
+        (JOB,): epoch("2026-11-18T02:04:11+00:00")
+    }
+    assert values(collected, "bdbackup_job_last_run_result", "job_name", "job_type", "result") == {
+        (JOB, "gfs", "locked"): 1
+    }
+
+
+@pytest.mark.parametrize("facts", [
+    {"computed_at": "yesterday", "reasons": [], "moves": {"rename": 1, "copy": 0}},
+    {"reasons": [], "moves": {"rename": 1, "copy": 0}},
+    {"computed_at": 1.5, "reasons": [], "moves": {"rename": 1, "copy": 0}},
+], ids=["bad-time", "no-time", "number-time"])
+def test_facts_without_a_valid_time_are_not_written(env, facts):
+    record_facts(env, facts)
+
+    collected = collect(env)
+
+    assert collected.errors == []
+    assert not [s for s in collected.samples if s.family.startswith(
+        ("bdbackup_gfs_last_run_reason", "bdbackup_gfs_last_run_moves", "bdbackup_gfs_facts"))]
+
+
+def test_a_malformed_entry_of_the_facts_is_skipped_and_the_rest_written(env):
+    record_facts(env, {
+        **FACTS,
+        "reasons": [
+            {"stage": 1, "outcome": "held", "reason": "period_incomplete", "units": 1},
+            {"stage": "one", "outcome": "held", "reason": "period_incomplete", "units": 1},
+            {"stage": 1, "outcome": "held", "reason": "period_incomplete", "units": True},
+            {"stage": 1, "outcome": "held"},
+            "not a table",
+            {"stage": 1, "outcome": "held", "reason": "period_incomplete", "units": 2},
+        ],
+        "moves": {"rename": "many", "copy": 1},
+    })
+
+    collected = collect(env)
+
+    assert collected.errors == []
+    assert values(collected, "bdbackup_gfs_last_run_reason_units",
+                  "job_name", "stage", "outcome", "reason") == {
+        (JOB, "1", "held", "period_incomplete"): 3  # the two good entries, added up
+    }
+    assert values(collected, "bdbackup_gfs_last_run_moves", "job_name", "method") == {
+        (JOB, "copy"): 1
+    }

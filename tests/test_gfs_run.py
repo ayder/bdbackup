@@ -167,11 +167,11 @@ class Env:
         return invoke("run", "-c", self.config_path, "-j", "gfs-main",
                       *(["--dry-run"] if self.dry_run else []))
 
-    def run_api(self, now):
+    def run_api(self, now, *, outcome=None, transport=None):
         config = Config(self.config_path)
         lines = []
         code = runner.run_job(config, config.get("gfs-main"), now=now, out=lines.append,
-                              dry_run=self.dry_run)
+                              dry_run=self.dry_run, outcome=outcome, transport=transport)
         return code, "\n".join(lines)
 
     def query(self, sql, *args):
@@ -1083,7 +1083,8 @@ def test_last_run_of_a_completed_gfs_run(env):
 
     assert result.exit_code == 0, result.output
     row = last_run(env)
-    assert (row.job_type, row.result, row.exit_code, row.facts) == ("gfs", "completed", 0, None)
+    assert (row.job_type, row.result, row.exit_code) == ("gfs", "completed", 0)
+    assert (row.facts or {}).get("moves") == {"rename": 1, "copy": 0}  # it now keeps its facts
     assert datetime.fromisoformat(row.finished_at).utcoffset() == timedelta(0)
 
 
@@ -1747,3 +1748,262 @@ def test_a_verify_false_stage_says_its_checksums_are_not_re_read(env, dry_run):
         f"Stage {env.abs('NFS/daily')}: 1 unit ({size_a} bytes), checksums not re-read",
         f"Stage {env.abs('NFS/weekly')}: 0 units (0 bytes)",
     ], result.output
+
+
+# ---- the facts of a run: reason classes and move methods (spec 16 section 6.1 and 6.2) --------
+
+
+class _UnitCopyFails(_CopyOnly):
+    """The copy of a unit fails; the ledger snapshot's copy does not."""
+
+    def copy(self, source, temp, on_file):
+        if Path(source).suffix == ".snapshot":
+            return super().copy(source, temp, on_file)
+        raise OSError("injected copy failure")
+
+
+class _UnitCopyRefused(_CopyOnly):
+    def copy(self, source, temp, on_file):
+        if Path(source).suffix == ".snapshot":
+            return super().copy(source, temp, on_file)
+        raise actions.Refusal("a refusal of a kind the classes do not name")
+
+
+def facts_of(env, now=None, **kwargs):
+    """The facts a run leaves for ``last_runs``, taken from its outcome."""
+    outcome = runner.RunOutcome()
+    code, output = env.run_api(now or datetime.now(), outcome=outcome, **kwargs)
+    assert outcome.facts is not None, output
+    return outcome.facts
+
+
+def reasons(env, now=None, **kwargs):
+    """``(stage, outcome, reason, units)`` of each reason class the run counted."""
+    return [(r["stage"], r["outcome"], r["reason"], r["units"])
+            for r in facts_of(env, now, **kwargs)["reasons"]]
+
+
+def record_then_change(env, change):
+    """Unit a is recorded by a first run, in which it stays; ``change`` then touches it."""
+    a = env.file_unit("a.tar.gz", day=date(2026, 9, 25))
+    env.file_unit("b.tar.gz", day=date(2026, 9, 29))
+    assert env.run_api(datetime(2026, 9, 29, 12))[0] == 0 and a.exists()
+    change(a)
+    return datetime(2026, 10, 2, 12)  # a is now due for NFS/daily
+
+
+def test_a_run_with_nothing_to_say_counts_no_reason(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert facts_of(env)["reasons"] == []
+
+
+def test_a_held_unit_is_period_incomplete(env):
+    env.write([(["BACKUP"], "daily", "2d"), (["NFS/weekly"], "weekly", "8w")])
+    for day in [date(2026, 9, 26) + timedelta(n) for n in range(5)]:
+        env.file_unit(f"{day}.tar.gz", day=day)
+
+    # 09-28 belongs to the week 2026-W40, which is not over on 09-30
+    assert reasons(env, datetime(2026, 9, 30, 12)) == [(1, "held", "period_incomplete", 1)]
+
+
+def test_the_units_of_a_job_still_backing_up_are_deferred_as_backup_running(env):
+    defer_a_unit(env)
+
+    assert reasons(env) == [(1, "deferred", "backup_running", 2)]  # a and b, both in stage 1
+
+
+def test_a_unit_whose_engine_lock_is_busy_is_deferred_as_locked(env):
+    env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+
+    with process_lock(env.abs("BACKUP/mysql/prod") / ".bdbackup.lock"):
+        found = reasons(env)
+
+    assert found == [(1, "deferred", "locked", 1)]
+
+
+def test_a_changed_unit_is_refused_as_checksum_mismatch(env):
+    now = record_then_change(env, lambda a: a.write_bytes(b"changed on disk"))
+
+    assert reasons(env, now) == [(1, "refused", "checksum_mismatch", 1)]
+
+
+def test_a_missing_unit_is_refused_as_missing_location(env):
+    now = record_then_change(env, lambda a: a.unlink())
+
+    assert reasons(env, now) == [(1, "refused", "missing_location", 1)]
+
+
+def test_a_stray_entry_is_refused_as_unexpected_entry(env):
+    unit = env.xtrabackup_unit(7)
+    env.xtrabackup_unit(0)
+    full_name = next(p.name for p in unit.iterdir() if p.name.startswith("Full_2"))
+    (unit / "Incremental" / full_name / "leftover.tmp").mkdir()
+
+    assert reasons(env) == [(1, "refused", "unexpected_entry", 1)]
+
+
+def test_a_unit_in_a_stage_that_is_not_configured_is_stage_0(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_api(datetime.now())[0] == 0
+    with closing(sqlite3.connect(env.database)) as db, db:
+        db.execute("UPDATE gfs_locations SET stage_path='/not/a/stage'"
+                   " WHERE path LIKE '%NFS/daily%'")
+
+    assert reasons(env) == [(0, "refused", "stage_not_configured", 1)]
+
+
+def test_a_destination_without_its_marker_is_destination_not_ready(env):
+    (env.root / "NFS/daily/.bdbackup-destination").unlink()
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    # the same missing marker fails the ledger snapshot of that stage
+    assert reasons(env) == [(1, "refused", "destination_not_ready", 1),
+                            (2, "failed", "snapshot", 1)]
+
+
+def test_a_taken_final_name_is_final_name_exists(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    final = env.root / "NFS/daily/files/a.tar.gz"
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"in the way")
+
+    assert reasons(env) == [(1, "refused", "final_name_exists", 1)]
+
+
+def test_a_refusal_of_no_named_kind_is_other(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert reasons(env, transport=_UnitCopyRefused()) == [(1, "refused", "other", 1)]
+
+
+def test_a_failed_move_is_error(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert reasons(env, transport=_UnitCopyFails()) == [(1, "failed", "error", 1)]
+
+
+def test_a_failed_ledger_snapshot_is_counted_in_the_stage_it_was_written_to(env):
+    (env.root / "NFS/weekly/.bdbackup-destination").unlink()
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert reasons(env) == [(3, "failed", "snapshot", 1)]
+
+
+def test_units_of_one_class_in_one_stage_are_counted_together(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("c.tar.gz", days_ago=8)
+    env.file_unit("b.tar.gz", days_ago=0)
+    with closing(sqlite3.connect(env.database)) as db, db:  # a job still backing up: both defer
+        db.execute(
+            "INSERT INTO backup_runs (job_name, backup_type, started_at, status, restore_info)"
+            " VALUES ('files', 'file', ?, 'running', '{}')", (datetime.now(UTC).isoformat(),),
+        )
+
+    assert reasons(env) == [(1, "deferred", "backup_running", 3)]
+
+
+def test_moves_by_rename_and_by_copy(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert facts_of(env)["moves"] == {"rename": 1, "copy": 0}
+
+
+def test_a_move_by_copy_is_counted_as_a_copy(env, copy_path):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert facts_of(env)["moves"] == {"rename": 0, "copy": 1}
+
+
+def test_a_move_onto_two_paths_is_one_copy(env):
+    env.write(TWO_DAILY_PATHS)
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert facts_of(env)["moves"] == {"rename": 0, "copy": 1}
+
+
+def test_a_run_computes_its_facts_at_its_end(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    before = datetime.now(UTC)
+
+    facts = facts_of(env)
+
+    computed = datetime.fromisoformat(facts["computed_at"])
+    assert computed.utcoffset() == timedelta(0)
+    assert before <= computed <= datetime.now(UTC)
+    assert set(facts) == {"computed_at", "reasons", "moves", "drift"}
+
+
+def test_a_dry_run_computes_no_facts(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    env.dry_run = True
+    outcome = runner.RunOutcome()
+
+    code, output = env.run_api(datetime.now(), outcome=outcome)
+
+    assert code == 0, output
+    assert outcome.facts is None
+
+
+def test_a_finished_run_records_its_facts_in_last_runs(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+
+    assert env.run_cli().exit_code == 0
+
+    facts = last_run(env).facts
+    assert set(facts) == {"computed_at", "reasons", "moves", "drift"}
+    assert facts["moves"] == {"rename": 1, "copy": 0}
+
+
+def finished_run(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    facts = last_run(env).facts
+    assert facts is not None, "the run left no facts to keep"
+    return facts
+
+
+def test_a_locked_run_keeps_the_previous_facts(env):
+    before = finished_run(env)
+
+    with process_lock(runner.job_lock_path(Config(env.config_path), "gfs-main")):
+        result = env.run_cli()
+
+    assert result.exit_code == 3, result.output
+    row = last_run(env)
+    assert (row.result, row.facts) == ("locked", before)
+
+
+def test_a_run_that_raised_keeps_the_previous_facts(env):
+    before = finished_run(env)
+
+    with patch("bdbackup.gfs.runner.decide", side_effect=RuntimeError("injected")):
+        result = env.run_cli()
+
+    assert isinstance(result.exception, RuntimeError), result.output
+    row = last_run(env)
+    assert (row.result, row.facts) == ("error", before)
+
+
+def test_a_dry_run_leaves_the_previous_facts(env):
+    before = finished_run(env)
+    env.dry_run = True
+
+    assert env.run_cli().exit_code == 0
+
+    assert last_run(env).facts == before
