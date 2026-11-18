@@ -1,7 +1,8 @@
 """The GFS families of 0.7.4 that ``metrics`` computes from the history database (spec 16).
 
-Coverage, reach and size per source job (tier A). Dates are local: every test here runs with
-``TZ=UTC``, and the metrics run's "today" is injected as ``now``.
+Coverage, reach and size per source job, the last move per stage pair, the unmanaged records,
+the stage's verify flag and the schema version (tier A). Dates are local: every test here runs
+with ``TZ=UTC``, and the metrics run's "today" is injected as ``now``.
 """
 
 from __future__ import annotations
@@ -15,10 +16,12 @@ import pytest
 
 from bdbackup.config import Config
 from bdbackup.engines import _reset_for_tests
+from bdbackup.gfs import store as gfs_store
 from bdbackup.history import History
+from bdbackup.metrics.collector import DESTINATION, Results
 from bdbackup.metrics.run import collect_all
 from tests.test_gfs_run import Env
-from tests.test_metrics_collect import epoch, in_process_probe, sql, values
+from tests.test_metrics_collect import epoch, in_process_probe, sql, touch_database, values
 
 TODAY = datetime(2026, 11, 18, 2, 30, tzinfo=UTC)
 JOB = "gfs-main"
@@ -248,3 +251,135 @@ def test_source_units_and_bytes_sum_to_the_stage_figures(env):
         assert sum(v for (s, _), v in units.items() if s == stage) == stage_units[(JOB, stage)]
         assert sum(v for (s, _), v in size.items() if s == stage) == stage_bytes[(JOB, stage)]
     assert stage_units[(JOB, "1")] == 2 and stage_bytes[(JOB, "1")] > 0
+
+
+# ---- last move per stage pair (spec 4.4) -------------------------------------------------------
+
+TWO_PATHS = [(["BACKUP"], "daily", "5d"), (["NFS/daily", "NFS/daily2"], "daily", "20d"),
+             (["NFS/weekly"], "weekly", "8w")]
+
+
+def step(env, run_at, source, destination, *, action="move", outcome="ok", job=JOB):
+    sql(env, "INSERT INTO gfs_steps (run_at, gfs_job, action, source, destination, outcome)"
+             " VALUES (?, ?, ?, ?, ?, ?)", run_at, job, action, source, destination, outcome)
+
+
+def last_moves(collected):
+    found = values(collected, "bdbackup_gfs_last_move_timestamp_seconds",
+                   "job_name", "from_stage", "to_stage")
+    return {key[1:]: value for key, value in found.items() if key[0] == JOB}
+
+
+def test_the_last_move_of_a_stage_pair_is_the_newest_ok_move(env):
+    env.write(TWO_PATHS)
+    touch_database(env)
+    back, d1, d2, weekly = (str(env.abs(p)) for p in ("BACKUP", "NFS/daily", "NFS/daily2",
+                                                       "NFS/weekly"))
+    step(env, "2026-11-10T02:00:00+00:00", f"{back}/files/a", f"{d1}/files/a")
+    step(env, "2026-11-12T02:00:00+00:00", f"{back}/files/b", f"{d1}/files/b")  # the newest 1 to 2
+    step(env, "2026-11-12T02:00:01+00:00", f"{back}/files/b", f"{d2}/files/b")  # its second path
+    step(env, "2026-11-11T02:00:00+00:00", f"{d1}/files/a", f"{weekly}/files/a")
+    step(env, "2026-11-18T02:00:00+00:00", f"{d1}/files/c", f"{weekly}/files/c", outcome="failed")
+    step(env, "2026-11-18T02:00:00+00:00", f"{d1}/files/c", f"{weekly}/files/c", action="hold")
+    step(env, "2026-11-17T02:00:00+00:00", f"{d1}/files/a", None)  # completes an interrupted move
+    step(env, "2026-11-17T02:00:00+00:00", f"{back}/files/z", f"{weekly}/files/z", job="other")
+    step(env, "2026-11-17T02:00:00+00:00", "/elsewhere/a", f"{weekly}/files/z")  # no stage
+
+    collected = collect(env)
+
+    assert last_moves(collected) == {
+        ("1", "2"): epoch("2026-11-12T02:00:01+00:00"),
+        ("2", "3"): epoch("2026-11-11T02:00:00+00:00"),
+    }
+
+
+def test_no_move_means_no_last_move_series(env):
+    touch_database(env)
+
+    assert last_moves(collect(env)) == {}
+
+
+# ---- unmanaged records (spec 4.5) --------------------------------------------------------------
+
+
+def unmanaged(collected):
+    units = values(collected, "bdbackup_gfs_unmanaged_units", "job_name", "stage", "reason")
+    size = values(collected, "bdbackup_gfs_unmanaged_bytes", "job_name", "stage", "reason")
+    return (
+        {key[1:]: value for key, value in units.items() if key[0] == JOB},
+        {key[1:]: value for key, value in size.items() if key[0] == JOB},
+    )
+
+
+def test_unmanaged_records_by_reason_equal_what_the_run_counts(env):
+    env.file_unit("kept.tar.gz", days_ago=0)
+    bare = env.file_unit("bare.tar.gz", days_ago=1)  # a record with no unit and no checksum
+    sql(env, "UPDATE backup_runs SET unit=NULL, checksum=NULL WHERE path=?", str(bare.resolve()))
+    gone = env.file_unit("gone.tar.gz", days_ago=2)
+    gone_size = gone.stat().st_size
+    gone.unlink()  # missing when GFS first judges it
+    assert env.run_api(datetime.now())[0] == 0
+    counted = gfs_store.load(
+        env.history, env.abs("BACKUP"),
+        {path for stage in Config(env.config_path).get("gfs-main").params["stage"]
+         for path in stage.paths},
+    )[1]
+
+    collected = collect(env)
+
+    units, size = unmanaged(collected)
+    assert units == {("1", "no_checksum"): 1, ("1", "unavailable"): 1}
+    assert size == {("1", "no_checksum"): bare.stat().st_size, ("1", "unavailable"): gone_size}
+    assert sum(units.values()) == counted == env.query("SELECT unmanaged FROM gfs_runs")[0][0] == 2
+
+
+def test_both_classes_are_zero_when_nothing_is_unmanaged(env):
+    env.file_unit("kept.tar.gz", days_ago=0)
+    assert env.run_api(datetime.now())[0] == 0
+
+    units, size = unmanaged(collect(env))
+
+    assert units == {("1", "no_checksum"): 0, ("1", "unavailable"): 0}
+    assert size == {("1", "no_checksum"): 0, ("1", "unavailable"): 0}
+
+
+# ---- the stage's verify flag and the schema version (spec 4.6) ---------------------------------
+
+
+def test_stage_verify_is_1_or_0_for_each_stage(env):
+    env.write([(["BACKUP"], "daily", "5d"), (["NFS/daily"], "daily", "20d", "verify = false"),
+               (["NFS/weekly"], "weekly", "8w", "verify = true")])
+
+    collected = collect(env)
+
+    found = values(collected, "bdbackup_gfs_stage_verify", "job_name", "stage")
+    assert found == {(JOB, "1"): 1, (JOB, "2"): 0, (JOB, "3"): 1}
+
+
+def test_the_schema_version_is_the_databases_user_version(env):
+    touch_database(env)
+
+    collected = collect(env)
+
+    version = sql(env, "PRAGMA user_version")[0][0]
+    assert version >= 6
+    assert values(collected, "bdbackup_history_schema_version") == {(): version}
+
+
+def test_the_schema_version_does_not_wait_for_the_share(env):
+    touch_database(env)
+
+    collected = collect_all(
+        Config(env.config_path).jobs, History(Config(env.config_path).history), now=TODAY,
+        timeout_seconds=5, probe=lambda requests, timeout: Results({}, {DESTINATION: "timeout"}),
+    )
+
+    assert values(collected, "bdbackup_history_schema_version") == {
+        (): sql(env, "PRAGMA user_version")[0][0]
+    }
+
+
+def test_there_is_no_schema_version_before_the_database_exists(env):
+    assert not env.database.exists()
+
+    assert values(collect(env), "bdbackup_history_schema_version") == {}

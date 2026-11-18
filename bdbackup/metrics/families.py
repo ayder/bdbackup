@@ -40,6 +40,11 @@ GFS_SOURCE_NEWEST = "bdbackup_gfs_source_newest_timestamp_seconds"
 GFS_SOURCE_OLDEST = "bdbackup_gfs_source_oldest_timestamp_seconds"
 GFS_SOURCE_UNITS = "bdbackup_gfs_source_units"
 GFS_SOURCE_BYTES = "bdbackup_gfs_source_bytes"
+GFS_LAST_MOVE = "bdbackup_gfs_last_move_timestamp_seconds"
+GFS_UNMANAGED_UNITS = "bdbackup_gfs_unmanaged_units"
+GFS_UNMANAGED_BYTES = "bdbackup_gfs_unmanaged_bytes"
+GFS_STAGE_VERIFY = "bdbackup_gfs_stage_verify"
+HISTORY_SCHEMA_VERSION = "bdbackup_history_schema_version"
 
 # Labels of the families kept per stage and per backup job whose units the stage holds.
 GFS_SOURCE = ("job_name", "stage", "source_job")
@@ -127,6 +132,33 @@ BUILTIN = (
     Family(GFS_SOURCE_UNITS, "Units of the backup job whose newest location is in the stage.",
            GFS_SOURCE),
     Family(GFS_SOURCE_BYTES, "Bytes of the backup job's units in the stage.", GFS_SOURCE),
+    Family(
+        GFS_LAST_MOVE,
+        "Time of the newest successful move between two stages of the gfs job.",
+        ("job_name", "from_stage", "to_stage"),
+    ),
+    Family(
+        GFS_UNMANAGED_UNITS,
+        "Successful records under the first stage that GFS does not manage, by reason: "
+        "no_checksum or unavailable.",
+        ("job_name", "stage", "reason"),
+    ),
+    Family(
+        GFS_UNMANAGED_BYTES,
+        "Bytes of the successful records under the first stage that GFS does not manage, "
+        "by reason.",
+        ("job_name", "stage", "reason"),
+    ),
+    Family(
+        GFS_STAGE_VERIFY,
+        "1 when GFS re-reads the checksums of the stage's units, 0 for verify = false.",
+        ("job_name", "stage"),
+    ),
+    Family(
+        HISTORY_SCHEMA_VERSION,
+        "Schema version of the history database (PRAGMA user_version).",
+        (),
+    ),
 )
 
 
