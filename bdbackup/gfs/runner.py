@@ -145,10 +145,15 @@ class _Run:
         self.line("refused", unit, current, None, f"refused: {reason}")
         self.step(unit, "refuse", None, None, "refused", reason)
 
+    def verify(self, unit, location: store.Location) -> None:
+        """Verify one location; its stage's ``verify = false`` skips the checksum re-read."""
+        index = _stage_index(self.stages, location)
+        verify(unit, location.path, checksums=index is None or self.stages[index].verify)
+
     def remove_locations(self, unit, locations, *, verified: bool) -> None:
         for location in locations:
             if not verified:
-                verify(unit, location.path)
+                self.verify(unit, location)
             self.transport.remove(location.path)
 
     def complete_interrupted(self, unit, current: int, leftovers) -> store.ManagedUnit:
@@ -157,7 +162,7 @@ class _Run:
             return unit
         for location in unit.locations:  # never remove the earlier copy unless the new ones hold
             if location not in leftovers:
-                verify(unit, location.path)
+                self.verify(unit, location)
         with ExitStack() as stack:
             _engine_locks(stack, unit, [loc.path for loc in leftovers])
             self.remove_locations(unit, leftovers, verified=False)
@@ -182,7 +187,7 @@ class _Run:
             return
         source = unit.locations[0].path
         for location in unit.locations[1:]:  # the source is hashed while it is copied
-            verify(unit, location.path)
+            self.verify(unit, location)
         temps: list[Path] = []
         try:
             for final in finals:
@@ -213,7 +218,7 @@ class _Run:
             self.line("delete", unit, current, None, decision.reason)
             return
         for location in unit.locations:
-            verify(unit, location.path)
+            self.verify(unit, location)
         with ExitStack() as stack:
             _engine_locks(stack, unit, [loc.path for loc in unit.locations])
             unit = self.ensure_row(unit)

@@ -172,9 +172,15 @@ def check_contents(unit: ManagedUnit, at: Path) -> None:
             raise Refusal(f"unexpected entry {relative}")
 
 
-def verify(unit: ManagedUnit, at: Path) -> None:
-    """Recompute every member's checksum at a location and compare with the ledger."""
+def verify(unit: ManagedUnit, at: Path, *, checksums: bool = True) -> None:
+    """Check a location against the ledger: its contents, then every member's checksum.
+
+    The contents check reads metadata only and always runs; ``checksums=False`` skips the
+    read of the data (a stage with ``verify = false``).
+    """
     check_contents(unit, at)
+    if not checksums:
+        return
     for member, relative in zip(unit.members, _member_paths(unit), strict=True):
         try:
             actual = checksum(at / relative if relative != "." else at)
