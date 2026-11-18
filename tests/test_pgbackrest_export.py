@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import gc
 import hashlib
+import inspect
 import io
 import os
 import tarfile
@@ -18,7 +19,7 @@ from bdbackup.backends import BackupError
 from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History, HistorySettings
 from bdbackup.postgres import pgbackrest
-from bdbackup.postgres.pgbackrest import PgBackRest
+from bdbackup.postgres.pgbackrest import ExportProgress, PgBackRest
 from bdbackup.postgres.repository import FullBackup
 from tests.pgbackrest_fake import make_repo
 
@@ -516,4 +517,163 @@ def test_close_error_removes_temp(tmp_path, monkeypatch):
 
     assert os.strerror(errno.EIO) in str(caught.value)
     assert os.strerror(errno.EBADF) not in str(caught.value)
+    assert list(engine.out_dir.iterdir()) == []
+
+
+# ---- progress: the step an export reached and how long its phases took ----------------------
+
+
+class Clock:
+    """The export's clock, moved by the test: it advances only when a watched call does."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float):
+        def move():
+            self.now += seconds
+
+        return move
+
+
+def hook(monkeypatch, owner, name, *, before=None, after=None):
+    """Run ``before()`` and ``after()`` around every call of ``owner.name``, which still runs."""
+    original = getattr(owner, name)
+    static = isinstance(inspect.getattr_static(owner, name), staticmethod)
+
+    def wrapper(*args, **kwargs):
+        if before is not None:
+            before()
+        result = original(*args, **kwargs)
+        if after is not None:
+            after()
+        return result
+
+    monkeypatch.setattr(owner, name, staticmethod(wrapper) if static else wrapper)
+
+
+def test_progress_moves_through_the_steps_in_order(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, make_repo(tmp_path))
+    progress = ExportProgress()
+    assert progress == ExportProgress(step="start", write_seconds=None, verify_seconds=None)
+    seen = []
+    for owner, name in (
+        (PgBackRest, "require_marker"),
+        (PgBackRest, "_write_tar"),
+        (PgBackRest, "_read_back"),
+        (os, "rename"),
+    ):
+        hook(monkeypatch, owner, name, before=lambda name=name: seen.append((name, progress.step)))
+
+    result = engine.export(full(), progress=progress)
+
+    assert seen == [
+        ("require_marker", "destination"),
+        ("_write_tar", "write"),
+        ("_read_back", "verify"),
+        ("rename", "publish"),
+    ]
+    assert progress.step == "done"
+    assert result.success
+
+
+def test_progress_without_verify_skips_the_verify_step(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, make_repo(tmp_path))
+    progress = ExportProgress()
+    seen = []
+    hook(monkeypatch, PgBackRest, "_read_back", before=lambda: seen.append(progress.step))
+    hook(monkeypatch, os, "rename", before=lambda: seen.append(progress.step))
+
+    engine.export(full(), verify=False, progress=progress)
+
+    assert seen == ["publish"]  # the read-back never ran; the rename ran in the publish step
+    assert progress.step == "done"
+    assert progress.write_seconds is not None
+    assert progress.verify_seconds is None
+
+
+def test_progress_times_the_write_and_the_read_back(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, make_repo(tmp_path))
+    clock = Clock()
+    monkeypatch.setattr(pgbackrest, "_clock", clock)
+    # Slow calls inside the write: the tar and its fsync. Slow calls outside both timers:
+    # clearing stale files before the write, and the rename after the read-back.
+    hook(monkeypatch, PgBackRest, "_remove_stale_temps", after=clock.advance(7.0))
+    hook(monkeypatch, PgBackRest, "_write_tar", after=clock.advance(2.0))
+    hook(monkeypatch, os, "fsync", after=clock.advance(0.5))
+    hook(monkeypatch, PgBackRest, "_read_back", after=clock.advance(3.0))
+    hook(monkeypatch, os, "rename", after=clock.advance(11.0))
+    progress = ExportProgress()
+
+    engine.export(full(), progress=progress)
+
+    assert progress.write_seconds == pytest.approx(2.5)
+    assert progress.verify_seconds == pytest.approx(3.0)
+
+
+def test_progress_without_verify_times_only_the_write(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, make_repo(tmp_path))
+    clock = Clock()
+    monkeypatch.setattr(pgbackrest, "_clock", clock)
+    hook(monkeypatch, PgBackRest, "_write_tar", after=clock.advance(2.0))
+    hook(monkeypatch, os, "fsync", after=clock.advance(0.5))
+    progress = ExportProgress()
+
+    engine.export(full(), verify=False, progress=progress)
+
+    assert progress.write_seconds == pytest.approx(2.5)
+    assert progress.verify_seconds is None
+
+
+def test_a_missing_marker_leaves_the_destination_step(tmp_path):
+    engine = make_engine(tmp_path, make_repo(tmp_path), marker=False)
+    progress = ExportProgress()
+
+    with pytest.raises(BackupError, match="missing"):
+        engine.export(full(), progress=progress)
+
+    assert progress.step == "destination"
+    assert progress.write_seconds is None
+    assert progress.verify_seconds is None
+
+
+def test_a_corrupted_read_back_leaves_the_verify_step(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, make_repo(tmp_path))
+    watch_files(monkeypatch, before_read_back=flip("data"))
+    progress = ExportProgress()
+
+    with pytest.raises(BackupError, match="checksum"):
+        engine.export(full(), progress=progress)
+
+    assert progress.step == "verify"
+    assert progress.write_seconds is not None  # the write finished; only the read-back did not
+    assert progress.verify_seconds is None
+    assert list(engine.out_dir.iterdir()) == []
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_a_full_disk_leaves_the_write_step(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, make_repo(tmp_path))
+    original = pgbackrest._HashingWriter.write
+    calls = []
+
+    def fail_first_write(self, data):
+        calls.append(len(data))
+        if len(calls) == 1:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        return original(self, data)
+
+    monkeypatch.setattr(pgbackrest._HashingWriter, "write", fail_first_write)
+    progress = ExportProgress()
+
+    with pytest.raises(BackupError, match=os.strerror(errno.ENOSPC)):
+        engine.export(full(), progress=progress)
+    gc.collect()
+
+    assert progress.step == "write"
+    assert progress.write_seconds is None
+    assert progress.verify_seconds is None
     assert list(engine.out_dir.iterdir()) == []

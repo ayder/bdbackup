@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,22 @@ class Choice:
 
     full: FullBackup
     new: bool
+
+
+@dataclass
+class ExportProgress:
+    """How far an export got, and how long its phases took; ``PgBackRest.export`` fills it in.
+
+    ``step`` is the phase the export is in, and after a failure the phase it failed in:
+    ``start``, ``destination``, ``write``, ``verify``, ``publish`` or ``done``.
+    """
+
+    step: str = "start"
+    write_seconds: float | None = None
+    verify_seconds: float | None = None
+
+
+_clock = time.monotonic  # the export's timer, a module attribute so tests can set it
 
 
 class PgBackRestError(BackupError):
@@ -350,7 +367,10 @@ class PgBackRest:
             return "OK", f"{subject} does not exist; {target} is writable, so it can be created"
         return "FAIL", f"{subject} does not exist and {target} is not a writable directory"
 
-    def export(self, full: FullBackup, *, verify: bool = True) -> BackupResult:
+    def export(
+        self, full: FullBackup, *, verify: bool = True,
+        progress: ExportProgress | None = None,
+    ) -> BackupResult:
         """Write ``full`` as one tar in ``out_dir``, hashing its bytes as they are written.
 
         With ``verify`` the temporary file is read back once before it gets its final name.
