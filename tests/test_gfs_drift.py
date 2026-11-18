@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timedelta
@@ -54,7 +55,10 @@ def placed(env):
     return env.root / "NFS/daily/files/a.tar.gz"
 
 
-CLEAN = {2: (True, 0, 0), 3: (True, 0, 0)}
+# The first stage, when no pgbackrest job feeds it, is checked for missing locations only: it
+# has no marker and is not walked, so its unknown count is None.
+FIRST = (True, 0, None)
+CLEAN = {1: FIRST, 2: (True, 0, 0), 3: (True, 0, 0)}
 
 
 def test_the_suite_runs_gfs_with_an_in_process_drift_check_by_default():
@@ -81,7 +85,7 @@ def test_a_location_removed_by_hand_is_missing(env):
     code, output, facts = run(env)
 
     assert code == 0, output
-    assert stages(facts) == {2: (True, 1, 0), 3: (True, 0, 0)}
+    assert stages(facts) == {**CLEAN, 2: (True, 1, 0)}
     assert lines(output) == [f"Drift {env.abs('NFS/daily')}: 1 missing, 0 unknown"]
 
 
@@ -100,7 +104,7 @@ def test_stray_entries_are_unknown_one_each_and_are_not_entered(env):
     code, output, facts = run(env)
 
     assert code == 0, output
-    assert stages(facts) == {2: (True, 0, 3), 3: (True, 0, 0)}
+    assert stages(facts) == {**CLEAN, 2: (True, 0, 3)}
     assert lines(output) == [f"Drift {env.abs('NFS/daily')}: 0 missing, 3 unknown"]
 
 
@@ -183,7 +187,7 @@ def test_a_stage_without_its_marker_is_not_checked(env):
 
     code, output, facts = run(env)
 
-    assert stages(facts) == {2: (True, 0, 0), 3: (False, 0, 0)}
+    assert stages(facts) == {**CLEAN, 3: (False, 0, 0)}
     assert lines(output) == []  # not a drift: the snapshot step reports the missing marker
 
 
@@ -193,8 +197,30 @@ def test_a_first_stage_that_is_not_fed_is_never_walked(env):
 
     _, output, facts = run(env)
 
-    assert stages(facts) == CLEAN  # there is no stage 1 entry
+    assert stages(facts) == CLEAN  # a stray file there is not counted: its unknown is None
     assert lines(output) == []
+
+
+def test_a_first_stage_that_is_not_fed_is_checked_for_missing_locations(env):
+    placed(env)
+    (env.root / "BACKUP" / "files" / "b.tar.gz").unlink()  # unit b only stays in stage 1
+    (env.root / "BACKUP" / "stray.txt").write_text("x")
+
+    code, output, facts = run(env)
+
+    assert code == 0, output
+    assert stages(facts) == {**CLEAN, 1: (True, 1, None)}
+    assert lines(output) == [f"Drift {env.abs('BACKUP')}: 1 missing"]  # no unknown count: no walk
+
+
+def test_a_first_stage_that_does_not_exist_is_not_checked(env):
+    placed(env)
+    shutil.rmtree(env.root / "BACKUP")
+
+    _, output, facts = run(env)
+
+    assert stages(facts) == {**CLEAN, 1: (False, 0, 0)}
+    assert lines(output) == []  # a missing first stage is not a drift of units
 
 
 def test_a_first_stage_a_pgbackrest_job_writes_into_is_walked(env):
@@ -230,7 +256,7 @@ def test_a_hanging_child_ends_the_run_at_the_deadline(env, monkeypatch):
     assert elapsed < 6
     assert code == 0, output
     assert lines(output, "drift not checked") == ["drift not checked: timeout after 1 s"]
-    assert stages(facts) == {2: (False, 0, 0), 3: (False, 0, 0)}
+    assert stages(facts) == {1: (False, 0, 0), 2: (False, 0, 0), 3: (False, 0, 0)}
     assert facts["moves"] == {"rename": 1, "copy": 0}  # the move was made before the check
     assert lines(output) == []
 
@@ -261,7 +287,7 @@ def test_a_walk_error_leaves_the_stage_unchecked_with_a_line_and_the_exit_code_a
         files.chmod(0o700)
 
     assert code == 0, output
-    assert stages(facts) == {2: (False, 0, 0), 3: (True, 0, 0)}
+    assert stages(facts) == {**CLEAN, 2: (False, 0, 0)}
     assert lines(output, "drift not checked") == [
         f"drift not checked: {env.abs('NFS/daily')}: Permission denied"
     ]
@@ -279,7 +305,7 @@ def test_a_drift_check_that_raises_blocks_nothing_and_changes_no_exit_code(env):
     assert code == 0, output
     assert (env.root / "NFS/daily/files/a.tar.gz").exists()
     assert lines(output, "drift not checked") == ["drift not checked: boom"]
-    assert stages(facts) == {2: (False, 0, 0), 3: (False, 0, 0)}
+    assert stages(facts) == {1: (False, 0, 0), 2: (False, 0, 0), 3: (False, 0, 0)}
 
 
 def test_a_dry_run_before_any_history_exists_still_checks_the_stage_paths(env):
@@ -337,7 +363,7 @@ def test_a_crash_after_a_rename_shows_as_one_missing_and_one_unknown(env):
         (r["stage"], r["outcome"], r["reason"], r["units"]) for r in facts["reasons"]
     ]
     # the ledger names a copy that is gone, and the share holds one the ledger does not name
-    assert stages(facts) == {2: (True, 1, 0), 3: (True, 0, 1)}
+    assert stages(facts) == {**CLEAN, 2: (True, 1, 0), 3: (True, 0, 1)}
     assert lines(output) == [f"Drift {env.abs('NFS/daily')}: 1 missing, 0 unknown",
                              f"Drift {env.abs('NFS/weekly')}: 0 missing, 1 unknown"]
 

@@ -688,13 +688,30 @@ def test_the_drift_of_a_checked_stage_becomes_series_and_an_unchecked_stage_has_
     }
 
 
+def test_a_stage_that_was_not_walked_has_missing_units_and_no_unknown_entries(env):
+    record_facts(env, {**FACTS, "drift": [
+        {"stage": 1, "checked": True, "missing": 2, "unknown": None},  # an unfed first stage
+        {"stage": 2, "checked": True, "missing": 0, "unknown": 1},
+    ]})
+
+    collected = collect(env)
+
+    assert values(collected, "bdbackup_gfs_drift_missing_units", "job_name", "stage") == {
+        (JOB, "1"): 2, (JOB, "2"): 0,
+    }
+    assert values(collected, "bdbackup_gfs_drift_unknown_entries", "job_name", "stage") == {
+        (JOB, "2"): 1  # none for stage 1
+    }
+
+
 def test_malformed_drift_entries_are_skipped(env):
     record_facts(env, {**FACTS, "drift": [
         {"stage": 2, "checked": True, "missing": 1, "unknown": 2},
         {"stage": "two", "checked": True, "missing": 1, "unknown": 2},
         {"stage": 3, "checked": "yes", "missing": 1, "unknown": 2},
         {"stage": 4, "checked": True, "missing": -1, "unknown": 2},
-        {"stage": 5, "checked": True, "missing": 1},
+        {"stage": 5, "checked": True, "missing": 1},  # no "unknown" key at all
+        {"stage": 6, "checked": True, "missing": 1, "unknown": "many"},
         "not a table",
     ]})
 
