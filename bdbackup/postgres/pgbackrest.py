@@ -377,17 +377,23 @@ class PgBackRest:
         Nothing is published unless the whole tar was written, synced and, with ``verify``,
         read back; on any failure the temporary file is removed. Every file under
         ``repo_path`` is opened read-only.
+
+        ``progress``, when given, is updated as the export goes, so its caller can tell after
+        a failure which phase failed and what the phases took (:class:`ExportProgress`).
         """
+        progress = progress if progress is not None else ExportProgress()
+        progress.step = "destination"
         self.require_marker()
         try:
-            return self._export(full, verify)
+            return self._export(full, verify, progress)
         except OSError as exc:
             # Not left as an OSError: BlockingIOError would read as a busy lock (exit 3).
             raise BackupError(
                 f"cannot export {full.label} to {self.out_dir}: {exc.strerror or exc}"
             ) from exc
 
-    def _export(self, full: FullBackup, verify: bool) -> BackupResult:
+    def _export(self, full: FullBackup, verify: bool, progress: ExportProgress) -> BackupResult:
+        progress.step = "write"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._remove_stale_temps()
         final = self.unit_path(full.label)
@@ -397,14 +403,20 @@ class PgBackRest:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         writer = _HashingWriter(fd)
         try:
+            started = _clock()
             names = self._write_tar(writer, full.label)
             os.fsync(fd)
             # Cleared before the close: a failed close has still released the descriptor.
             closing, fd = fd, None
             os.close(closing)
+            progress.write_seconds = _clock() - started
             if verify:
+                progress.step = "verify"
+                started = _clock()
                 # As FileBackup.close_archive does: a tar that fails is never published.
                 self._read_back(temp, final, writer.sha256.hexdigest(), names)
+                progress.verify_seconds = _clock() - started
+            progress.step = "publish"
             os.rename(temp, final)
         except BaseException:
             # A failed tar stream flushes its buffer again when it is collected; that write
@@ -415,6 +427,7 @@ class PgBackRest:
             temp.unlink(missing_ok=True)
             raise
         _fsync_dir(self.out_dir)
+        progress.step = "done"
         return BackupResult(
             final, size_bytes=writer.size, success=True, checksum=writer.sha256.hexdigest()
         )
