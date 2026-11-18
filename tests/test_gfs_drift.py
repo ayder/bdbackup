@@ -194,6 +194,34 @@ def test_the_entries_a_filesystem_or_an_appliance_keeps_are_not_unknown(env):
     assert lines(output) == [f"Drift {env.abs('NFS/daily')}: 0 missing, 1 unknown"]
 
 
+def test_the_empty_directory_a_move_leaves_behind_is_not_unknown(env):
+    placed(env)
+    later = datetime.now() + timedelta(days=30)  # a now belongs in NFS/weekly
+    code, output, _ = run(env, later)
+    assert code == 0, output
+    assert (env.root / "NFS/weekly/files/a.tar.gz").exists()
+    leftover = env.root / "NFS/daily/files"  # GFS never removes the parent a unit left
+    assert leftover.is_dir() and not list(leftover.iterdir())
+    (leftover / ".bdbackup.lock").write_text("")  # what a move of an xtrabackup unit leaves in it
+
+    code, output, facts = run(env, later)
+
+    assert code == 0, output
+    assert stages(facts) == CLEAN
+    assert lines(output) == []
+
+
+def test_a_directory_with_a_real_entry_is_still_one_unknown_entry(env):
+    placed(env)
+    (env.root / "NFS/daily" / "left").mkdir()
+    (env.root / "NFS/daily" / "left" / ".bdbackup.lock").write_text("")  # not counted
+    (env.root / "NFS/daily" / "left" / "something").write_text("x")  # the directory counts, once
+
+    _, _, facts = run(env)
+
+    assert stages(facts)[2] == (True, 0, 1)
+
+
 # ---- unchecked stages --------------------------------------------------------------------------
 
 
