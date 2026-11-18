@@ -20,7 +20,7 @@ PERIODS = ("daily", "weekly", "monthly", "yearly")
 MARKER = ".bdbackup-destination"
 _KEEP = re.compile(r"([1-9][0-9]*)([dwmy])")
 _JOB_KEYS = {"type", "stage"}
-_STAGE_KEYS = {"paths", "period", "keep"}
+_STAGE_KEYS = {"paths", "period", "keep", "verify"}
 # (shortest, longest) days of one unit, so "longer on every calendar" is decidable.
 _UNIT_DAYS = {"d": (1, 1), "w": (7, 7), "m": (28, 31), "y": (365, 366)}
 
@@ -66,6 +66,7 @@ class Stage:
     paths: tuple[Path, ...]
     period: str
     keep: Keep
+    verify: bool = True
 
 
 def _stage(

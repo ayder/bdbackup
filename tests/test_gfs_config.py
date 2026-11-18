@@ -62,6 +62,47 @@ def test_gfs_config_parses_stages(gfs_tree):
     )
 
 
+def verify_stages(first=None, second=None):
+    """STAGES with ``verify = <value>`` (a TOML literal) written on the first or second stage."""
+    extra = {index: [f"verify = {value}"] for index, value in ((1, first), (2, second))
+             if value is not None}
+    return stage_tables(extra=extra)
+
+
+def test_stage_verify_false_parses(gfs_tree):
+    stages = Config(write_config(gfs_tree, stages=verify_stages(second="false"))).jobs[
+        "gfs-main"
+    ].params["stage"]
+    assert [stage.verify for stage in stages] == [True, False, True]
+    assert stages[1].verify is False
+
+
+def test_stage_verify_true_and_an_absent_key_parse_alike(gfs_tree):
+    stages = Config(write_config(gfs_tree, stages=verify_stages(second="true"))).jobs[
+        "gfs-main"
+    ].params["stage"]
+    assert [stage.verify for stage in stages] == [True, True, True]
+    assert all(stage.verify is True for stage in stages)
+
+
+def test_the_first_stage_accepts_the_key(gfs_tree):
+    stages = Config(write_config(gfs_tree, stages=verify_stages(first="false"))).jobs[
+        "gfs-main"
+    ].params["stage"]
+    assert [stage.verify for stage in stages] == [False, True, True]
+
+
+@pytest.mark.parametrize("value", ['"no"', "0", "1"], ids=["string", "zero", "one"])
+def test_stage_verify_must_be_true_or_false(gfs_tree, value):
+    path = write_config(gfs_tree, stages=verify_stages(second=value))
+    for args in (("run", "--validate", "--config", path), ("run", "-c", path, "-j", "gfs-main")):
+        result = invoke(*args)
+        assert result.exit_code == 2, result.output
+        assert "stage 2: verify must be true or false" in " ".join(result.output.split()), (
+            result.output
+        )
+
+
 def case_config(tmp_path, case):
     p = tmp_path.resolve()
     if case == "no-history":
