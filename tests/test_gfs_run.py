@@ -70,10 +70,10 @@ class Env:
 
     def write(self, stages):
         text = '[history]\ndatabase="state/history.sqlite3"\n[gfs-main]\ntype="gfs"\n'
-        for paths, period, keep in stages:
+        for paths, period, keep, *options in stages:  # options: more "key = value" lines
             quoted = ", ".join(f'"{p}"' for p in paths)
             text += (f"[[gfs-main.stage]]\npaths = [{quoted}]\nperiod = \"{period}\"\n"
-                     f"keep = \"{keep}\"\n")
+                     f"keep = \"{keep}\"\n" + "".join(f"{option}\n" for option in options))
         self.config_path.write_text(text)
 
     def feed_first_stage(self):
@@ -1186,3 +1186,225 @@ def test_last_run_needs_no_outcome_from_run_job_it_returns_what_it_always_did(en
     assert runner.run_job(config, job, out=lambda _line: None) == 0
     with process_lock(runner.job_lock_path(config, "gfs-main")):
         assert runner.run_job(config, job, out=lambda _line: None) == 3
+
+
+# ---- verify = false: no checksum re-reads (0.7.4, D1, D2) ------------------------------------
+
+NO_VERIFY = "verify = false"
+
+
+@pytest.fixture
+def checksums():
+    """The paths ``bdbackup.gfs.actions`` checksums: what a verify step reads again."""
+    calls = []
+    original = actions.checksum
+
+    def spy(path):
+        calls.append(Path(path))
+        return original(path)
+
+    with patch("bdbackup.gfs.actions.checksum", spy):
+        yield calls
+
+
+def later_stage(*options):
+    """A first stage and one later stage, with ``options`` on the later one."""
+    return [(["BACKUP"], "daily", "5d"), (["NFS/daily"], "daily", "20d", *options)]
+
+
+def expire_in_nfs_daily(env, make_unit, *, options):
+    """A unit moved to NFS/daily, which is not the newest of its series, and the day it expires.
+
+    Returns the unit's path at NFS/daily and the clock to run at: 60 days on.
+    """
+    env.write(later_stage(*options))
+    unit = make_unit()
+    assert env.run_api(datetime.now())[0] == 0
+    moved = env.root / "NFS/daily" / unit.relative_to(env.root / "BACKUP")
+    assert moved.exists() and not unit.exists()
+    return moved, datetime.now() + timedelta(days=60)
+
+
+def file_pair(env):
+    def make():
+        a = env.file_unit("a.tar.gz", days_ago=7)
+        env.file_unit("b.tar.gz", days_ago=0)
+        return a
+    return make
+
+
+@pytest.mark.parametrize("options", [(), (NO_VERIFY,)], ids=["default", "verify-false"])
+def test_a_changed_unit_is_deleted_only_in_a_verify_false_stage(env, checksums, options):
+    moved, later = expire_in_nfs_daily(env, file_pair(env), options=options)
+    moved.write_bytes(b"changed on disk")
+    checksums.clear()
+
+    code, output = env.run_api(later)
+
+    if options:
+        assert code == 0, output
+        assert "delete files files/a.tar.gz" in output, output
+        assert not moved.exists()
+        assert checksums == []
+        assert env.query("SELECT count(*) FROM gfs_units WHERE deleted_at IS NOT NULL") == [(1,)]
+    else:
+        assert code == 1, output
+        assert "refused: checksum mismatch" in output
+        assert moved.read_bytes() == b"changed on disk"
+        assert checksums == [moved.resolve()]
+
+
+def make_missing(moved):
+    moved.unlink()
+    return f"refused: missing location {moved.resolve()}"
+
+
+def make_directory(moved):
+    moved.unlink()
+    moved.mkdir()
+    return "refused: unexpected entry a.tar.gz"
+
+
+@pytest.mark.parametrize("damage", [make_missing, make_directory],
+                         ids=["missing-location", "directory-in-place"])
+def test_a_verify_false_stage_still_refuses_a_file_unit_that_is_not_there_or_not_a_file(
+    env, checksums, damage
+):
+    moved, later = expire_in_nfs_daily(env, file_pair(env), options=(NO_VERIFY,))
+    reason = damage(moved)
+
+    code, output = env.run_api(later)
+
+    assert code == 1, output
+    assert reason in output, output
+    assert checksums == []
+    assert env.query("SELECT count(*) FROM gfs_units WHERE deleted_at IS NOT NULL") == [(0,)]
+
+
+def test_a_verify_false_stage_still_refuses_an_unexpected_entry_in_an_xtrabackup_unit(
+    env, checksums
+):
+    def make():
+        unit = env.xtrabackup_unit(7)
+        env.xtrabackup_unit(0)
+        return unit
+
+    moved, later = expire_in_nfs_daily(env, make, options=(NO_VERIFY,))
+    (moved / "stray").mkdir()
+    before = tree(moved)
+
+    code, output = env.run_api(later)
+
+    assert code == 1, output
+    assert "refused: unexpected entry stray" in output, output
+    assert tree(moved) == before
+    assert checksums == []
+
+
+MIRRORED = [(["BACKUP"], "daily", "5d"),
+            (["NFS/daily", "NFS/daily2"], "daily", "20d", NO_VERIFY),
+            (["NFS/weekly"], "weekly", "8w")]
+
+
+def mirrored_unit(env):
+    """Unit a in both paths of the verify = false stage; the next run moves it to weekly."""
+    env.write(MIRRORED)
+    env.file_unit("a.tar.gz", day=date(2026, 8, 30))  # a Sunday, alone in ISO week 35
+    env.file_unit("z.tar.gz", day=date(2026, 9, 29))
+    assert env.run_api(datetime(2026, 9, 5, 12))[0] == 0
+    return (env.root / "NFS/daily/files/a.tar.gz", env.root / "NFS/daily2/files/a.tar.gz",
+            env.root / "NFS/weekly/files/a.tar.gz")
+
+
+def test_a_changed_second_copy_in_a_verify_false_stage_does_not_block_the_move(env, checksums):
+    first, second, weekly = mirrored_unit(env)
+    original = first.read_bytes()
+    second.write_bytes(b"tampered")
+
+    code, output = env.run_api(datetime(2026, 9, 29, 12))  # a's target is weekly
+
+    assert code == 0, output
+    assert weekly.read_bytes() == original
+    assert not first.exists() and not second.exists()
+    assert checksums == []
+
+
+def test_a_changed_first_copy_in_a_verify_false_stage_is_still_refused(env, checksums):
+    first, second, weekly = mirrored_unit(env)
+    original = second.read_bytes()
+    first.write_bytes(b"tampered")  # the copy the move reads: its hash rides on that read (D3)
+
+    code, output = env.run_api(datetime(2026, 9, 29, 12))
+
+    assert code == 1, output
+    assert "refused: checksum mismatch" in output
+    assert first.read_bytes() == b"tampered" and second.read_bytes() == original
+    assert not weekly.exists()
+    assert checksums == []
+
+
+def leave_an_interrupted_move(env, *, options, first=()):
+    """Unit a at NFS/daily, recorded there, with its earlier copy still in BACKUP.
+
+    ``options`` go on the later stage, ``first`` on the first one the earlier copy is left in.
+    """
+    env.write([(["BACKUP"], "daily", "5d", *first), *later_stage(*options)[1:]])
+    a = env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    moved = env.root / "NFS/daily/files/a.tar.gz"
+    shutil.copy2(moved, a)
+    unit_id, = env.query("SELECT id FROM gfs_units WHERE unit=?", str(a.resolve()))[0]
+    with closing(sqlite3.connect(env.database)) as db, db:
+        db.execute("INSERT INTO gfs_locations (unit_id, stage_path, path) VALUES (?, ?, ?)",
+                   (unit_id, str(env.abs("BACKUP")), str(a.resolve())))
+    return a, moved, unit_id
+
+
+@pytest.mark.parametrize("options", [(), (NO_VERIFY,)], ids=["default", "verify-false"])
+def test_a_changed_later_copy_blocks_an_interrupted_move_only_in_a_default_stage(
+    env, checksums, options
+):
+    a, moved, unit_id = leave_an_interrupted_move(env, options=options)
+    moved.write_bytes(b"changed later copy")
+    checksums.clear()
+
+    result = env.run_cli()
+
+    if options:
+        assert result.exit_code == 0, result.output
+        assert not a.exists()
+        # the later copy is not read; the earlier one is, as its own stage (default) says
+        assert checksums == [a.resolve()]
+        assert env.query("SELECT count(*) FROM gfs_locations WHERE unit_id=?", unit_id) == [(1,)]
+    else:
+        assert result.exit_code == 1, result.output
+        assert "refused: checksum mismatch" in result.output
+        assert a.exists()
+        assert env.query("SELECT count(*) FROM gfs_locations WHERE unit_id=?", unit_id) == [(2,)]
+
+
+def test_an_interrupted_move_between_two_verify_false_stages_reads_neither_copy(env, checksums):
+    a, moved, unit_id = leave_an_interrupted_move(env, options=(NO_VERIFY,), first=(NO_VERIFY,))
+    moved.write_bytes(b"changed later copy")
+    checksums.clear()
+
+    result = env.run_cli()
+
+    assert result.exit_code == 0, result.output
+    assert not a.exists()
+    assert checksums == []
+    assert env.query("SELECT count(*) FROM gfs_locations WHERE unit_id=?", unit_id) == [(1,)]
+
+
+def test_a_missing_later_copy_still_keeps_the_earlier_one_in_a_verify_false_stage(env, checksums):
+    a, moved, unit_id = leave_an_interrupted_move(env, options=(NO_VERIFY,))
+    moved.unlink()
+
+    result = env.run_cli()
+
+    assert result.exit_code == 1, result.output
+    assert f"refused: missing location {moved.resolve()}" in result.output
+    assert a.exists()
+    assert checksums == []
+    assert env.query("SELECT count(*) FROM gfs_locations WHERE unit_id=?", unit_id) == [(2,)]
