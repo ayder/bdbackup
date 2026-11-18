@@ -442,3 +442,62 @@ def test_a_failed_read_back_publishes_nothing_and_the_next_run_exports_the_full(
     assert retry.exit_code == 0, retry.output
     assert f"Job pg: {site.unit}" in retry.output
     assert [row.status for row in site.rows()] == ["success", "failed"]
+
+
+# ---- a binary that is missing or cannot be run -----------------------------------------------
+
+MISSING = "bdbackup-no-such-pgbackrest"
+NOT_FOUND = f"pgbackrest binary not found: {MISSING} (set the job's binary key to its full path)"
+
+
+def binary_site(tmp_path, kind):
+    """A site whose job names a binary that does not exist, or a file that is not executable.
+
+    Returns the site and the message a run must report; pgBackRest is not faked.
+    """
+    if kind == "missing":
+        return make_site(tmp_path, extra=f'binary = "{MISSING}"\n'), NOT_FOUND
+    binary = tmp_path / "pgbackrest"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o644)
+    message = f"pgbackrest binary is not executable: {binary} (check its permissions)"
+    return make_site(tmp_path, extra=f'binary = "{binary}"\n'), message
+
+
+def run_unfaked(site, *args):
+    with patch("bdbackup.cli._now", return_value=SOON):
+        return CliRunner().invoke(main, ["run", "-c", str(site.config), "-j", "pg", *args])
+
+
+@pytest.mark.parametrize("args", [(), ("--dry-run",)], ids=["run", "dry-run"])
+@pytest.mark.parametrize("kind", ["missing", "not-executable"])
+def test_a_binary_that_cannot_run_is_reported_not_raised(tmp_path, caplog, kind, args):
+    site, message = binary_site(tmp_path, kind)
+    caplog.set_level(logging.INFO)
+
+    result = run_unfaked(site, *args)
+
+    assert result.exit_code == 1, result.output
+    assert message in caplog.text
+    assert "Traceback" not in caplog.text
+    assert "Unexpected error" not in caplog.text
+    assert site.rows() == []  # as for every refusal before the export starts (D7)
+    assert not site.out_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("kind", "reason"),
+    [("missing", "No such file or directory"), ("not-executable", "Permission denied")],
+)
+def test_validate_still_reports_the_os_error_for_a_binary_that_cannot_run(
+    tmp_path, kind, reason
+):
+    site, _ = binary_site(tmp_path, kind)
+
+    result = run_unfaked(site, "--validate")
+
+    assert result.exit_code == 1, result.output
+    lines = result.output.splitlines()
+    assert f"[FAIL] pgbackrest version failed: {reason}" in lines
+    assert f"[FAIL] pgbackrest info failed: {reason}" in lines
+    assert "Traceback" not in result.output
