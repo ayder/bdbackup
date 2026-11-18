@@ -1,9 +1,9 @@
 """A fake pgBackRest repository and command runner, shared by the pgBackRest engine tests.
 
-``make_repo`` writes a repository tree on disk; ``info_json`` reads it back as the
-``pgbackrest info --output=json`` document, with each backup's database size;
-``fake_pgbackrest`` answers the engine's ``version`` and ``info`` commands from it, in place of
-``subprocess.run``.
+``make_repo`` writes a repository tree on disk (with archived WAL files when asked);
+``info_json`` reads it back as the ``pgbackrest info --output=json`` document, with each backup's
+database size and the ``archive[]`` entry of the WAL on disk; ``fake_pgbackrest`` answers the
+engine's ``version`` and ``info`` commands from it, in place of ``subprocess.run``.
 
 The info files are parsed here by a few lines of this module's own, never by
 ``bdbackup.postgres.repository``, so a bug in the code under test cannot hide in its fake.
@@ -12,6 +12,7 @@ The info files are parsed here by a few lines of this module's own, never by
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -89,6 +90,7 @@ def make_repo(
     stanza: str = "main",
     fulls=(("20261109-010000F", True, False),),
     cipher: bool = False,
+    wal=(),
 ) -> Path:
     """Write a repository under ``root / "repo"`` and return that path.
 
@@ -98,6 +100,10 @@ def make_repo(
     stops ``STOP_AFTER_START`` seconds after its label's time. Every label gets a
     ``backup.manifest`` and two data files, one of them in a nested directory. A backup's
     database size is ``10000`` times its position in ``fulls``, counting from 1.
+
+    ``wal`` lists archived WAL segment names (24 hex digits). Each becomes an empty file
+    ``archive/<stanza>/16-1/<first 16 digits>/<segment>-<40 hex digits>.gz``, as pgBackRest
+    names them, for database 1 of PostgreSQL 16.
     """
     repo = Path(root) / "repo"
     backup_dir = repo / "backup" / stanza
@@ -143,7 +149,36 @@ def make_repo(
     backup_sections["db"] = db
     _write_pair(backup_dir, "backup.info", _dump(backup_sections))
     _write_pair(archive_dir, "archive.info", _dump({"backrest": header, "db": db}))
+    for segment in wal:
+        directory = archive_dir / "16-1" / segment[:16]
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{segment}-{'0' * 40}.gz").write_bytes(b"")
     return repo
+
+
+_WAL_FILE = re.compile(r"([0-9A-F]{24})-[0-9a-f]{40}\.gz")
+
+
+def _archive_entries(repo, stanza: str) -> list[dict]:
+    """The ``archive[]`` entries: one per archive id directory that holds WAL files."""
+    entries = []
+    for directory in sorted((Path(repo) / "archive" / stanza).glob("*-*")):
+        segments = sorted(
+            match.group(1)
+            for path in directory.rglob("*.gz")
+            if (match := _WAL_FILE.fullmatch(path.name))
+        )
+        if segments:
+            database_id = int(directory.name.split("-", 1)[1])
+            entries.append(
+                {
+                    "database": {"id": database_id, "repo-key": 1},
+                    "id": directory.name,
+                    "min": segments[0],
+                    "max": segments[-1],
+                }
+            )
+    return entries
 
 
 def info_json(repo, stanza: str) -> list[dict]:
@@ -172,6 +207,7 @@ def info_json(repo, stanza: str) -> list[dict]:
     return [
         {
             "name": stanza,
+            "archive": _archive_entries(repo, stanza),
             "repo": [{"key": 1, "cipher": CIPHER if "cipher" in sections else "none"}],
             "db": [{"id": db["db-id"], "version": db["db-version"]}],
             "backup": backups,

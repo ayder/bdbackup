@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -12,18 +15,29 @@ import pytest
 from bdbackup.backends import BackupResult
 from bdbackup.config import Config, Job
 from bdbackup.engines import EngineInfo, _reset_for_tests, get_engine, list_engines, register_engine
+from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History
-from bdbackup.metrics.collector import MetricError
+from bdbackup.metrics import probe
+from bdbackup.metrics.collector import ListPrefixRequest, MetricError
+from bdbackup.metrics.probe import CHILD_SOURCE, run_probes
 from bdbackup.metrics.render import Sample
 from bdbackup.metrics.run import collect_all
 from bdbackup.postgres import PgBackRest
 from tests.pgbackrest_fake import fake_pgbackrest, info_json, missing_stanza_info
 from tests.test_metrics_collect import FakeCollector, values
+from tests.test_metrics_probe import hang_on_stat
 from tests.test_pgbackrest_cli import NEWEST, SOON, make_site
 
 RUN = "bdbackup.postgres.pgbackrest.subprocess.run"
 NOW = datetime(2026, 11, 18, 12, tzinfo=UTC)
 JS = ("job_name", "stanza")
+WAL_METRICS = (
+    "bdbackup_pgbackrest_wal_archive_present",
+    "bdbackup_pgbackrest_wal_archive_max_timeline",
+    "bdbackup_pgbackrest_wal_archive_max_segment",
+    "bdbackup_pgbackrest_wal_archive_max_mtime_seconds",
+)
+SEGMENT = "0000000100000000000000FF"
 
 
 @pytest.fixture(autouse=True)
@@ -132,6 +146,7 @@ def test_the_collector_is_registered_with_the_engine_and_declares_its_families()
         "bdbackup_pgbackrest_last_backup_bytes",
         "bdbackup_pgbackrest_last_backup_repo_bytes",
         "bdbackup_pgbackrest_backups",
+        *WAL_METRICS,
     }
 
 
@@ -417,3 +432,236 @@ def test_a_collector_may_not_report_another_source_or_job(tmp_path, error):
 
     assert collected.errors == [MetricError("collector", "f1", "failed")]
     assert values(collected, "bdbackup_fake_things", "job_name") == {}
+
+
+# ---- WAL archive freshness (D10) ---------------------------------------------------------------
+
+LOW = "000000010000000000000001"
+
+
+def wal_doc(high, *, low=LOW, archive_id="16-1", db_id=1):
+    return stanza(archive=[archive_entry(db_id, archive_id, low, high)])
+
+
+class Recording:
+    """A probe that records the requests it is given and answers them with the real children."""
+
+    def __init__(self):
+        self.requests = []
+
+    def __call__(self, requests, timeout):
+        self.requests.extend(requests)
+        return run_probes(requests, timeout)
+
+    def lists(self):
+        return [r for r in self.requests if isinstance(r, ListPrefixRequest)]
+
+
+def wal(collected, name, *extra):
+    return values(collected, f"bdbackup_pgbackrest_wal_archive_{name}", *JS, "db_id", *extra)
+
+
+def test_only_the_current_database_is_reported_after_a_stanza_upgrade(tmp_path):
+    site = make_site(tmp_path)
+    document = stanza(
+        db=[{"id": 1, "version": "15"}, {"id": 2, "version": "16"}],
+        archive=[
+            archive_entry(1, "15-1", "000000010000000000000001", "000000010000000000000009"),
+            archive_entry(2, "16-2", "000000020000000000000001", "000000020000000000000007"),
+        ],
+    )
+    recording = Recording()
+
+    collected = collect(site, scripted(document), probe_=recording)
+
+    assert wal(collected, "present") == {("pg", "main", "2"): 1}
+    assert wal(collected, "max_timeline") == {("pg", "main", "2"): 2}
+    assert wal(collected, "max_segment") == {("pg", "main", "2"): 7}
+    repo = Config(site.config).get("pg").params["repo_path"]
+    assert recording.lists() == [
+        ListPrefixRequest(
+            Path(repo) / "archive" / "main" / "16-2" / "0000000200000000",
+            "000000020000000000000007-",
+            "repository",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("archive", "present"),
+    [
+        ([], 0),
+        ([archive_entry(1, "16-1", LOW, None)], 0),
+        ([archive_entry(1, "16-1", None, SEGMENT)], 0),
+        ([archive_entry(9, "16-9", LOW, SEGMENT)], 0),  # another database's archive
+    ],
+    ids=["no-entry", "no-max", "no-min", "other-database"],
+)
+def test_wal_archive_present_is_0_without_both_min_and_max_for_the_current_database(
+    tmp_path, archive, present
+):
+    site = make_site(tmp_path)
+    recording = Recording()
+
+    collected = collect(site, scripted(stanza(archive=archive)), probe_=recording)
+
+    assert wal(collected, "present") == {("pg", "main", "1"): present}
+    assert wal(collected, "max_timeline") == {} and wal(collected, "max_segment") == {}
+    assert recording.lists() == []  # nothing to look up
+    assert collected.errors == []
+
+
+@pytest.mark.parametrize(
+    ("timeline", "log", "segment"),
+    [(1, 0, 0xFF), (1, 1, 0), (2, 0x10, 0x3), (0xA, 0xFFFFFFFF, 0xFFFFFFFF)],
+)
+@pytest.mark.parametrize("case", [str.upper, str.lower], ids=["upper", "lower"])
+def test_the_timeline_and_segment_come_from_the_24_hex_digits(
+    tmp_path, timeline, log, segment, case
+):
+    site = make_site(tmp_path)
+    high = case(f"{timeline:08X}{log:08X}{segment:08X}")
+    assert len(high) == 24
+
+    collected = collect(site, scripted(wal_doc(high)), probe_=Recording())
+
+    assert wal(collected, "max_timeline") == {("pg", "main", "1"): timeline}
+    assert wal(collected, "max_segment") == {("pg", "main", "1"): (log << 32) | segment}
+
+
+@pytest.mark.parametrize(
+    "high",
+    ["XYZ", "0000000100000000000000F", "0000000100000000000000FFF", "0000000100000000000000GG"],
+)
+def test_a_max_that_is_not_24_hex_digits_gives_no_wal_figures_and_no_request(tmp_path, high):
+    site = make_site(tmp_path)
+    recording = Recording()
+
+    collected = collect(site, scripted(wal_doc(high)), probe_=recording)
+
+    assert wal(collected, "present") == {("pg", "main", "1"): 1}  # it has both min and max
+    for name in ("max_timeline", "max_segment", "max_mtime_seconds"):
+        assert wal(collected, name) == {}
+    assert recording.lists() == []
+    assert collected.errors == []
+
+
+def wal_site(tmp_path, *, segments=(LOW, SEGMENT)):
+    """A site whose repository holds archived WAL files; the newest one's mtime is set."""
+    site = make_site(tmp_path, wal=segments)
+    directory = site.repo / "archive" / "main" / "16-1" / SEGMENT[:16]
+    newest = next(directory.glob(f"{SEGMENT}-*"))
+    os.utime(newest, (1_700_000_123, 1_700_000_123))
+    return site, directory
+
+
+def test_the_mtime_is_that_of_the_one_matching_wal_file(tmp_path):
+    site, _ = wal_site(tmp_path)
+    document = info_json(site.repo, "main")
+    assert document[0]["archive"][0]["max"] == SEGMENT  # the fake read it from the files
+
+    collected = collect(site, fake_pgbackrest(site.repo))
+
+    assert wal(collected, "max_mtime_seconds") == {("pg", "main", "1"): 1_700_000_123}
+    assert wal(collected, "present") == {("pg", "main", "1"): 1}
+    assert collected.errors == []
+
+
+def unavailable(collected):
+    return collected.errors == [MetricError("pgbackrest", "pg", "wal_mtime_unavailable")]
+
+
+def test_no_matching_file_is_wal_mtime_unavailable_and_the_other_figures_stay(tmp_path):
+    site, directory = wal_site(tmp_path)
+    next(directory.glob(f"{SEGMENT}-*")).unlink()
+
+    collected = collect(site, scripted(wal_doc(SEGMENT)))
+
+    assert unavailable(collected)
+    assert errors_of(collected) == {("pgbackrest", "pg", "wal_mtime_unavailable"): 1}
+    assert wal(collected, "max_mtime_seconds") == {}
+    assert wal(collected, "max_segment") == {("pg", "main", "1"): 255}
+    assert wal(collected, "present") == {("pg", "main", "1"): 1}
+
+
+def test_two_matching_files_are_wal_mtime_unavailable(tmp_path):
+    site, directory = wal_site(tmp_path)
+    (directory / f"{SEGMENT}-{'1' * 40}.gz").write_bytes(b"")
+
+    collected = collect(site, scripted(wal_doc(SEGMENT)))
+
+    assert unavailable(collected)
+    assert wal(collected, "max_mtime_seconds") == {}
+
+
+def test_a_missing_directory_is_wal_mtime_unavailable(tmp_path):
+    site = make_site(tmp_path)
+
+    collected = collect(site, scripted(wal_doc(SEGMENT)))
+
+    assert unavailable(collected)
+    assert wal(collected, "max_mtime_seconds") == {}
+
+
+def hang_on_list(delay: float = 0.0) -> str:
+    """A child that hangs when it is asked for a listing and answers stat requests like the real
+    one."""
+    return (
+        "import io, json, sys, time\n"
+        "text = sys.stdin.read()\n"
+        "if any(r['kind'] == 'list' for r in json.loads(text)):\n"
+        "    time.sleep(30)\n"
+        "sys.stdin = io.StringIO(text)\n"
+        f"exec({CHILD_SOURCE!r})\n"
+    )
+
+
+def use_child(monkeypatch, code):
+    monkeypatch.setattr(probe, "_child_argv", lambda: [sys.executable, "-c", code])
+
+
+def test_a_hung_repository_probe_loses_the_wal_mtime_and_nothing_else(tmp_path, monkeypatch):
+    site, _ = wal_site(tmp_path)
+    use_child(monkeypatch, hang_on_list())
+
+    collected = collect(site, fake_pgbackrest(site.repo), timeout=1)
+
+    assert unavailable(collected)
+    assert wal(collected, "max_mtime_seconds") == {}
+    assert wal(collected, "max_segment") == {("pg", "main", "1"): 255}
+    ready = values(collected, "bdbackup_destination_ready", "job_name", "stage", "path")
+    assert list(ready.values()) == [1]  # the destination probe answered: STAGE1 has its marker
+    assert (Path(site.root) / "STAGE1" / MARKER).exists()
+
+
+def test_a_hung_destination_probe_leaves_the_wal_mtime(tmp_path, monkeypatch):
+    site, _ = wal_site(tmp_path)
+    use_child(monkeypatch, hang_on_stat(0))
+
+    collected = collect(site, fake_pgbackrest(site.repo), timeout=1)
+
+    assert collected.errors == [MetricError("destination", "", "timeout")]
+    assert wal(collected, "max_mtime_seconds") == {("pg", "main", "1"): 1_700_000_123}
+    ready = values(collected, "bdbackup_destination_ready", "job_name", "stage", "path")
+    assert list(ready.values()) == [0]
+
+
+def test_the_collector_asks_for_one_directory_and_scans_nothing_in_the_parent(tmp_path):
+    site, directory = wal_site(tmp_path)
+    document = info_json(site.repo, "main")  # the fake reads the repository; only the code under
+    recording = Recording()  # test is watched, so it answers from this document instead
+    real_scandir = os.scandir
+    scanned = []
+
+    def watching(path=".", *args, **kwargs):
+        scanned.append(os.fsdecode(path) if not isinstance(path, int) else path)
+        return real_scandir(path, *args, **kwargs)
+
+    with patch("os.scandir", watching):
+        collected = collect(site, scripted(document), probe_=recording)
+
+    assert wal(collected, "max_mtime_seconds") == {("pg", "main", "1"): 1_700_000_123}
+    assert [(r.directory, r.prefix, r.probe) for r in recording.lists()] == [
+        (directory.resolve(), f"{SEGMENT}-", "repository")
+    ]
+    assert not [path for path in scanned if str(site.repo) in str(path)]
