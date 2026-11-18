@@ -602,10 +602,13 @@ def test_last_run_of_a_missing_marker_is_destination_not_ready(tmp_path):
 
 def test_last_run_of_a_full_disk_is_export_failed(tmp_path, monkeypatch):
     site = make_site(tmp_path)
+    gc.collect()  # a stale failed stream of an earlier test flushes now, not through the patch
     original = pgbackrest._HashingWriter.write
     calls = []
 
     def fail_first_write(self, data):
+        if self.discarding:  # the writer of an export that already failed
+            return original(self, data)
         calls.append(len(data))
         if len(calls) == 1:
             raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))

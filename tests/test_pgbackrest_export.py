@@ -410,11 +410,16 @@ def test_write_error_leaves_no_unit(tmp_path, monkeypatch):
     big.write_bytes(os.urandom(3 * 1024 * 1024))
     engine = make_engine(tmp_path, repo)
     store = history(tmp_path)
+    # A failed tar stream an earlier test left behind flushes when it is collected. Let that
+    # happen now, before the patch, and count the writes of this export only.
+    gc.collect()
     original = pgbackrest._HashingWriter.write
     calls = []
     at_failure = []
 
     def fail_second_write(self, data):
+        if self.discarding:  # the writer of an export that already failed
+            return original(self, data)
         calls.append(len(data))
         if len(calls) == 2:
             at_failure.extend((p.name, p.stat().st_size) for p in engine.out_dir.iterdir())
@@ -657,10 +662,13 @@ def test_a_corrupted_read_back_leaves_the_verify_step(tmp_path, monkeypatch):
 @pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 def test_a_full_disk_leaves_the_write_step(tmp_path, monkeypatch):
     engine = make_engine(tmp_path, make_repo(tmp_path))
+    gc.collect()  # a stale failed stream of an earlier test flushes now, not through the patch
     original = pgbackrest._HashingWriter.write
     calls = []
 
     def fail_first_write(self, data):
+        if self.discarding:  # the writer of an export that already failed
+            return original(self, data)
         calls.append(len(data))
         if len(calls) == 1:
             raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
