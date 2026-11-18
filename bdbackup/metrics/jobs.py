@@ -30,7 +30,8 @@ def _number(value: object) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
 
 
-def _restore_label(record: BackupRecord) -> object:
+def restore_label(record: BackupRecord) -> object:
+    """The ``label`` in the record's restore info, or ``None``."""
     try:
         info = json.loads(record.restore_info)
     except ValueError:
@@ -49,7 +50,7 @@ def _describes(job: Job, facts: dict, record: BackupRecord) -> bool:
     if callable(hook):
         return bool(hook(facts, record))
     label = facts.get("label")
-    return label is not None and label == _restore_label(record)
+    return label is not None and label == restore_label(record)
 
 
 class JobCollector:

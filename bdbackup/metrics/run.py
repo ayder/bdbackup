@@ -111,6 +111,13 @@ def _check(registry: Registry, samples: list[Sample], unit: _Unit, seen: set) ->
     seen |= keys
 
 
+def _check_errors(unit: _Unit, errors: list[MetricError]) -> None:
+    """An engine's collector may report failures of its own source and job only."""
+    for error in errors:
+        if unit.prefix is None or error.source != unit.job.type or error.job_name != unit.name:
+            raise ValueError(f"{unit.name or 'a collector'} may not report {error}")
+
+
 def collect_all(
     jobs: Mapping[str, Job],
     history: History,
@@ -140,7 +147,7 @@ def collect_all(
     except (HistoryError, OSError) as exc:
         fail("history", "", "unreadable", exc)
         history_ok, data = False, HistoryData()
-    ctx = Context(now, jobs, history, data)
+    ctx = Context(now, jobs, history, data, timeout_seconds)
     units = _units(jobs, history_ok=history_ok)
     registry = f.builtin_registry()
     broken = _declare(registry, units)
@@ -179,12 +186,19 @@ def collect_all(
     seen: set[Any] = set()
     for unit in probed:
         try:
-            samples = list(unit.collector.collect(unit.job, ctx, results))
+            items = list(unit.collector.collect(unit.job, ctx, results))
+            samples = [item for item in items if isinstance(item, Sample)]
+            reported = [item for item in items if isinstance(item, MetricError)]
+            if len(samples) + len(reported) != len(items):
+                raise ValueError("a collector yields samples and errors only")
             _check(registry, samples, unit, seen)
+            _check_errors(unit, reported)
         except Exception as exc:
             fail("collector", unit.name, "failed", exc)
         else:
             collected.samples.extend(samples)
+            for error in reported:
+                fail(error.source, error.job_name, error.reason)
     for error in collected.errors:
         collected.samples.append(Sample(f.ERROR, 1, {
             "source": error.source, "job_name": error.job_name, "reason": error.reason,
