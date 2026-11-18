@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from stat import S_ISREG
 
 from bdbackup.backends import BackupError, BackupResult
 from bdbackup.ledger import LedgerError, checksum, unit_path
@@ -25,18 +26,22 @@ class HistorySettings:
     restore_root: Path
 
 
-def artifact_identity(path: Path) -> str:
-    """Detect removed/replaced artifacts, including archives with reused names."""
-    stat = path.stat()
+def stat_identity(stat) -> str:
+    """The identity of an artifact from its ``os.stat`` facts.
+
+    ``stat`` is anything with ``st_mode``, ``st_dev``, ``st_ino``, ``st_size`` and
+    ``st_mtime_ns``: an ``os.stat_result``, or what a metrics probe child read. A regular file's
+    size and modification time are part of it, a directory's are not.
+    """
     values = [stat.st_dev, stat.st_ino]
-    if path.is_file():
+    if S_ISREG(stat.st_mode):
         values.extend([stat.st_size, stat.st_mtime_ns])
     return json.dumps(values)
 
 
-def stat_identity(stat) -> str:
-    """Not yet."""
-    return ""
+def artifact_identity(path: Path) -> str:
+    """Detect removed/replaced artifacts, including archives with reused names."""
+    return stat_identity(path.stat())
 
 
 @dataclass(frozen=True)
