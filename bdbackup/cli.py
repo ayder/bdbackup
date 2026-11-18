@@ -6,7 +6,8 @@ import logging
 import os
 import subprocess
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,8 +22,9 @@ from bdbackup.gfs import runner as gfs_runner
 from bdbackup.gfs import store as gfs_store
 from bdbackup.gfs import structure as gfs_structure
 from bdbackup.gfs.stages import fed_first_stages
-from bdbackup.history import History
+from bdbackup.history import History, HistoryError
 from bdbackup.mysql import MySQLBackup, XtraBackup
+from bdbackup.postgres.pgbackrest import ExportProgress
 from bdbackup.postgres.restore import describe_unit, restore_lines
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
 from bdbackup.templates import TemplateError
@@ -168,11 +170,101 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
         raise click.UsageError(f"--dry-run is not supported for job type {job.type!r}")
 
 
-def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) -> int:
+@dataclass
+class _Outcome:
+    """What a pgbackrest or gfs run decided; ``_last_run`` turns it into a ``last_runs`` row.
+
+    A run sets ``result`` and ``facts`` where it decides them. What it leaves unset is worked
+    out from the exit code and from how far an export got (``progress``), or, for a gfs run,
+    from ``gfs`` and ``raised``.
+    """
+
+    result: str | None = None
+    facts: dict | None = None
+    progress: ExportProgress = field(default_factory=ExportProgress)
+    gfs: gfs_runner.RunOutcome = field(default_factory=gfs_runner.RunOutcome)
+    raised: bool = False
+
+
+# The result of a failed pgbackrest run, by the step its export reached.
+_FAILED_AT = {
+    "destination": "destination_not_ready",
+    "write": "export_failed",
+    "publish": "export_failed",
+    "verify": "verify_failed",
+}
+
+
+def _result_of(job: Job, outcome: _Outcome, code: int) -> str:
+    """The ``last_runs`` result word of a run that ended with exit code ``code``."""
+    if job.type == "gfs":
+        if outcome.raised:
+            return "error"
+        if code == EXIT_OK:
+            return "completed"
+        if code == EXIT_LOCKED:
+            return "locked" if outcome.gfs.locked else "deferred"
+        return "failed"
+    if outcome.result is not None:
+        return outcome.result
+    if code == EXIT_LOCKED:
+        return "locked"
+    return _FAILED_AT.get(outcome.progress.step, "failed")
+
+
+@contextmanager
+def _last_run(config: Config, job: Job, outcome: _Outcome):
+    """Record the run in the block in ``last_runs`` when it ends, however it ends.
+
+    The exit code is the one the block exits with (click's ``Exit``, or a ``ClickException``
+    such as a usage error); an exception that escapes counts as 1. Whatever ended the block is
+    raised again. A failure to record is a warning: it never changes the exit code or the output.
+    """
+    code = EXIT_OK
+    try:
+        yield
+    except click.exceptions.Exit as exc:
+        code = exc.exit_code
+        raise
+    except click.ClickException as exc:
+        code = exc.exit_code
+        raise
+    except BaseException:
+        code = EXIT_BACKUP_FAILED
+        outcome.raised = True
+        raise
+    finally:
+        try:
+            History(config.history).record_last_run(
+                job.name, job.type, code, _result_of(job, outcome, code), outcome.facts
+            )
+        except (HistoryError, OSError) as exc:
+            logging.getLogger("bdbackup.cli").warning(
+                "Could not record the last run of job %r: %s", job.name, exc
+            )
+
+
+def _export_facts(full, result, progress: ExportProgress, started: datetime) -> dict:
+    """The facts an export leaves in ``last_runs``: its phases, label, size and the full's age."""
+    phases = {"write": progress.write_seconds}
+    if progress.verify_seconds is not None:
+        phases["verify"] = progress.verify_seconds
+    return {
+        "phases": phases,
+        "label": full.label,
+        "bytes": result.size_bytes,
+        "full_age_seconds": int((started - full.stop).total_seconds()),
+    }
+
+
+def _run_pgbackrest(
+    config: Config, job: Job, *, verify: bool, dry_run: bool, outcome: _Outcome
+) -> int:
     """Export the newest pgBackRest full of the job's stanza as one tar; return the exit code.
 
     A real run holds the job lock from before the full is chosen until the export is published.
-    A dry run takes no lock and writes nothing. When there is no new full nothing is recorded.
+    A dry run takes no lock and writes nothing. When there is no new full nothing is recorded in
+    the history of backups. The result a run decides is set on ``outcome``.
     """
     engine = build_backend(job)
     engine.refuse_root()
@@ -190,8 +282,10 @@ def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) ->
             limit = engine.max_full_age_hours
             if limit is not None and hours > limit:
                 _echo(f"{message} (older than max_full_age_hours = {limit})")
+                outcome.result = "full_too_old"
                 return EXIT_BACKUP_FAILED
             _echo(message)
+            outcome.result = "no_new_full"
             return EXIT_OK
         if dry_run:
             engine.require_marker()
@@ -202,9 +296,15 @@ def _run_pgbackrest(config: Config, job: Job, *, verify: bool, dry_run: bool) ->
             return EXIT_OK
 
         info = engine.restore_info(full, engine.version())
-        result = _tracked_backup(
-            config, job.name, "pgbackrest-full", lambda: engine.export(full, verify=verify), info
-        )
+        began = []
+
+        def export():
+            began.append(_now())
+            return engine.export(full, verify=verify, progress=outcome.progress)
+
+        result = _tracked_backup(config, job.name, "pgbackrest-full", export, info)
+    outcome.result = "exported"
+    outcome.facts = _export_facts(full, result, outcome.progress, began[0])
     _echo(f"Job {job.name}: {result.path}")
     return EXIT_OK
 
@@ -288,10 +388,18 @@ def run(
     logger = logging.getLogger("bdbackup.cli")
     logger.info("Running job %r (%s)%s", job.name, job.type, " as a dry run" if dry_run else "")
     if job.type == "gfs":
-        code = gfs_runner.run_job(config, job, out=_echo, dry_run=dry_run)
-        ctx.exit(code if code in (EXIT_OK, EXIT_LOCKED) else EXIT_BACKUP_FAILED)
+        outcome = _Outcome()
+        with nullcontext() if dry_run else _last_run(config, job, outcome):
+            code = gfs_runner.run_job(
+                config, job, out=_echo, dry_run=dry_run, outcome=outcome.gfs
+            )
+            ctx.exit(code if code in (EXIT_OK, EXIT_LOCKED) else EXIT_BACKUP_FAILED)
     if job.type == "pgbackrest":
-        ctx.exit(_handle_errors(_run_pgbackrest, config, job, verify=verify, dry_run=dry_run))
+        outcome = _Outcome()
+        with nullcontext() if dry_run else _last_run(config, job, outcome):
+            ctx.exit(_handle_errors(
+                _run_pgbackrest, config, job, verify=verify, dry_run=dry_run, outcome=outcome
+            ))
     if dry_run:
         return _handle_errors(_dry_run, config, job, incremental)
     info = {}

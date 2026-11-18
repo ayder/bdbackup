@@ -410,12 +410,15 @@ def run_job(config: Config, job: Job, *, now: datetime | None = None,
             dry_run: bool = False, outcome: RunOutcome | None = None) -> int:
     """Run one gfs job; return 0, 1 (a failure or refusal) or 3 (locked or deferred only).
 
-    A dry run reports what would change and changes nothing.
+    A dry run reports what would change and changes nothing. ``outcome``, when given, tells a
+    busy job lock from deferred work, which both exit 3.
     """
     today = (now or datetime.now()).date()
     try:
         with process_lock(job_lock_path(config, job.name)):
             return _Run(config, job, today, out, transport or LocalTransport(), dry_run).run()
     except BlockingIOError:
+        if outcome is not None:
+            outcome.locked = True
         out(f"another run of {job.name} is in progress")
         return 3
