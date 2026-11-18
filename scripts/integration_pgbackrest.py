@@ -19,6 +19,11 @@ pgbackrest restore runs with PGBACKREST_LOG_LEVEL_CONSOLE=info in its environmen
 raises the console log level, so that pgBackRest logs the options in effect, which proves the
 repository path it read and that no decoy option reached it.
 
+`bdbackup metrics` runs after the export, after a WAL switch and after a GFS run: it reads
+pgBackRest's `info` through the same routed command and the host's repository and stage paths
+(its probe children run on the host), and its file must show the export, the repository's
+backups and the WAL archive as pgBackRest's own `info` reports them.
+
 Every bdbackup call is bracketed by a digest of the repository tree (path, size, mtime_ns and
 inode of every entry): bdbackup never writes, renames, deletes or locks anything there.
 pgBackRest's own commands run between the calls, so the digest is taken around each one.
@@ -27,6 +32,7 @@ pgBackRest's own commands run between the calls, so the digest is taken around e
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -185,6 +191,42 @@ def info_entries(text):
     return sections
 
 
+SAMPLE = re.compile(r"([a-z_0-9]+)(?:\{(.*)\})? (\S+)")
+LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+STAGE_LINE = re.compile(r"Stage (.+): (\d+) units? \((\d+) bytes\)")
+
+
+def prom_samples(text):
+    """The ``(name, labels, value)`` of every series of a Prometheus textfile."""
+    samples = []
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            name, raw, value = SAMPLE.fullmatch(line).groups()
+            samples.append((name, dict(LABEL.findall(raw or "")), float(value)))
+    return samples
+
+
+def series(samples, name, **labels):
+    """The values of the series of ``name`` whose labels include ``labels``."""
+    return [
+        value for found, have, value in samples
+        if found == name and all(have.get(key) == wanted for key, wanted in labels.items())
+    ]
+
+
+def one(samples, name, **labels):
+    """The value of the one series of ``name`` with ``labels``."""
+    values = series(samples, name, **labels)
+    if len(values) != 1:
+        raise RuntimeError(f"expected one {name}{labels} series, found {values}")
+    return values[0]
+
+
+def segment_number(name):
+    """The number of a WAL segment name as ``bdbackup metrics`` computes it."""
+    return (int(name[8:16], 16) << 32) | int(name[16:24], 16)
+
+
 def tree_digest(root):
     """Path, size, mtime_ns and inode of ``root`` and of every entry below it; no link followed."""
     entries = {}
@@ -296,6 +338,7 @@ def main(variant):
         return real_which(name, *args, **kwargs)
 
     digests = []  # the number of entries in the repository at each bdbackup call
+    last_stdout = []  # what the latest bdbackup call printed on stdout alone
 
     def bdbackup(*args):
         captured.lines.clear()
@@ -306,6 +349,7 @@ def main(variant):
         ):
             result = CliRunner().invoke(cli, [str(arg) for arg in args])
         after = tree_digest(repo)
+        last_stdout[:] = [result.stdout]
         print(f"$ bdbackup {' '.join(map(str, args))}  -> exit {result.exit_code}", flush=True)
         for line in result.output.splitlines():
             print(f"  {line}", flush=True)
@@ -317,6 +361,7 @@ def main(variant):
             raise RuntimeError(f"bdbackup raised {result.exception!r}")
         return result.exit_code, result.output + "\n".join(captured.lines)
 
+    run_started = time.time()
     with tempfile.TemporaryDirectory(prefix="bdbackup-pgbackrest-") as raw:
         work = Path(raw).resolve()
         setup, repo = work / "setup", work / "repo"
@@ -422,6 +467,8 @@ def main(variant):
 
             # --- Step 3: export F2 through bdbackup run.
             history_db, restores = work / "history.sqlite3", work / "restores"
+            metrics_file = work / "metrics" / "bdbackup.prom"
+            metrics_file.parent.mkdir()
             stage, out_dir = work / "stage" / "pg", work / "stage" / "pg" / STANZA
             stage.parent.mkdir()  # the mounted share; the stage itself is initialized
             config = work / "config.toml"
@@ -435,7 +482,8 @@ def main(variant):
                 f"out_dir = {json.dumps(str(stage / 'nosuch'))}\n\n"
                 '[pg-gfs]\ntype = "gfs"\n\n'
                 f"[[pg-gfs.stage]]\npaths = [{json.dumps(str(stage))}]\n"
-                'period = "daily"\nkeep = "14d"\n'
+                'period = "daily"\nkeep = "14d"\n\n'
+                f"[metrics]\npath = {json.dumps(str(metrics_file))}\ntimeout_seconds = 30\n"
             )
             code, _ = bdbackup("run", "-c", config, "-j", "pg-gfs", "--initialize-structure")
             if code:
@@ -494,6 +542,126 @@ def main(variant):
                 raise RuntimeError("the copied backup.info does not list F1 and the diff")
             print(f"Step 3: exported {unit.name} ({len(names)} members, spec 4.4 layout; "
                   f"its backup.info also lists {f1} and {diff})", flush=True)
+
+            # --- Step 3b: bdbackup metrics after the export, after a WAL switch, after GFS.
+            def metrics():
+                """Run ``bdbackup metrics``: exit 0, nothing on stdout, the file; its series."""
+                code, _ = bdbackup("metrics", "-c", config)
+                if code or last_stdout != [""]:
+                    raise RuntimeError(f"metrics exited {code}, stdout {last_stdout}")
+                if metrics_file.stat().st_mode & 0o777 != 0o644:
+                    raise RuntimeError(f"{metrics_file} has mode {metrics_file.stat().st_mode:o}")
+                samples = prom_samples(metrics_file.read_text())
+                if series(samples, "bdbackup_metrics_error") or one(
+                    samples, "bdbackup_metrics_success"
+                ) != 1:
+                    raise RuntimeError(f"metrics reported an error:\n{metrics_file.read_text()}")
+                return samples
+
+            def current_archive():
+                """The archive max (name, and the first and last of the archive) of the stanza."""
+                entry = stanza_info()
+                database = max(db["id"] for db in entry["db"])
+                archive = next(a for a in entry["archive"] if a["database"]["id"] == database)
+                return database, archive
+
+            def wal_series(samples, database, low, high):
+                """Check the WAL series against the archive max pgBackRest reported around them."""
+                key = {"job_name": "pg-main", "stanza": STANZA, "db_id": str(database)}
+                if one(samples, "bdbackup_pgbackrest_wal_archive_present", **key) != 1:
+                    raise RuntimeError("wal_archive_present is not 1")
+                timeline = one(samples, "bdbackup_pgbackrest_wal_archive_max_timeline", **key)
+                segment = one(samples, "bdbackup_pgbackrest_wal_archive_max_segment", **key)
+                mtime = one(samples, "bdbackup_pgbackrest_wal_archive_max_mtime_seconds", **key)
+                if timeline != int(high[:8], 16):
+                    raise RuntimeError(f"WAL timeline {timeline} is not that of {high}")
+                if not segment_number(low) <= segment <= segment_number(high):
+                    raise RuntimeError(f"WAL segment {segment} is not in {low}..{high}")
+                if not run_started - 60 <= mtime <= time.time() + 60:
+                    raise RuntimeError(f"the WAL mtime {mtime} is outside this run's window")
+                return segment, mtime
+
+            database, before_archive = current_archive()
+            samples = metrics()
+            _, after_archive = current_archive()
+            main_job = {"job_name": "pg-main", "job_type": "pgbackrest"}
+            keys = {"job_name": "pg-main", "stanza": STANZA}
+            if one(samples, "bdbackup_job_last_run_result", result="exported", **main_job) != 1:
+                raise RuntimeError("the last run of pg-main is not exported")
+            if one(samples, "bdbackup_job_last_run_exit_code", **main_job) != 0:
+                raise RuntimeError("the last run of pg-main did not exit 0")
+            phases = {phase: one(samples, "bdbackup_job_last_success_phase_seconds",
+                                 phase=phase, **main_job) for phase in ("write", "verify")}
+            if one(samples, "bdbackup_pgbackrest_export_info", label=f2, **keys) != 1:
+                raise RuntimeError(f"export_info does not name {f2}")
+            if one(samples, "bdbackup_pgbackrest_stanza_status", **keys) != 0:
+                raise RuntimeError("the stanza status is not 0")
+            for kind, expected in (("full", 2), ("diff", 1), ("incr", 0)):
+                if one(samples, "bdbackup_pgbackrest_backups", type=kind, **keys) != expected:
+                    raise RuntimeError(f"the number of {kind} backups is not {expected}")
+            newest = {
+                "bdbackup_pgbackrest_last_backup_timestamp_seconds": f2_json["timestamp"]["stop"],
+                "bdbackup_pgbackrest_last_backup_bytes": f2_json["info"]["size"],
+                "bdbackup_pgbackrest_last_backup_repo_bytes": f2_json["info"]["repository"]["size"],
+            }
+            for name, expected in newest.items():
+                if one(samples, name, type="full", **keys) != expected:
+                    raise RuntimeError(f"{name} is not {expected} for {f2}")
+            segment, mtime = wal_series(
+                samples, database, before_archive["max"], after_archive["max"]
+            )
+            print(f"Step 3b: metrics after the export: exported, exit 0, phases {phases}, "
+                  f"label {f2}, stanza status 0, F2 stop/size/repo size as pgBackRest's info, "
+                  f"WAL db {database} segment {int(segment)} mtime {int(mtime)}; "
+                  f"info archive[] {json.dumps(after_archive)}; "
+                  f"info F2 backup[].info {json.dumps(f2_json['info'])}", flush=True)
+
+            # A write and a WAL switch on the primary, then wait for pgBackRest to archive it.
+            sql(primary, "CREATE TABLE IF NOT EXISTS wal_growth(i int); "
+                         "INSERT INTO wal_growth VALUES (1)")
+            sql(primary, "SELECT pg_switch_wal()")
+            wait_for("the switched WAL segment to be archived",
+                     lambda: current_archive()[1]["max"] != after_archive["max"], timeout=90)
+            database, grown_archive = current_archive()
+            samples = metrics()
+            _, grown_after = current_archive()
+            grown, grown_mtime = wal_series(
+                samples, database, grown_archive["max"], grown_after["max"]
+            )
+            if grown <= segment or grown_archive["max"] == after_archive["max"]:
+                raise RuntimeError(f"the WAL segment did not grow: {segment} then {grown}")
+            print(f"Step 3b: after pg_switch_wal() the archive max went "
+                  f"{after_archive['max']} -> {grown_archive['max']}; the segment series "
+                  f"{int(segment)} -> {int(grown)}", flush=True)
+
+            # The GFS run: the unit is in the first stage, which the pgbackrest job feeds.
+            code, output = bdbackup("run", "-c", config, "-j", "pg-gfs")
+            if code:
+                raise RuntimeError(f"the gfs run exited {code}: {output}")
+            reported = STAGE_LINE.findall(output)
+            if [(path, count) for path, count, _ in reported] != [(str(stage), "1")]:
+                raise RuntimeError(f"the gfs report has no Stage line of one unit: {output}")
+            samples = metrics()
+            gfs_job = {"job_name": "pg-gfs", "job_type": "gfs"}
+            if one(samples, "bdbackup_job_last_run_result", result="completed", **gfs_job) != 1:
+                raise RuntimeError("the last run of pg-gfs is not completed")
+            if one(samples, "bdbackup_gfs_stage_units", job_name="pg-gfs", stage="1") != int(
+                reported[0][1]
+            ) or one(samples, "bdbackup_gfs_stage_bytes", job_name="pg-gfs", stage="1") != int(
+                reported[0][2]
+            ):
+                raise RuntimeError(f"the stage figures differ from the report {reported}")
+            if one(samples, "bdbackup_destination_ready", job_name="pg-gfs", stage="1",
+                   path=str(stage)) != 1:
+                raise RuntimeError("the fed first stage is not ready")
+            if one(samples, "bdbackup_history_units", job_name="pg-main", state="available") < 1:
+                raise RuntimeError("no available history unit of pg-main")
+            print(f"Step 3b: after the gfs run: completed, stage 1 holds {reported[0][1]} "
+                  f"unit(s) / {reported[0][2]} bytes as its report says, the fed first stage "
+                  "is ready, the export is an available history unit", flush=True)
+            print("  the metrics file:", flush=True)
+            for line in metrics_file.read_text().splitlines():
+                print(f"    {line}", flush=True)
 
             # --- Step 4: nothing new.
             code, output = bdbackup("run", "-c", config, "-j", "pg-main")
