@@ -34,6 +34,11 @@ def artifact_identity(path: Path) -> str:
     return json.dumps(values)
 
 
+def stat_identity(stat) -> str:
+    """Not yet."""
+    return ""
+
+
 @dataclass(frozen=True)
 class BackupRecord:
     id: int

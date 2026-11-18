@@ -35,8 +35,12 @@ import logging
 import pkgutil
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from bdbackup.utils import config_dir
+
+if TYPE_CHECKING:
+    from bdbackup.metrics.collector import Collector
 
 __all__ = [
     "EngineError",
@@ -59,12 +63,17 @@ FAMILIES: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class EngineInfo:
-    """A named backup engine bound to a backend class."""
+    """A named backup engine bound to a backend class.
+
+    ``metrics`` is the engine's collector for ``bdbackup metrics`` (see
+    :class:`bdbackup.metrics.collector.Collector`); an engine without one is not collected.
+    """
 
     name: str
     backend: type
     description: str = ""
     family: str = "mysql"
+    metrics: Collector | None = None
 
 
 class EngineError(Exception):
