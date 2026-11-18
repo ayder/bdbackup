@@ -351,12 +351,14 @@ class _Run:
             return 1
         return 3 if self.tally.deferred else 0
 
-    def finish(self, unmanaged: int) -> None:
+    def counts(self, unmanaged: int) -> dict[str, int]:
         t = self.tally
-        counts = {"moved": t.moved, "deleted": t.deleted, "held": t.held,
-                  "deferred": t.deferred, "refused": t.refused, "failed": t.failed,
-                  "unmanaged": unmanaged}
-        store.finish_run(self.history, self.run_id, self.exit_code(), counts)
+        return {"moved": t.moved, "deleted": t.deleted, "held": t.held,
+                "deferred": t.deferred, "refused": t.refused, "failed": t.failed,
+                "unmanaged": unmanaged}
+
+    def finish(self, unmanaged: int) -> None:
+        store.finish_run(self.history, self.run_id, self.exit_code(), self.counts(unmanaged))
 
     def _run(self) -> int:
         units, unmanaged, judgments = store.load(
@@ -399,13 +401,12 @@ class _Run:
             unit, current = placed[decision.unit.id]
             self.act(unit, current, decision)
         if self.apply:
-            # Completed before the snapshots, so every stage copy shows this run finished; a
-            # failed copy then updates the live row's exit code and count.
+            # The live row stays running through the snapshot step, so a run stuck there shows in
+            # running_since. The local copy that goes to every stage gets the finished row
+            # first, so each stage copy shows this run finished; a failed copy then shows only
+            # in the live row's exit code and count.
+            self.snapshot(unmanaged)
             self.finish(unmanaged)
-            failed = self.tally.failed
-            self.snapshot()
-            if self.tally.failed != failed:
-                self.finish(unmanaged)
             if self.outcome is not None:
                 self.outcome.facts = self.facts()
         self.report(unmanaged)
@@ -430,14 +431,15 @@ class _Run:
             (i for i, stage in enumerate(self.stages) if path in stage.paths), None))
         self.tally.snapshots.append(f"failed snapshot {path}: {reason}")
 
-    def snapshot(self) -> None:
+    def snapshot(self, unmanaged: int) -> None:
         """Copy the whole ledger to every later stage path, whatever the actions' outcome.
 
         The first stage gets it too when a pgbackrest job feeds it, under the same marker rule.
 
         One consistent copy is made locally with SQLite's online backup and then copied to
         each path under a temporary name, fsynced and renamed, so SQLite never writes on a
-        stage and every path receives the same bytes (spec 2 §4.3, D18).
+        stage and every path receives the same bytes (spec 2 §4.3, D18). The copy carries this
+        run's row as finished, with the counts it has now; the live row is finished after.
         """
         live = self.history.settings.database
         if not live.exists():
@@ -452,6 +454,9 @@ class _Run:
                 closing(sqlite3.connect(local)) as target,
             ):
                 source.backup(target)
+                with target:  # the copy shows this run finished; the live row is still running
+                    store.finish_run_in(
+                        target, self.run_id, self.exit_code(), self.counts(unmanaged))
             fd = os.open(local, os.O_RDONLY)
             try:
                 os.fsync(fd)
