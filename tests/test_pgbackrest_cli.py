@@ -697,3 +697,61 @@ def test_a_last_run_recording_failure_is_a_warning_and_changes_nothing_else(
     assert len(warnings) == 1, caplog.text
     assert "last run" in warnings[0].getMessage()
     assert str(error) in warnings[0].getMessage()
+
+
+# ---- last_runs, review fixes -------------------------------------------------------------------
+
+
+def test_a_root_refusal_on_a_fresh_install_creates_no_state(tmp_path, monkeypatch):
+    site = make_site(tmp_path)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    result = site.run()
+
+    assert result.exit_code == 1, result.output
+    assert site.fake.calls == []
+    # Nothing is left owned by root: no history database, no directory for it.
+    assert not (site.root / "state").exists()
+    assert site.last_run() is None
+
+
+def test_a_root_refusal_leaves_an_existing_last_run_alone(tmp_path, monkeypatch):
+    site = make_site(tmp_path)
+    assert site.run().exit_code == 0
+    before = last_run(site)
+    database = (site.root / "state" / "history.sqlite3").read_bytes()
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    result = site.run()
+
+    assert result.exit_code == 1, result.output
+    assert site.last_run() == before
+    assert (site.root / "state" / "history.sqlite3").read_bytes() == database
+
+
+def test_a_failed_rename_of_the_export_records_export_failed(tmp_path, monkeypatch):
+    site = make_site(tmp_path)
+    real_rename = os.rename
+
+    def refuse(source, destination, *args, **kwargs):
+        if ".tar.tmp-" in os.fspath(source):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", refuse)
+
+    result = site.run()
+
+    assert result.exit_code == 1, result.output
+    assert not site.unit.exists()
+    row = last_run(site)
+    assert (row.result, row.exit_code, row.facts) == ("export_failed", 1, None)
+
+
+def test_the_age_of_a_full_that_stopped_in_the_future_is_zero(tmp_path):
+    site = make_site(tmp_path)
+
+    result = site.run(now=STOP - timedelta(hours=1))  # the clock is behind the repository's
+
+    assert result.exit_code == 0, result.output
+    assert last_run(site).facts["full_age_seconds"] == 0
