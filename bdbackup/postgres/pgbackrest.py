@@ -47,6 +47,12 @@ class Choice:
     new: bool
 
 
+class PgBackRestError(BackupError):
+    """A pgBackRest command that failed."""
+
+    reason: str = ""
+
+
 def _whole_number(value: object, minimum: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
@@ -95,7 +101,7 @@ class PgBackRest:
             *args,
         ]
 
-    def _run(self, cmd: list[str], name: str) -> str:
+    def _run(self, cmd: list[str], name: str, timeout: float | None = None) -> str:
         """Run ``cmd`` and return its stdout; a failure carries pgBackRest's last stderr line.
 
         A binary that cannot be started is a BackupError too, never an OSError.
@@ -132,7 +138,7 @@ class PgBackRest:
             raise BackupError(f"unexpected pgbackrest version output: {text!r}")
         return match.group(1)
 
-    def info(self) -> list[dict]:
+    def info(self, timeout: float | None = None) -> list[dict]:
         """The ``info --output=json`` document: one entry per stanza of the repository."""
         text = self._run(self.command("info", "--output=json"), "info")
         try:
