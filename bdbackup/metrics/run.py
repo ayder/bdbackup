@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,6 +35,10 @@ if TYPE_CHECKING:
     from bdbackup.config import Job
 
 logger = logging.getLogger("bdbackup.metrics")
+
+# A collector's own timeout, such as the info call's, fires at ``timeout_seconds`` too; the
+# phase waits this much longer, so that outcome wins over being abandoned.
+_JOIN_GRACE = 0.5
 
 
 @dataclass
@@ -79,6 +85,36 @@ def _units(jobs: Mapping[str, Job], *, history_ok: bool) -> list[_Unit]:
         if engine is not None and engine.metrics is not None:
             units.append(_Unit(job, engine.metrics, engine_prefix(engine.name)))
     return units
+
+
+def _run_probes_phase(units: list[_Unit], ctx: Context, timeout_seconds: float) -> list[tuple]:
+    """Run every unit's ``probes()`` in a daemon thread of its own, all started together.
+
+    The threads are joined against one deadline. Each result is ``(unit, outcome, alive)``:
+    ``outcome`` is ``(True, requests)`` or ``(False, exception)``, or ``None`` when the thread
+    has not finished, and ``alive`` says whether it is still running (it is abandoned then; a
+    daemon thread cannot hold the process, and the run ends with ``os._exit``).
+    """
+    outcomes: dict[int, tuple] = {}
+
+    def work(unit: _Unit) -> None:
+        try:
+            asked = list(unit.collector.probes(unit.job, ctx))
+            for request in asked:
+                if not isinstance(request, StatRequest | ListPrefixRequest):
+                    raise ValueError(f"not a probe request: {request!r}")
+        except Exception as exc:
+            outcomes[id(unit)] = (False, exc)
+        else:
+            outcomes[id(unit)] = (True, asked)
+
+    threads = [(unit, threading.Thread(target=work, args=(unit,), daemon=True)) for unit in units]
+    for _, thread in threads:
+        thread.start()
+    deadline = time.monotonic() + timeout_seconds + _JOIN_GRACE
+    for _, thread in threads:
+        thread.join(max(0.0, deadline - time.monotonic()))
+    return [(unit, outcomes.get(id(unit)), thread.is_alive()) for unit, thread in threads]
 
 
 def _declare(registry: Registry, units: list[_Unit]) -> dict[int, Exception]:
@@ -162,17 +198,15 @@ def collect_all(
 
     requests: list[Request] = []
     probed = []
-    for unit in survivors:
-        try:
-            asked = list(unit.collector.probes(unit.job, ctx))
-            for request in asked:
-                if not isinstance(request, StatRequest | ListPrefixRequest):
-                    raise ValueError(f"not a probe request: {request!r}")
-        except Exception as exc:
-            fail("collector", unit.name, "failed", exc)
-            continue
-        requests.extend(asked)
-        probed.append(unit)
+    for unit, outcome, alive in _run_probes_phase(survivors, ctx, timeout_seconds):
+        if outcome is None and alive:  # still in probes(): abandoned, its collect() is skipped
+            collected.abandoned = True
+            fail(unit.job.type if unit.prefix is not None else "collector", unit.name, "timeout")
+        elif outcome is None or not outcome[0]:
+            fail("collector", unit.name, "failed", outcome[1] if outcome else None)
+        else:
+            requests.extend(outcome[1])
+            probed.append(unit)
     requests = list(dict.fromkeys(requests))
     results = Results()
     if requests:
@@ -201,6 +235,7 @@ def collect_all(
             collected.samples.extend(samples)
             for error in reported:
                 fail(error.source, error.job_name, error.reason)
+    collected.registry = registry
     for error in collected.errors:
         collected.samples.append(Sample(f.ERROR, 1, {
             "source": error.source, "job_name": error.job_name, "reason": error.reason,
