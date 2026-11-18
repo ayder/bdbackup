@@ -439,12 +439,14 @@ class _Run:
     def check_drift(self) -> None:
         """Compare the destination stage paths with the ledger (spec 16 section 6.3).
 
-        The later stage paths, and the first when a pgbackrest job writes into it, are checked
-        in a child under one deadline. Nothing here raises, changes the exit code or blocks an
+        Every stage path is checked in a child under one deadline for the recorded locations that
+        are not there. Only the later stage paths, and the first when a pgbackrest job writes
+        into it, are walked for entries the ledger does not record: they carry the marker that
+        says the share is mounted. Nothing here raises, changes the exit code or blocks an
         action: a stage that could not be checked is reported and left out of the facts' counts.
         """
-        destinations = [(index, path) for index, stage in enumerate(self.stages, 1)
-                        if index > 1 or self.fed for path in stage.paths]
+        destinations = [(index, path, index > 1 or self.fed)
+                        for index, stage in enumerate(self.stages, 1) for path in stage.paths]
         try:
             units, _, _ = store.load(self.history, self.stages[0].paths[0],
                                      {path for stage in self.stages for path in stage.paths})
@@ -452,24 +454,25 @@ class _Run:
             if self.history.settings.database.exists():  # none yet (a dry run on a fresh install)
                 recorded = [Path(r.path) for r in self.history.records(successful=True) if r.path]
             requests = []
-            for _, path in destinations:
+            for _, path, walk in destinations:
                 locations = [str(loc.path) for unit in units for loc in unit.locations
                              if loc.stage_path == path]
                 known = {*locations, *(str(r) for r in recorded if r.is_relative_to(path))}
                 requests.append(DriftRequest(path, MARKER, snapshot_name(self.job),
-                                             tuple(locations), tuple(sorted(known))))
+                                             tuple(locations), tuple(sorted(known)), walk))
             results = self.drift(requests, self.drift_timeout)
             if len(results) != len(requests):
                 raise RuntimeError("the drift check answered for the wrong stage paths")
         except Exception as exc:
             results = [DriftResult(path, False, problem=f"failed: {exc}")
-                       for _, path in destinations]
+                       for _, path, _ in destinations]
         timed_out = False
         for result in results:
             if result.checked:
                 if result.missing or result.unknown:
-                    self.tally.drift.append(f"Drift {result.path}: {result.missing} missing, "
-                                            f"{result.unknown} unknown")
+                    unknown = "" if result.unknown is None else f", {result.unknown} unknown"
+                    self.tally.drift.append(f"Drift {result.path}: {result.missing} missing"
+                                            f"{unknown}")
             elif result.problem == "timeout":
                 if not timed_out:  # one line for every path the deadline cut off
                     self.tally.drift.append(
@@ -483,13 +486,15 @@ class _Run:
                     why = result.problem[len("failed: "):]
                     self.tally.drift.append(f"drift not checked: {why}")
         self.drift_facts = []
-        for index in sorted({index for index, _ in destinations}):
-            here = [r for (i, _), r in zip(destinations, results, strict=True) if i == index]
+        for index in sorted({index for index, _, _ in destinations}):
+            here = [r for (i, _, _), r in zip(destinations, results, strict=True) if i == index]
             checked = all(r.checked for r in here)
+            walked = all(r.unknown is not None for r in here)
             self.drift_facts.append({
                 "stage": index, "checked": checked,
                 "missing": sum(r.missing for r in here) if checked else 0,
-                "unknown": sum(r.unknown for r in here) if checked else 0,
+                # None for a stage that was not walked: there is no count, not a count of 0
+                "unknown": (sum(r.unknown for r in here) if walked else None) if checked else 0,
             })
 
     def snapshot_failed(self, path: Path, reason) -> None:

@@ -73,14 +73,19 @@ def walk(root, known, ancestors, skip_at_root):
 def check(request):
     """``{"checked": True, "missing": n, "unknown": m}``, or why the path was not checked."""
     root = request["path"]
+    # A path that is walked must carry its marker (an unmounted share has none). One that is
+    # only looked at for missing locations, an unfed first stage, must exist.
+    walked = request["walk"]
+    problem = "no marker" if walked else "no path"
+    wanted = stat.S_ISREG if walked else stat.S_ISDIR
     try:
-        marker = os.stat(os.path.join(root, request["marker"]))
+        found = os.stat(os.path.join(root, request["marker"]) if walked else root)
     except (FileNotFoundError, NotADirectoryError):
-        return {"checked": False, "problem": "no marker"}
+        return {"checked": False, "problem": problem}
     except OSError as exc:
         return {"checked": False, "problem": "error: " + (exc.strerror or str(exc))}
-    if not stat.S_ISREG(marker.st_mode):
-        return {"checked": False, "problem": "no marker"}
+    if not wanted(found.st_mode):
+        return {"checked": False, "problem": problem}
     try:
         missing = 0
         for location in request["locations"]:
@@ -95,7 +100,9 @@ def check(request):
             while parent.startswith(root + os.sep) and parent not in ancestors:
                 ancestors.add(parent)
                 parent = os.path.dirname(parent)
-        unknown = walk(root, known, ancestors, {request["marker"], request["snapshot"]})
+        unknown = None
+        if walked:
+            unknown = walk(root, known, ancestors, {request["marker"], request["snapshot"]})
     except OSError as exc:
         return {"checked": False, "problem": "error: " + (exc.strerror or str(exc))}
     return {"checked": True, "missing": missing, "unknown": unknown}
@@ -118,10 +125,11 @@ class DriftRequest:
     """One stage path to check."""
 
     path: Path
-    marker: str  # the file whose presence says the share is mounted
+    marker: str  # the file whose presence says the share is mounted (when the path is walked)
     snapshot: str  # the ledger snapshot's name, which is not an unknown entry
     locations: tuple[str, ...]  # the recorded locations in this stage path: each must exist
     known: tuple[str, ...]  # every path the ledger knows below it: none of them is unknown
+    walk: bool = True  # False: only the locations are looked at, and the path must exist
 
 
 @dataclass(frozen=True)
@@ -131,8 +139,8 @@ class DriftResult:
     path: Path
     checked: bool
     missing: int = 0
-    unknown: int = 0
-    problem: str = ""  # "no marker", "timeout" or "error: <what the system said>"
+    unknown: int | None = 0  # None: the path was not walked
+    problem: str = ""  # "no marker", "no path", "timeout" or "error: <what the system said>"
 
 
 Drift = Callable[[list[DriftRequest], float], list[DriftResult]]
@@ -149,6 +157,7 @@ def _wire(request: DriftRequest) -> dict:
     return {
         "path": str(request.path), "marker": request.marker, "snapshot": request.snapshot,
         "locations": list(request.locations), "known": list(request.known),
+        "walk": request.walk,
     }
 
 
@@ -159,7 +168,8 @@ def _child_argv() -> list[str]:
 
 def _result(request: DriftRequest, line: dict) -> DriftResult:
     if line["checked"]:
-        return DriftResult(request.path, True, int(line["missing"]), int(line["unknown"]))
+        unknown = None if line["unknown"] is None else int(line["unknown"])
+        return DriftResult(request.path, True, int(line["missing"]), unknown)
     return DriftResult(request.path, False, problem=str(line["problem"]))
 
 
