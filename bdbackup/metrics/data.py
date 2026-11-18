@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,9 +47,25 @@ class HistoryData:
     units: dict[str, LedgerUnit] = field(default_factory=dict)  # unit path -> ledger row
     judged: dict[int, bool] | None = None  # record id -> managed; None before schema 5
     places: dict[int, tuple[gfs_store.Place, ...]] = field(default_factory=dict)
-    user_version: int | None = None  # PRAGMA user_version; None when there is no database
+    user_version: int | None = None  # PRAGMA user_version; None when the file does not open
     # (gfs job, from stage, to stage), stages counted from 1 -> run_at of the newest ok move
     last_moves: dict[tuple[str, int, int], str] = field(default_factory=dict)
+
+
+def read_user_version(history: History) -> int | None:
+    """``PRAGMA user_version`` of the history database, or ``None`` when its file does not open.
+
+    Read on its own, without the schema check ``History`` makes, so that a schema this bdbackup
+    cannot read (a newer one) still shows its number.
+    """
+    path = history.settings.database
+    try:
+        if not path.exists():
+            return None
+        with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)) as db:
+            return db.execute("PRAGMA user_version").fetchone()[0]
+    except (sqlite3.Error, OSError):
+        return None
 
 
 def _tables(db) -> set[str]:
@@ -96,7 +114,6 @@ def read_history(
     last_moves: dict[tuple[str, int, int], str] = {}
     with history._connect() as db:
         tables = _tables(db)
-        user_version = db.execute("PRAGMA user_version").fetchone()[0]
         if "gfs_steps" in tables:
             for job, job_stages in (stages or {}).items():
                 last_moves.update(_last_moves(db, job, job_stages))
@@ -130,5 +147,5 @@ def read_history(
             }
     return HistoryData(
         records, running, history.last_runs(), tuple(gfs_runs), units, judged,
-        gfs_store.places(history), user_version, last_moves,
+        gfs_store.places(history), None, last_moves,
     )
