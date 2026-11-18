@@ -48,9 +48,16 @@ class Choice:
 
 
 class PgBackRestError(BackupError):
-    """A pgBackRest command that failed."""
+    """A pgBackRest command that failed, and why.
 
-    reason: str = ""
+    ``reason`` is ``binary_missing`` (not found, or not executable), ``failed`` (an exit
+    status, or any other failure to start it), ``timeout`` or ``output_invalid`` (``info``
+    printed something that is not a JSON list of stanzas).
+    """
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _whole_number(value: object, minimum: int) -> bool:
@@ -104,31 +111,42 @@ class PgBackRest:
     def _run(self, cmd: list[str], name: str, timeout: float | None = None) -> str:
         """Run ``cmd`` and return its stdout; a failure carries pgBackRest's last stderr line.
 
-        A binary that cannot be started is a BackupError too, never an OSError.
+        Every failure is a :class:`PgBackRestError`, a BackupError that says why: a binary that
+        cannot be started is never an OSError. ``timeout`` (seconds) is passed to the command
+        only when given.
         """
+        options = {} if timeout is None else {"timeout": timeout}
         try:
             completed = subprocess.run(  # noqa: S603
-                cmd, check=True, capture_output=True, text=True
+                cmd, check=True, capture_output=True, text=True, **options
             )
         except subprocess.CalledProcessError as exc:
             lines = (exc.stderr or "").strip().splitlines()
             detail = lines[-1].strip() if lines else f"exit status {exc.returncode}"
-            raise BackupError(f"pgbackrest {name} failed: {detail}") from exc
+            raise PgBackRestError(f"pgbackrest {name} failed: {detail}", "failed") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise PgBackRestError(
+                f"pgbackrest {name} timed out after {timeout} seconds", "timeout"
+            ) from exc
         except OSError as exc:
-            raise BackupError(self._start_failure(cmd[0], name, exc)) from exc
+            raise self._start_failure(cmd[0], name, exc) from exc
         return completed.stdout
 
     @staticmethod
-    def _start_failure(binary: str, name: str, exc: OSError) -> str:
-        """The message for a pgBackRest command that could not be started."""
+    def _start_failure(binary: str, name: str, exc: OSError) -> PgBackRestError:
+        """The error for a pgBackRest command that could not be started."""
         if isinstance(exc, FileNotFoundError):
-            return (
+            return PgBackRestError(
                 f"pgbackrest binary not found: {binary} "
-                "(set the job's binary key to its full path)"
+                "(set the job's binary key to its full path)",
+                "binary_missing",
             )
         if isinstance(exc, PermissionError):
-            return f"pgbackrest binary is not executable: {binary} (check its permissions)"
-        return f"pgbackrest {name} failed: {exc.strerror or exc}"
+            return PgBackRestError(
+                f"pgbackrest binary is not executable: {binary} (check its permissions)",
+                "binary_missing",
+            )
+        return PgBackRestError(f"pgbackrest {name} failed: {exc.strerror or exc}", "failed")
 
     def version(self) -> str:
         """The pgBackRest version, for example ``2.58.0`` from ``pgBackRest 2.58.0``."""
@@ -139,14 +157,19 @@ class PgBackRest:
         return match.group(1)
 
     def info(self, timeout: float | None = None) -> list[dict]:
-        """The ``info --output=json`` document: one entry per stanza of the repository."""
-        text = self._run(self.command("info", "--output=json"), "info")
+        """The ``info --output=json`` document: one entry per stanza of the repository.
+
+        ``timeout`` (seconds) limits the command; ``None`` lets it run as long as it takes.
+        """
+        text = self._run(self.command("info", "--output=json"), "info", timeout)
         try:
             document = json.loads(text)
         except ValueError:
             document = None
         if not isinstance(document, list) or not all(isinstance(s, dict) for s in document):
-            raise BackupError("pgbackrest info did not print a JSON list of stanzas")
+            raise PgBackRestError(
+                "pgbackrest info did not print a JSON list of stanzas", "output_invalid"
+            )
         return document
 
     def choose(self, history: History, job_name: str) -> Choice:
