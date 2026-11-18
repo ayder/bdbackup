@@ -542,6 +542,35 @@ def test_gfs_stage_figures_never_stat_the_share(env):
     assert stage_figures(collected) == baseline
 
 
+def test_collecting_makes_no_filesystem_call_on_a_share_even_with_a_pgbackrest_job(env):
+    add_pg(env)  # a fed first stage: the collector must know it without resolving out_dir
+    env.history.record_last_run("pg", "pgbackrest", 0, "exported")
+    config = Config(env.config_path)  # loading resolves paths; collecting must not
+    history = History(config.history)
+    roots = (str(env.abs("BACKUP")), str(env.abs("NFS")))
+    calls = []
+
+    def watching(name):
+        real = getattr(os, name)
+
+        def wrapper(path, *args, **kwargs):
+            if isinstance(path, str | bytes | os.PathLike) and os.fsdecode(path).startswith(roots):
+                calls.append((name, os.fsdecode(path)))
+            return real(path, *args, **kwargs)
+
+        return wrapper
+
+    names = ("stat", "lstat", "readlink", "scandir")
+    with patch.multiple(os, **{name: watching(name) for name in names}):
+        collected = collect_all(
+            config.jobs, history, now=NOW, timeout_seconds=5,
+            probe=lambda requests, timeout: Results({}, {DESTINATION: "ok"}),
+        )
+
+    assert calls == []
+    assert ("gfs-main", "1", str(env.abs("BACKUP"))) in destination(collected)  # it knew it was fed
+
+
 def test_a_record_under_the_first_stage_that_no_unit_row_names_is_a_first_stage_unit(env):
     env.file_unit("a.tar.gz", days_ago=0)  # recorded, and GFS has not run yet
     assert env.query("SELECT count(*) FROM gfs_units") == [(0,)]

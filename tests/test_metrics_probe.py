@@ -65,15 +65,23 @@ HANG = (
     "print(json.dumps({'i': 0, 'ok': False, 'errno': 2}), flush=True)\n"
     "time.sleep(30)\n"
 )
-# A child that hangs before it answers any stat request but answers listings like the real one.
-HANG_ON_STAT = (
-    "import io, json, sys, time\n"
-    "text = sys.stdin.read()\n"
-    "if any(r['kind'] == 'stat' for r in json.loads(text)):\n"
-    "    time.sleep(30)\n"
-    "sys.stdin = io.StringIO(text)\n"
-    f"exec({CHILD_SOURCE!r})\n"
-)
+
+
+def hang_on_stat(delay: float) -> str:
+    """A child that hangs before it answers any stat request, and answers listings like the real
+    one after ``delay`` seconds."""
+    return (
+        "import io, json, sys, time\n"
+        "text = sys.stdin.read()\n"
+        "if any(r['kind'] == 'stat' for r in json.loads(text)):\n"
+        "    time.sleep(30)\n"
+        f"time.sleep({delay})\n"
+        "sys.stdin = io.StringIO(text)\n"
+        f"exec({CHILD_SOURCE!r})\n"
+    )
+
+
+HANG_ON_STAT = hang_on_stat(0)
 SLEEP = "import time\ntime.sleep(30)\n"
 # A child that answers its first request with a failure and then exits.
 ANSWER_ONE = (
@@ -226,6 +234,23 @@ def test_one_probe_that_hangs_leaves_the_other_probes_answers_intact(tmp_path, m
     assert results.probe_status(REPOSITORY) == "ok"
     assert names(results.listing(tmp_path, "wal-")) == ["wal-1"]
     assert results.stat(tmp_path / "wal-1") is None
+
+
+def test_a_slow_probe_inside_the_deadline_is_not_hidden_by_a_hung_one(tmp_path, monkeypatch):
+    use_child(monkeypatch, hang_on_stat(0.4))
+    (tmp_path / "wal-1").write_bytes(b"x")
+    stat = StatRequest(tmp_path / "wal-1")
+    listing = ListPrefixRequest(tmp_path, "wal-")
+
+    started = time.monotonic()
+    results = run_probes([stat, listing], 2)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 4
+    assert results.probe_status(DESTINATION) == "timeout"
+    # Both children work at once, so the destination's hang does not eat the repository's time.
+    assert results.probe_status(REPOSITORY) == "ok"
+    assert names(results.listing(tmp_path, "wal-")) == ["wal-1"]
 
 
 def test_a_child_that_cannot_start_is_a_failed_probe(tmp_path, monkeypatch):
