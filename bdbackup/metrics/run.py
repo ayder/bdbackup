@@ -177,7 +177,10 @@ def collect_all(
         error = MetricError(source, job_name, reason)
         if error not in collected.errors:
             collected.errors.append(error)
-        logger.warning("metrics source %s %s failed (%s): %s", source, job_name, reason, why)
+        logger.warning(
+            "Metrics: %s%s failed: %s%s",
+            source, f" ({job_name})" if job_name else "", reason, f" ({why})" if why else "",
+        )
 
     history_ok = True
     try:
