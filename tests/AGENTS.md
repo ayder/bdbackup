@@ -19,7 +19,7 @@ Measured baselines before calling the gate.
 | Layer | What it runs | Environment | Where |
 |---|---|---|---|
 | `unit` | pytest tests of the package and the CLI (`click.testing.CliRunner`). Backup tools and database clients are never executed: physical backups use the `physical_runner` fixture (`tests/conftest.py`) through a patched `subprocess.run`; MySQL clients are patched as in `tests/test_helpers.py`. | `local-python` | `tests/` |
-| `integration` | Real servers and real backup tools in disposable, network-isolated Docker containers with synthetic data; a restore starts a server on the recovered data and checks rows; `bdbackup metrics` runs against a hard NFS mount whose server stops answering. | `docker` | `scripts/integration_mysql.py`, `scripts/integration_physical.py`, `scripts/integration_pgbackrest.py`, `scripts/integration_nfs_outage.py` |
+| `integration` | Real servers and real backup tools in disposable, network-isolated Docker containers with synthetic data; a restore starts a server on the recovered data and checks rows; `bdbackup metrics` runs against a hard NFS mount whose server stops answering, a GFS run renames a unit within that mount (and copies one onto it), and the metrics file shows the share's capacity, ledger snapshot and drift. | `docker` | `scripts/integration_mysql.py`, `scripts/integration_physical.py`, `scripts/integration_pgbackrest.py`, `scripts/integration_nfs_outage.py` |
 
 - `local-python`: Python 3.12+, editable install `pip install -e '.[dev]'` in `.venv/`. CI runs
   Python 3.12, 3.13 and 3.14.
@@ -100,7 +100,9 @@ sh -c '<commands of the step>' > <log> 2>&1; echo "exit=$?" >> <log>
     Expected: exit 0 and the line `Real pgBackRest export and restore passed`.
 11. **Integration pgbackrest pg18-2.60.** Same with `pg18-2.60`. Same expectation.
 12. **Integration NFS outage.** Run `.venv/bin/python scripts/integration_nfs_outage.py`.
-    Expected: exit 0 and the line `Real NFS outage metrics test passed`.
+    Expected: exit 0 and the line `Real NFS outage metrics test passed`. The run also proves a
+    rename within one NFS mount (the same inode, a report line ending `, renamed)`) and checks the
+    share's capacity, ledger snapshot and drift series.
 13. **Package.** Run `rm -rf dist && .venv/bin/python -m build -q && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist`
     as one `sh -c '…'`, captured as above.
     Expected: the log contains one `Checking dist/… PASSED` line for the wheel and one for the
