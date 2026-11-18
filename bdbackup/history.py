@@ -105,7 +105,7 @@ class History:
                 if create:
                     connection.execute("BEGIN IMMEDIATE")
                 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-                if schema not in (0, 1, 2, 3, 4, 5) or (not create and schema == 0):
+                if schema not in (0, 1, 2, 3, 4, 5, 6) or (not create and schema == 0):
                     raise HistoryError(f"Unsupported history schema version: {schema}")
                 if create and schema == 0:
                     connection.execute(
@@ -211,6 +211,20 @@ class History:
                            WHERE backup_runs.status = 'success'"""
                     )
                     connection.execute("PRAGMA user_version = 5")
+                if create and schema in (0, 1, 2, 3, 4, 5):
+                    # Metrics (0.7.3): the outcome of each job's newest run that was not a dry
+                    # run, in one row per job; ``facts`` is the JSON its job type keeps.
+                    connection.execute(
+                        """CREATE TABLE last_runs (
+                            job_name TEXT PRIMARY KEY,
+                            job_type TEXT NOT NULL,
+                            finished_at TEXT NOT NULL,
+                            exit_code INTEGER NOT NULL,
+                            result TEXT NOT NULL,
+                            facts TEXT
+                        )"""
+                    )
+                    connection.execute("PRAGMA user_version = 6")
                 yield connection
         except (OSError, sqlite3.Error) as exc:
             raise HistoryError(f"Cannot access history database {path}: {exc}") from exc
@@ -297,11 +311,48 @@ class History:
         self, job_name: str, job_type: str, exit_code: int, result: str,
         facts: dict | None = None,
     ) -> None:
-        """Not yet."""
+        """Set the outcome of ``job_name``'s run that ends now; one row per job.
+
+        ``facts`` replaces the stored facts; ``None`` keeps them, so a night with nothing to
+        export leaves what the last export recorded.
+        """
+        with self._connect(create=True) as db:
+            db.execute(
+                """INSERT INTO last_runs (job_name, job_type, finished_at, exit_code, result, facts)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_name) DO UPDATE SET
+                       job_type=excluded.job_type, finished_at=excluded.finished_at,
+                       exit_code=excluded.exit_code, result=excluded.result,
+                       facts=COALESCE(excluded.facts, last_runs.facts)""",
+                (job_name, job_type, datetime.now(UTC).isoformat(), exit_code, result,
+                 None if facts is None else json.dumps(facts)),
+            )
 
     def last_runs(self) -> dict[str, LastRun]:
-        """Not yet."""
-        return {}
+        """Every job's last run; read-only.
+
+        Empty when the database does not exist or is older than schema 6, which reading never
+        migrates.
+        """
+        if not self.settings.database.exists():
+            return {}
+        with self._connect() as db:
+            if db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='last_runs'"
+            ).fetchone() is None:
+                return {}
+            rows = db.execute("SELECT * FROM last_runs ORDER BY job_name").fetchall()
+        runs = {}
+        for row in rows:
+            try:
+                facts = json.loads(row["facts"]) if row["facts"] is not None else None
+            except ValueError:
+                facts = None
+            runs[row["job_name"]] = LastRun(
+                row["job_name"], row["job_type"], row["finished_at"], row["exit_code"],
+                row["result"], facts if isinstance(facts, dict) else None,
+            )
+        return runs
 
     def records(self, *, job: str | None = None, successful: bool = False) -> list[BackupRecord]:
         with self._connect() as db:
