@@ -26,6 +26,8 @@ from bdbackup.config import Config
 from bdbackup.gfs import actions, runner
 from bdbackup.history import History, HistoryError, artifact_identity
 from bdbackup.ledger import checksum
+from bdbackup.metrics.collector import DESTINATION, Results
+from bdbackup.metrics.run import collect_all
 from bdbackup.mysql import XtraBackup
 from bdbackup.recovery import backup_restore_info
 from bdbackup.utils import process_lock
@@ -2007,3 +2009,120 @@ def test_a_dry_run_leaves_the_previous_facts(env):
     assert env.run_cli().exit_code == 0
 
     assert last_run(env).facts == before
+
+
+# ---- the live row stays running through the snapshot step (spec 16 section 6.4) ---------------
+
+RUN_COLUMNS = "status, finished_at IS NOT NULL, exit_code, moved, failed"
+
+
+def run_rows(path):
+    with closing(sqlite3.connect(path)) as db:
+        return db.execute(f"SELECT {RUN_COLUMNS} FROM gfs_runs ORDER BY id").fetchall()  # noqa: S608
+
+
+def running_since(env):
+    """The ``running_since`` series of the gfs job, as a metrics run would write them now."""
+    config = Config(env.config_path)
+    collected = collect_all(
+        config.jobs, History(config.history), now=datetime.now(UTC), timeout_seconds=5,
+        probe=lambda requests, timeout: Results({}, {DESTINATION: "ok"}),
+    )
+    return [s.value for s in collected.samples
+            if s.family == "bdbackup_job_running_since_timestamp_seconds"
+            and s.labels["job_name"] == "gfs-main"]
+
+
+class _WatchingSnapshot(_CopyOnly):
+    """Looks at the run while its ledger snapshot is being copied to a stage: the run is there
+    and blocked, as it is on a hung mount. ``fail_on`` is the stage path whose copy fails."""
+
+    def __init__(self, env, fail_on=None):
+        self.env, self.fail_on, self.seen = env, fail_on, []
+
+    def copy(self, source, temp, on_file):
+        if Path(source).suffix == ".snapshot":
+            copied = self.env.abs("NFS/daily") / "gfs-main.ledger.sqlite3"
+            self.seen.append({
+                "live": run_rows(self.env.database),
+                "local": run_rows(source),  # what is copied to the stage
+                "first stage copy": run_rows(copied) if copied.exists() else None,
+                "running_since": running_since(self.env),
+            })
+            if self.fail_on is not None and Path(temp).parent == self.fail_on:
+                raise OSError("injected snapshot copy failure")
+        return super().copy(source, temp, on_file)
+
+
+def test_the_live_row_stays_running_while_the_snapshot_is_copied(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    transport = _WatchingSnapshot(env)
+
+    code, output = env.run_api(datetime.now(), transport=transport)
+
+    assert code == 0, output
+    assert len(transport.seen) == 2  # one copy for each later stage path
+    for seen in transport.seen:
+        assert seen["live"] == [("running", 0, None, None, None)]
+        assert len(seen["running_since"]) == 1  # a run stuck here shows in running_since
+        # what is copied to the stage already shows the run finished
+        assert seen["local"] == [("completed", 1, 0, 1, 0)]
+    assert transport.seen[0]["first stage copy"] is None
+    assert transport.seen[1]["first stage copy"] == [("completed", 1, 0, 1, 0)]
+    assert run_rows(env.database) == [("completed", 1, 0, 1, 0)]
+    assert running_since(env) == []
+
+
+def test_a_failed_snapshot_copy_updates_the_live_row_only(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    transport = _WatchingSnapshot(env, fail_on=env.abs("NFS/weekly"))
+
+    code, output = env.run_api(datetime.now(), transport=transport)
+
+    assert code == 1, output
+    assert all(seen["live"] == [("running", 0, None, None, None)] for seen in transport.seen)
+    assert run_rows(env.database) == [("completed", 1, 1, 1, 1)]  # exit code 1, failed 1
+    # the copy that reached a stage was made before the failure, and says so
+    assert run_rows(env.abs("NFS/daily") / "gfs-main.ledger.sqlite3") == [
+        ("completed", 1, 0, 1, 0)
+    ]
+
+
+def test_a_snapshot_that_raises_leaves_the_row_failed(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    # the local copy of the ledger cannot be made: a directory has its name
+    Path(f"{env.database}.gfs-gfs-main.snapshot").mkdir()
+
+    result = env.run_cli()
+
+    assert isinstance(result.exception, OSError), result.output
+    assert [row[:2] for row in run_rows(env.database)] == [("failed", 1)]  # and it is finished
+    assert running_since(env) == []
+
+
+def test_a_run_killed_before_it_finished_is_marked_failed_when_the_next_run_begins(env):
+    env.file_unit("a.tar.gz", days_ago=7)
+    env.file_unit("b.tar.gz", days_ago=0)
+    assert env.run_cli().exit_code == 0
+    with closing(sqlite3.connect(env.database)) as db, db:
+        db.executemany(
+            "INSERT INTO gfs_runs (gfs_job, started_at, status) VALUES (?, ?, 'running')",
+            [("gfs-main", "2026-11-17T02:00:00+00:00"), ("gfs-other", "2026-11-17T02:00:00+00:00")],
+        )
+    assert len(running_since(env)) == 1  # the killed run shows as running for good
+    env.dry_run = True
+    assert env.run_cli().exit_code == 0  # a dry run holds no lock and proves nothing
+    assert len(running_since(env)) == 1
+    env.dry_run = False
+
+    assert env.run_cli().exit_code == 0
+
+    assert env.query("SELECT gfs_job, status, finished_at IS NOT NULL FROM gfs_runs"
+                     " ORDER BY id") == [
+        ("gfs-main", "completed", 1), ("gfs-main", "failed", 1), ("gfs-other", "running", 0),
+        ("gfs-main", "completed", 1),
+    ]
+    assert running_since(env) == []
