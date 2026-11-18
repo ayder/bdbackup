@@ -453,7 +453,8 @@ class _Run:
         for index, stage in enumerate(self.stages):
             sizes = [size for at, size in self.where.values() if at == index]
             units = "unit" if len(sizes) == 1 else "units"
-            self.out(f"Stage {stage.paths[0]}: {len(sizes)} {units} ({sum(sizes)} bytes)")
+            note = "" if stage.verify else ", checksums not re-read"
+            self.out(f"Stage {stage.paths[0]}: {len(sizes)} {units} ({sum(sizes)} bytes){note}")
         for line in t.snapshots:
             self.out(line)
 
