@@ -44,6 +44,8 @@ class Collected:
 
     samples: list[Sample] = field(default_factory=list)
     errors: list[MetricError] = field(default_factory=list)
+    abandoned: bool = False  # a collector's thread is still running; end the process with os._exit
+    registry: Registry | None = None  # the families of this run, the engines' included
 
 
 @dataclass
