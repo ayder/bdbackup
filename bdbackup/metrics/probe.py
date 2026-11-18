@@ -1,8 +1,9 @@
 """The probe children: every check that touches a share runs in a child process (D8, D10).
 
 A hard-mounted NFS share that hangs blocks any ``stat`` made against it, so the metrics process
-never makes one. It sends its requests to one child per probe (``destination`` and
-``repository``), which answers one flushed line per request, and gives them all one deadline.
+never makes one. It sends its requests (``stat``, ``statvfs`` and listings) to one child per
+probe (``destination`` and ``repository``), which answers one flushed line per request, and gives
+them all one deadline.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from bdbackup.metrics.collector import (
     Results,
     StatAnswer,
     StatRequest,
+    StatvfsAnswer,
+    StatvfsRequest,
 )
 
 # The child reads the requests as JSON on stdin and prints one JSON line per request, in order,
@@ -32,6 +35,11 @@ def stat_line(i, path):
     st = os.stat(path)
     return {"i": i, "ok": True, "mode": st.st_mode, "dev": st.st_dev, "ino": st.st_ino,
             "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+def statvfs_line(i, path):
+    st = os.statvfs(path)
+    return {"i": i, "ok": True, "blocks": st.f_blocks, "bavail": st.f_bavail,
+            "frsize": st.f_frsize}
 
 def list_line(i, directory, prefix):
     entries = []
@@ -48,6 +56,8 @@ for i, request in enumerate(json.load(sys.stdin)):
     try:
         if request["kind"] == "stat":
             line = stat_line(i, request["path"])
+        elif request["kind"] == "statvfs":
+            line = statvfs_line(i, request["path"])
         else:
             line = list_line(i, request["directory"], request["prefix"])
     except OSError as exc:
@@ -64,10 +74,12 @@ def _child_argv() -> list[str]:
 def _wire(request: Request) -> dict:
     if isinstance(request, StatRequest):
         return {"kind": "stat", "path": str(request.path)}
+    if isinstance(request, StatvfsRequest):
+        return {"kind": "statvfs", "path": str(request.path)}
     return {"kind": "list", "directory": str(request.directory), "prefix": request.prefix}
 
 
-def _answer(request: Request, line: dict) -> StatAnswer | ListAnswer | Failure:
+def _answer(request: Request, line: dict) -> StatAnswer | StatvfsAnswer | ListAnswer | Failure:
     """The answer in one line of the child's output; raises when the line is not one."""
     if not line["ok"]:
         errno = line.get("errno")
@@ -77,6 +89,8 @@ def _answer(request: Request, line: dict) -> StatAnswer | ListAnswer | Failure:
             int(line["mode"]), int(line["dev"]), int(line["ino"]), int(line["size"]),
             int(line["mtime_ns"]),
         )
+    if isinstance(request, StatvfsRequest):
+        return StatvfsAnswer(int(line["blocks"]), int(line["bavail"]), int(line["frsize"]))
     entries = sorted((str(e["name"]), float(e["mtime"])) for e in line["entries"])
     return ListAnswer(tuple(entries))
 

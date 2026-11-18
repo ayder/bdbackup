@@ -11,11 +11,22 @@ container is privileged, has no network but loopback, and holds everything:
 - a config whose history database and first gfs stage are on local disk and whose second gfs
   stage is on the share, and whose `[metrics]` timeout_seconds is 3.
 
-It takes a healthy run, then drops the NFS packets with iptables, and runs `bdbackup metrics`
-twice, each under `timeout 120` so that a hang cannot hang this test: each must end within
-3 x timeout_seconds + 5 seconds with exit 1 (or 3), a rewritten file that reads the share's
-destination as 0, the destination timeout error, no history series and the GFS series. Then it
-removes the rules, waits for the client to reconnect and runs once more: exit 0, share ready.
+A second, self-contained scenario has its own config and history database (the outage part
+never sees it): a file job feeds a three-stage gfs job whose first stage is local and whose
+other two are on the share. Backdating the file backups in the history database makes a gfs run
+move one unit from the local stage onto the share, which must be a copy, and a later run move
+it between the two share stages, which must be a rename (same inode, the report line ends
+`, renamed)`).
+
+It takes a healthy run, whose file must also carry the new GFS series of the share stage (its
+size and free space, the time of its ledger snapshot, the facts of the last run and a drift of
+nothing missing and nothing unknown), and that scenario, after which the drift of the `gfs` job
+must still be nothing: the scenario's directories on the share are not its entries. Then it
+drops the NFS packets with iptables, and runs `bdbackup metrics` twice, each under `timeout 120`
+so that a hang cannot hang this test: each must end within 3 x timeout_seconds + 5 seconds with
+exit 1 (or 3), a rewritten file that reads the share's destination as 0, the destination timeout
+error, no history series, no capacity or snapshot series and the GFS series. Then it removes the
+rules, waits for the client to reconnect and runs once more: exit 0, share ready, capacity back.
 
 Only this run's container is created and removed.
 """
@@ -65,6 +76,61 @@ period = "weekly"
 keep = "8w"
 """
 CONFIG_PATH = "/etc/bdbackup/config.toml"
+LOCAL_STAGE = "/var/backups/rename"
+HOT = "/mnt/share/rename-hot"
+COLD = "/mnt/share/rename-cold"
+RENAME_CONFIG = f"""[history]
+database = "/var/lib/bdbackup/rename.sqlite3"
+restore_root = "/var/lib/bdbackup/rename-restores"
+
+[moved]
+type = "file"
+template_filename = "paths"
+chdir = "/var/lib/source"
+backup_dst = "{LOCAL_STAGE}/moved"
+format = "tar.gz"
+timestamp = true
+
+[gfs-rename]
+type = "gfs"
+
+[[gfs-rename.stage]]
+paths = ["{LOCAL_STAGE}"]
+period = "daily"
+keep = "2d"
+
+[[gfs-rename.stage]]
+paths = ["{HOT}"]
+period = "daily"
+keep = "30d"
+
+[[gfs-rename.stage]]
+paths = ["{COLD}"]
+period = "weekly"
+keep = "52w"
+"""
+RENAME_CONFIG_PATH = "/etc/bdbackup/rename.toml"
+RENAME_DATABASE = "/var/lib/bdbackup/rename.sqlite3"
+# Run in the container with the interpreter bdbackup is installed in: the sqlite3 command line
+# may be missing there. Sets the completion time of the one record of an archive to ``days``
+# days ago, in the local zone the way GFS reads it, and prints the record's id.
+BACKDATE = """\
+import sqlite3, sys
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
+
+database, path, days = sys.argv[1], sys.argv[2], int(sys.argv[3])
+when = (datetime.now().astimezone() - timedelta(days=days)).astimezone(UTC).isoformat()
+with closing(sqlite3.connect(database)) as db, db:
+    ids = [row[0] for row in db.execute(
+        "SELECT id FROM backup_runs WHERE path=? AND status='success'", (path,))]
+    if len(ids) != 1:
+        sys.exit(f"expected one successful record of {path}, found {ids}")
+    db.execute("UPDATE backup_runs SET completed_at=? WHERE id=?", (when, ids[0]))
+print(ids[0], when)
+"""
+# One gfs report line of a move: series, relative path, the two stage paths and the reason.
+MOVE = re.compile(r"^  move (\S+) (\S+) \d{4}-\d\d-\d\d (\S+) -> (\S+) \((.*)\)$", re.MULTILINE)
 METRICS_FILE = "/var/lib/metrics/bdbackup.prom"
 SHARE = "/mnt/share/weekly"
 
@@ -96,6 +162,11 @@ def source_hash():
     return digest.hexdigest()
 
 
+def moves(report):
+    """The move lines of a gfs report: (series, relative path, from, to, reason)."""
+    return MOVE.findall(report)
+
+
 def prom_samples(text):
     samples = []
     for line in text.splitlines():
@@ -117,6 +188,32 @@ def one(samples, name, **labels):
     if len(values) != 1:
         raise RuntimeError(f"expected one {name}{labels} series, found {values}")
     return values[0]
+
+
+def check_share_series(samples, stamp):
+    """The GFS series of the share stage of job ``gfs`` in a healthy run: its capacity, the
+    time of its ledger snapshot, the facts of the last run and its drift. ``stamp`` is the
+    time the metrics run ended. Returns (size, free) in bytes."""
+    share = {"job_name": "gfs", "stage": "2", "path": SHARE}
+    size = one(samples, "bdbackup_destination_size_bytes", **share)
+    free = one(samples, "bdbackup_destination_free_bytes", **share)
+    if not 0 < free <= size:
+        raise RuntimeError(f"the share's capacity is not 0 < free <= size: {free}, {size}")
+    for name in ("bdbackup_gfs_ledger_snapshot_timestamp_seconds",
+                 "bdbackup_gfs_facts_timestamp_seconds"):
+        labels = share if "snapshot" in name else {"job_name": "gfs"}
+        taken = one(samples, name, **labels)
+        if not stamp - 600 <= taken <= stamp + 5:
+            raise RuntimeError(f"{name} is {taken}, not a recent time before {stamp}")
+    for name in ("bdbackup_gfs_drift_missing_units", "bdbackup_gfs_drift_unknown_entries"):
+        if one(samples, name, job_name="gfs", stage="2") != 0:
+            raise RuntimeError(f"{name} of the share stage is not 0")
+    # The first stage is local and not fed: its recorded units are looked at, it is not walked.
+    if one(samples, "bdbackup_gfs_drift_missing_units", job_name="gfs", stage="1") != 0:
+        raise RuntimeError("a unit of the first stage is missing")
+    if series(samples, "bdbackup_gfs_drift_unknown_entries", job_name="gfs", stage="1"):
+        raise RuntimeError("the first stage, which is not walked, has an unknown count")
+    return size, free
 
 
 def main():
@@ -194,9 +291,33 @@ def main():
         """The probe children still alive (a killed one lingers only as a zombie)."""
         return [line for line in ps().splitlines() if "-I -c" in line and "<defunct>" not in line]
 
+    def inode(path):
+        return sh(f"stat -c %i {path}").stdout.strip()
+
+    def exists(path):
+        return sh(f"test -e {path}", check=False).returncode == 0
+
+    def move_once(older, source, target, backdate_days):
+        """Backdate ``older`` (by its archive path in the local stage), run the gfs job and
+        return its one move line; the archive must be the only thing the run moves."""
+        stamped = docker("exec", container, "python", "-c", BACKDATE, RENAME_DATABASE,
+                         f"{LOCAL_STAGE}/{older}", str(backdate_days))
+        print(f"  backdated {older} by {backdate_days} days: record {stamped.stdout.strip()}",
+              flush=True)
+        report = bdbackup("run", "-c", RENAME_CONFIG_PATH, "-j", "gfs-rename")
+        found = moves(report)
+        if len(found) != 1 or found[0][:4] != ("moved", older, source, target):
+            raise RuntimeError(f"expected one move of {older} from {source} to {target}, "
+                               f"found {found}:\n{report}")
+        if not re.search(r"^Summary: moved 1 ", report, re.MULTILINE):
+            raise RuntimeError(f"the gfs run did not move exactly one unit:\n{report}")
+        return found[0][4]
+
     with tempfile.TemporaryDirectory(prefix="bdbackup-nfs-outage-") as raw:
         config = Path(raw) / "config.toml"
         config.write_text(CONFIG)
+        rename_config = Path(raw) / "rename.toml"
+        rename_config.write_text(RENAME_CONFIG)
         started_at = time.monotonic()
         dropping = False
         try:
@@ -248,8 +369,56 @@ def main():
             if one(samples, "bdbackup_gfs_stage_units", job_name="gfs", stage="1") != 1:
                 raise RuntimeError("the healthy run does not count the unit in stage 1")
             healthy_stamp = one(samples, "bdbackup_metrics_last_run_timestamp_seconds")
+            size, free = check_share_series(samples, healthy_stamp)
             print(f"Step 3: healthy run exit 0 in {elapsed:.1f} s; destination_ready 1, "
-                  "history units available 1, stage 1 holds 1 unit", flush=True)
+                  "history units available 1, stage 1 holds 1 unit; the share has "
+                  f"{size} bytes, {free} free, a ledger snapshot, facts and a drift of 0 and 0",
+                  flush=True)
+
+            # --- 3a. A move onto the share copies; a move between two stages on it renames.
+            # Its own config and history database: nothing above or below sees this scenario.
+            docker("cp", str(rename_config), f"{container}:{RENAME_CONFIG_PATH}")
+            bdbackup("run", "-c", RENAME_CONFIG_PATH, "-j", "gfs-rename",
+                     "--initialize-structure")
+            bdbackup("run", "-c", RENAME_CONFIG_PATH, "-j", "moved")
+            time.sleep(2)  # a stamped archive is never replaced: the next name needs a new second
+            bdbackup("run", "-c", RENAME_CONFIG_PATH, "-j", "moved")
+            listing = sh(f"ls {LOCAL_STAGE}").stdout
+            archives = sorted(re.findall(r"^moved-[\d-]+\.tar\.gz$", listing, re.MULTILINE))
+            if len(archives) != 2:
+                raise RuntimeError(f"expected two archives of job moved in {LOCAL_STAGE}:\n"
+                                   f"{listing}")
+            older, newer = archives
+            # The newer archive is the newest of its series and stays; the older one is aged.
+            copied = move_once(older, LOCAL_STAGE, HOT, 10)
+            if "renamed" in copied:
+                raise RuntimeError(f"a move from the local stage onto the share was a rename: "
+                                   f"({copied})")
+            if not (exists(f"{HOT}/{older}") and not exists(f"{LOCAL_STAGE}/{older}")
+                    and exists(f"{LOCAL_STAGE}/{newer}")):
+                raise RuntimeError(f"the copy left the archives in the wrong places:\n{listing}")
+            before = inode(f"{HOT}/{older}")
+            renamed = move_once(older, HOT, COLD, 40)
+            if not re.fullmatch(r"weekly \d{4}-W\d\d, renamed", renamed):
+                raise RuntimeError(f"the move between the share stages is not reported as a "
+                                   f"rename: ({renamed})")
+            after = inode(f"{COLD}/{older}")
+            if after != before or exists(f"{HOT}/{older}"):
+                raise RuntimeError(f"the archive was not renamed in place: inode {before} then "
+                                   f"{after}; still in {HOT}: {exists(f'{HOT}/{older}')}")
+            print(f"Step 3a: local stage -> share stage was a copy ({copied}); share stage -> "
+                  f"share stage was a rename ({renamed}), inode {before} kept", flush=True)
+
+            # --- 3b. The share now holds the scenario's directories next to the stage of job
+            # gfs; they are not its entries, so after another run its drift is still nothing.
+            bdbackup("run", "-c", CONFIG_PATH, "-j", "gfs")
+            code, _, _ = metrics()
+            text, samples = read_metrics()
+            if code != 0:
+                raise RuntimeError(f"the metrics run after the scenario exited {code}:\n{text}")
+            check_share_series(samples, one(samples, "bdbackup_metrics_last_run_timestamp_seconds"))
+            print("Step 3b: after the scenario, a gfs run and a metrics run: the drift of the "
+                  "share stage is still 0 missing and 0 unknown", flush=True)
 
             # --- 4. The outage.
             rules("I")
@@ -309,6 +478,14 @@ def main():
                     reason="timeout") == 1,
                 "success 0": one(samples, "bdbackup_metrics_success") == 0,
                 "no history series": not series(samples, "bdbackup_history_units"),
+                "no capacity series": not series(samples, "bdbackup_destination_size_bytes")
+                and not series(samples, "bdbackup_destination_free_bytes"),
+                "no ledger snapshot series": not series(
+                    samples, "bdbackup_gfs_ledger_snapshot_timestamp_seconds"),
+                "facts and drift from the database": len(series(
+                    samples, "bdbackup_gfs_facts_timestamp_seconds", job_name="gfs")) == 1
+                and one(samples, "bdbackup_gfs_drift_unknown_entries", job_name="gfs",
+                        stage="2") == 0,
                 "gfs stage info": len(series(samples, "bdbackup_gfs_stage_info")) == 2,
                 "gfs stage units": len(series(samples, "bdbackup_gfs_stage_units")) == 2,
                 "gfs last run": one(samples, "bdbackup_job_last_run_result", job_name="gfs",
@@ -352,8 +529,9 @@ def main():
             if one(samples, "bdbackup_destination_ready", job_name="gfs", stage="2",
                    path=SHARE) != 1 or not series(samples, "bdbackup_history_units"):
                 raise RuntimeError("the recovery file does not show the share ready")
+            check_share_series(samples, one(samples, "bdbackup_metrics_last_run_timestamp_seconds"))
             print(f"  recovery run exit 0 in {elapsed:.1f} s; destination_ready 1, history "
-                  "series back", flush=True)
+                  "series back, capacity and the ledger snapshot back", flush=True)
             print(f"Outage timings: run 5 {first_elapsed:.1f} s, run 6 {second_elapsed:.1f} s, "
                   f"recovery run {elapsed:.1f} s after {reconnected:.1f} s of reconnecting; "
                   f"whole test {time.monotonic() - started_at:.0f} s", flush=True)

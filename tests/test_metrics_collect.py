@@ -27,6 +27,8 @@ from bdbackup.metrics.collector import (
     Results,
     StatAnswer,
     StatRequest,
+    StatvfsAnswer,
+    StatvfsRequest,
 )
 from bdbackup.metrics.registry import Family
 from bdbackup.metrics.render import Sample
@@ -62,10 +64,14 @@ def env(tmp_path):
 
 
 def in_process_probe(requests, timeout_seconds):
-    """What the probe child does, done here: answer each stat request from the filesystem."""
+    """What the probe child does, done here: answer each stat and statvfs request."""
     answers = {}
     for request in requests:
         try:
+            if isinstance(request, StatvfsRequest):
+                vfs = os.statvfs(request.path)
+                answers[request] = StatvfsAnswer(vfs.f_blocks, vfs.f_bavail, vfs.f_frsize)
+                continue
             st = os.stat(request.path)
         except OSError as exc:
             answers[request] = Failure(exc.errno)
@@ -436,7 +442,11 @@ def test_history_units_ask_the_probe_for_the_places_of_each_record(env):
     paths = {request.path for request in asked if request.path.name != MARKER}
     assert env.abs("NFS/daily/files/a.tar.gz") in paths
     assert env.abs("BACKUP/files/b.tar.gz") in paths
-    assert all(isinstance(request, StatRequest) for request in asked)
+    # Everything but the capacity of the destination paths is a stat.
+    assert all(isinstance(r, StatRequest) for r in asked if not isinstance(r, StatvfsRequest))
+    assert {r.path for r in asked if isinstance(r, StatvfsRequest)} == {
+        env.abs("NFS/daily"), env.abs("NFS/weekly"),
+    }
     assert len(asked) == len(set(asked))  # each path once
 
 

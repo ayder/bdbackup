@@ -45,8 +45,8 @@ run from cron.
 | [MySQL and MariaDB logical backups with mysqldump](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md) | mysqldump jobs, credentials, default options |
 | [MySQL and MariaDB physical backups with Percona XtraBackup and MariaDB Backup](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) | xtrabackup jobs, full and incremental backups, encryption, preparing a recovery copy, engine pruning |
 | [PostgreSQL pgBackRest backups: nightly fulls exported to a GFS stage](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md) | pgbackrest jobs, taking fulls with archive-copy, the first stage, no new full and `max_full_age_hours`, restore and the printed pgBackRest command, the repository host lost, known limits |
-| [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, preparing stage directories, safety rules, run and step logs, ledger copies |
-| [Prometheus metrics: `bdbackup metrics`](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md) | the metrics command and `[metrics]`, the textfile for node_exporter and PMM, every metric, alerting, hangs and outages, known limits |
+| [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, the `verify` key, preparing stage directories, safety rules and renames, final name exists, drift, run and step logs, ledger copies, known limits |
+| [Prometheus metrics: `bdbackup metrics`](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md) | the metrics command and `[metrics]`, the textfile for node_exporter and PMM, every metric (coverage and drift of the GFS stages included), alerting, hangs and outages, known limits |
 | [Custom backup engines (plugins)](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) | the engine registry, writing your own engine and its metrics collector |
 | [Running xtrabackup jobs with systemd timers](https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md) | service and timer templates, the mysql account, schedules, CPU, I/O and memory limits |
 | [Annotated configuration](https://github.com/ayder/bdbackup/blob/master/config.toml.example) | every config key with a comment |
@@ -278,6 +278,13 @@ For a GFS job, every stage path after the first (and the first, when a pgbackres
 job writes into it) must exist and be writable, and
 its `.bdbackup-destination` marker must be present and writable; a missing
 marker's line names the `--initialize-structure` command that creates it.
+A path below a directory the OS user cannot search is a FAIL line that names the directory:
+`<label>: <path> is not reachable by OS user <user>: <directory> lacks search (x) permission;
+see namei -l <path>`. Any other error the system returns for a checked path (on NFS,
+`ESTALE`, `EIO` or `ETIMEDOUT`) is `<label>: cannot check <path>: <reason> (<errno name>)`, and
+validation goes on with its other checks. When the account has no entry in the passwd database
+(a container, a directory service that is down), the reports name it `uid <n>`, for example
+`Validation as OS user uid 1000`.
 An unreachable database or missing client is a failed/incomplete check, not a pass.
 Validation does not add SQLite history rows. It exits 0 when its checks pass, 1
 for failed or incomplete checks, and 2 for invalid command or configuration syntax.
@@ -348,7 +355,8 @@ changed. `--create-checksum` cannot be combined with `--successful`. The checksu
 History uses schema version 6, from bdbackup 0.7.3. A database at an older schema upgrades
 on the next write; bdbackup 0.7.2 or earlier refuses a version-6 database. Version 6 adds the
 `last_runs` table: the outcome of the last run of each pgbackrest and gfs job, which
-`bdbackup metrics` reads.
+`bdbackup metrics` reads. For a gfs job it also keeps the facts of its last finished run (reason
+classes, moves by rename and by copy, drift).
 
 History is written before work starts, and success only after the backup and its
 requested verification finish. If history cannot be written, the command fails;
@@ -426,7 +434,8 @@ python scripts/integration_nfs_outage.py # bdbackup-nfs-outage:test, privileged
 
 The pgBackRest images have no official source; build them from
 `scripts/docker/pgbackrest.Dockerfile` with the commands in `tests/AGENTS.md`. The NFS
-outage test runs `bdbackup metrics` against a hard NFS mount whose server stops answering. Its
+outage test runs `bdbackup metrics` against a hard NFS mount whose server stops answering, and
+checks that GFS copies a unit onto the share and renames it within it. Its
 image installs bdbackup from a wheel built on the host, and the script refuses an image built
 from other sources:
 

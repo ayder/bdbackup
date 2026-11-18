@@ -205,6 +205,8 @@ encrypt = false
 # <job>.ledger.sqlite3 (here gfs-main.ledger.sqlite3), a copy of the whole
 # history database that restore can use when only a stage survives. The first
 # stage gets that copy too when a pgbackrest job writes into it.
+# Each run also compares the stage paths with the ledger and prints a Drift line for a unit
+# that is missing or an entry it does not know (docs/README_GFS.md).
 # ---------------------------------------------------------------------------
 # Run it after the backups: bdbackup run -c config.toml -j gfs-main
 # Add --dry-run to print what would change without moving or deleting anything.
@@ -223,6 +225,7 @@ keep = "5d"
 paths = ["/NFS/daily"]           # everything for 15 more days
 period = "daily"
 keep = "20d"
+verify = false                   # do not re-read units here only to checksum them (default true)
 
 [[gfs-main.stage]]
 paths = ["/NFS/weekly"]          # newest backup of each ISO week

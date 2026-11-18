@@ -334,3 +334,33 @@ def test_a_directory_that_is_not_writable_is_exit_1_and_an_error_log(tmp_path, c
     assert result.exit_code == 1, result.output
     assert [r for r in caplog.records if r.levelno == logging.ERROR]
     assert not metrics_file(tmp_path).exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root searches every directory")
+def test_an_unsearchable_parent_of_the_directory_is_exit_1_and_an_error_log(
+    tmp_path, caplog, monkeypatch
+):
+    # setup_logging adds its handler once per process, on the stream of the first CLI test; a
+    # later one would print "--- Logging error ---" and a traceback into this output.
+    monkeypatch.setattr(logging.getLogger("bdbackup"), "handlers", [])
+    site = metrics_site(
+        tmp_path, metrics='[metrics]\npath = "locked/metrics/bdbackup.prom"\ntimeout_seconds = 5\n'
+    )
+    target = tmp_path.resolve() / "locked" / "metrics" / "bdbackup.prom"
+    target.parent.mkdir(parents=True)
+    caplog.set_level(logging.INFO)
+    (tmp_path / "locked").chmod(0o640)  # no search (x) bit: every stat below it is EACCES
+    try:
+        result = invoke(site.config)
+    finally:
+        (tmp_path / "locked").chmod(0o700)
+
+    assert result.exit_code == 1, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit), repr(
+        result.exception
+    )
+    assert "Traceback" not in result.output
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and errors[0].startswith(f"Cannot write {target}: "), errors
+    assert "Permission denied" in errors[0]
+    assert not target.exists()

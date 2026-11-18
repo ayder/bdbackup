@@ -491,9 +491,13 @@ encrypted repositories are not supported
 
 ## The cost of pruning
 
-GFS verifies a unit by checksum before it deletes it. In steady state each night therefore
-also reads the expiring tar once, as many bytes as the largest full of the stanza: a
-50 GB full costs one more 50 GB read each night. This is existing GFS behaviour.
+By default GFS verifies a unit by checksum before it deletes it. In steady state each night
+therefore also reads the expiring tar once, as many bytes as the largest full of the stanza: a
+50 GB full costs one more 50 GB read each night. Set `verify = false` on the stage that holds
+the tars (the first stage takes the key too) to skip that read: GFS then checks only that the
+tar exists and has the right structure before it deletes it, and a tar that changed on the
+share is deleted instead of refused. See
+[GFS, skipping checksum re-reads](README_GFS.md#skipping-checksum-re-reads-verify).
 
 ## Known limits
 

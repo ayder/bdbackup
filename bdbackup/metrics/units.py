@@ -73,3 +73,21 @@ class HistoryUnitsCollector:
         for name, by_state in counts.items():
             for state, count in by_state.items():
                 yield Sample(f.HISTORY_UNITS, count, {"job_name": name, "state": state})
+
+
+class SchemaCollector:
+    """``bdbackup_history_schema_version``: the database's ``PRAGMA user_version``.
+
+    It is read on its own and written whether or not the rest of the history can be read, and
+    never waits for a share; it is absent only when the database file does not open.
+    """
+
+    def families(self):
+        return ()
+
+    def probes(self, job: Job | None, ctx: Context) -> list[Request]:
+        return []
+
+    def collect(self, job: Job | None, ctx: Context, results: Results) -> Iterator[Sample]:
+        if ctx.data.user_version is not None:
+            yield Sample(f.HISTORY_SCHEMA_VERSION, ctx.data.user_version)

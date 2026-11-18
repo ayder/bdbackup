@@ -32,6 +32,30 @@ GFS_LAST_RUN_UNITS = "bdbackup_gfs_last_run_units"
 GFS_STAGE_INFO = "bdbackup_gfs_stage_info"
 GFS_STAGE_UNITS = "bdbackup_gfs_stage_units"
 GFS_STAGE_BYTES = "bdbackup_gfs_stage_bytes"
+GFS_COVERAGE_EXPECTED = "bdbackup_gfs_coverage_expected_slots"
+GFS_COVERAGE_FILLED = "bdbackup_gfs_coverage_filled_slots"
+GFS_COVERAGE_MISSING = "bdbackup_gfs_coverage_missing_slots"
+GFS_COVERAGE_NEWEST_MISSING = "bdbackup_gfs_coverage_newest_missing_timestamp_seconds"
+GFS_SOURCE_NEWEST = "bdbackup_gfs_source_newest_timestamp_seconds"
+GFS_SOURCE_OLDEST = "bdbackup_gfs_source_oldest_timestamp_seconds"
+GFS_SOURCE_UNITS = "bdbackup_gfs_source_units"
+GFS_SOURCE_BYTES = "bdbackup_gfs_source_bytes"
+DESTINATION_SIZE = "bdbackup_destination_size_bytes"
+DESTINATION_FREE = "bdbackup_destination_free_bytes"
+GFS_LEDGER_SNAPSHOT = "bdbackup_gfs_ledger_snapshot_timestamp_seconds"
+GFS_FACTS_TIMESTAMP = "bdbackup_gfs_facts_timestamp_seconds"
+GFS_LAST_RUN_REASON_UNITS = "bdbackup_gfs_last_run_reason_units"
+GFS_LAST_RUN_MOVES = "bdbackup_gfs_last_run_moves"
+GFS_DRIFT_MISSING = "bdbackup_gfs_drift_missing_units"
+GFS_DRIFT_UNKNOWN = "bdbackup_gfs_drift_unknown_entries"
+GFS_LAST_MOVE = "bdbackup_gfs_last_move_timestamp_seconds"
+GFS_UNMANAGED_UNITS = "bdbackup_gfs_unmanaged_units"
+GFS_UNMANAGED_BYTES = "bdbackup_gfs_unmanaged_bytes"
+GFS_STAGE_VERIFY = "bdbackup_gfs_stage_verify"
+HISTORY_SCHEMA_VERSION = "bdbackup_history_schema_version"
+
+# Labels of the families kept per stage and per backup job whose units the stage holds.
+GFS_SOURCE = ("job_name", "stage", "source_job")
 
 BUILTIN = (
     Family(LAST_RUN, "End of this metrics run.", ()),
@@ -85,6 +109,110 @@ BUILTIN = (
         GFS_STAGE_UNITS, "Units whose newest location is in the stage.", ("job_name", "stage")
     ),
     Family(GFS_STAGE_BYTES, "Bytes of the units in the stage.", ("job_name", "stage")),
+    Family(
+        GFS_COVERAGE_EXPECTED,
+        "Period slots (days, ISO weeks, months or years) wholly inside the stage's window that "
+        "the backup job's units should fill.",
+        GFS_SOURCE,
+    ),
+    Family(
+        GFS_COVERAGE_FILLED,
+        "Expected slots that hold a unit of the backup job in any stage.",
+        GFS_SOURCE,
+    ),
+    Family(GFS_COVERAGE_MISSING, "Expected slots that hold no unit of the backup job.",
+           GFS_SOURCE),
+    Family(
+        GFS_COVERAGE_NEWEST_MISSING,
+        "Local midnight starting the newest missing slot; absent when no slot is missing.",
+        GFS_SOURCE,
+    ),
+    Family(
+        GFS_SOURCE_NEWEST,
+        "Newest time of the newest unit of the backup job in the stage.",
+        GFS_SOURCE,
+    ),
+    Family(
+        GFS_SOURCE_OLDEST,
+        "Oldest time of the oldest unit of the backup job in the stage.",
+        GFS_SOURCE,
+    ),
+    Family(GFS_SOURCE_UNITS, "Units of the backup job whose newest location is in the stage.",
+           GFS_SOURCE),
+    Family(GFS_SOURCE_BYTES, "Bytes of the backup job's units in the stage.", GFS_SOURCE),
+    Family(
+        GFS_LAST_MOVE,
+        "Time of the newest successful move between two stages of the gfs job.",
+        ("job_name", "from_stage", "to_stage"),
+    ),
+    Family(
+        GFS_UNMANAGED_UNITS,
+        "Successful records under the first stage that GFS does not manage, by reason: "
+        "no_checksum or unavailable.",
+        ("job_name", "stage", "reason"),
+    ),
+    Family(
+        GFS_UNMANAGED_BYTES,
+        "Bytes of the successful records under the first stage that GFS does not manage, "
+        "by reason.",
+        ("job_name", "stage", "reason"),
+    ),
+    Family(
+        GFS_STAGE_VERIFY,
+        "1 when GFS re-reads the checksums of the stage's units, 0 for verify = false.",
+        ("job_name", "stage"),
+    ),
+    Family(
+        DESTINATION_SIZE,
+        "Size of the destination's filesystem, f_blocks x f_frsize, where its marker is a file.",
+        ("job_name", "stage", "path"),
+    ),
+    Family(
+        DESTINATION_FREE,
+        "Space available to the OS user on the destination's filesystem, f_bavail x f_frsize, "
+        "where its marker is a file.",
+        ("job_name", "stage", "path"),
+    ),
+    Family(
+        GFS_LEDGER_SNAPSHOT,
+        "Modification time of the gfs job's ledger snapshot on the destination; absent when "
+        "there is none.",
+        ("job_name", "stage", "path"),
+    ),
+    Family(
+        GFS_FACTS_TIMESTAMP,
+        "When the gfs job's newest finished run computed the facts behind the last_run and drift "
+        "families; a run that was locked or raised leaves them, and this time, as they were.",
+        ("job_name",),
+    ),
+    Family(
+        GFS_LAST_RUN_REASON_UNITS,
+        "Units the gfs job's last run held, deferred, refused or failed, by stage (0: not in a "
+        "configured stage), outcome and reason class.",
+        ("job_name", "stage", "outcome", "reason"),
+    ),
+    Family(
+        GFS_LAST_RUN_MOVES,
+        "Moves of the gfs job's last run, by method: rename or copy.",
+        ("job_name", "method"),
+    ),
+    Family(
+        GFS_DRIFT_MISSING,
+        "Units the ledger records at the stage's paths that are not there; written only for a "
+        "stage the last run could check.",
+        ("job_name", "stage"),
+    ),
+    Family(
+        GFS_DRIFT_UNKNOWN,
+        "Entries at the stage's paths that the ledger does not record, bdbackup's own files "
+        "aside; written only for a stage the last run could check.",
+        ("job_name", "stage"),
+    ),
+    Family(
+        HISTORY_SCHEMA_VERSION,
+        "Schema version of the history database (PRAGMA user_version).",
+        (),
+    ),
 )
 
 

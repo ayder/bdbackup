@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -22,14 +22,15 @@ from bdbackup.metrics.collector import (
     Request,
     Results,
     StatRequest,
+    StatvfsRequest,
 )
-from bdbackup.metrics.data import HistoryData, read_history
+from bdbackup.metrics.data import HistoryData, read_history, read_user_version
 from bdbackup.metrics.gfs import GfsCollector
 from bdbackup.metrics.jobs import LAST_RUN_JOB_TYPES, JobCollector
 from bdbackup.metrics.probe import run_probes
 from bdbackup.metrics.registry import Registry, engine_prefix
 from bdbackup.metrics.render import Sample, render
-from bdbackup.metrics.units import HistoryUnitsCollector
+from bdbackup.metrics.units import HistoryUnitsCollector, SchemaCollector
 
 if TYPE_CHECKING:
     from bdbackup.config import Job
@@ -69,7 +70,7 @@ class _Unit:
 
 def _units(jobs: Mapping[str, Job], *, history_ok: bool) -> list[_Unit]:
     """The collectors to run: built-ins for the active jobs, then each engine's own."""
-    units: list[_Unit] = []
+    units: list[_Unit] = [_Unit(None, SchemaCollector())]  # the number of a history we cannot read
     active = [job for job in jobs.values() if job.active]
     if history_ok:
         for job in active:
@@ -101,7 +102,7 @@ def _run_probes_phase(units: list[_Unit], ctx: Context, timeout_seconds: float) 
         try:
             asked = list(unit.collector.probes(unit.job, ctx))
             for request in asked:
-                if not isinstance(request, StatRequest | ListPrefixRequest):
+                if not isinstance(request, StatRequest | StatvfsRequest | ListPrefixRequest):
                     raise ValueError(f"not a probe request: {request!r}")
         except Exception as exc:
             outcomes[id(unit)] = (False, exc)
@@ -183,11 +184,16 @@ def collect_all(
         )
 
     history_ok = True
+    stages = {
+        job.name: [stage.paths for stage in job.params["stage"]]
+        for job in jobs.values() if job.active and job.type == "gfs"
+    }
+    version = read_user_version(history)
     try:
-        data = read_history(history)
+        data = replace(read_history(history, stages), user_version=version)
     except (HistoryError, OSError) as exc:
         fail("history", "", "unreadable", exc)
-        history_ok, data = False, HistoryData()
+        history_ok, data = False, HistoryData(user_version=version)
     ctx = Context(now, jobs, history, data, timeout_seconds)
     units = _units(jobs, history_ok=history_ok)
     registry = f.builtin_registry()
