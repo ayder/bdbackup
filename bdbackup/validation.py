@@ -22,7 +22,12 @@ from bdbackup.mysql.helpers import mysql_cnf_file
 
 
 def os_user() -> str:
-    return pwd.getpwuid(os.geteuid()).pw_name
+    """The effective user's name; ``uid <n>`` when the uid has no passwd entry."""
+    uid = os.geteuid()
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid {uid}"
 
 
 class Report:
