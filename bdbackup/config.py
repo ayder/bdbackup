@@ -11,7 +11,7 @@ from bdbackup.engines import EngineError, get_engine, list_engines
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
-from bdbackup.metrics.settings import MetricsSettings
+from bdbackup.metrics.settings import MetricsSettings, parse_metrics
 
 
 @dataclass
@@ -68,6 +68,16 @@ class Config:
                     raise ConfigError(f"[history] {key} must be a nonempty filesystem path")
                 paths[key] = (self.path.parent / Path(value).expanduser()).resolve()
             self.history = HistorySettings(**paths)
+
+        if "metrics" in data:
+            section = data.pop("metrics")
+            try:
+                settings = parse_metrics(section, self.path.parent)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
+            if self.history is None:
+                raise ConfigError("[metrics] requires a [history] section")
+            self.metrics = settings
 
         for name, section in data.items():
             if not isinstance(section, dict):
