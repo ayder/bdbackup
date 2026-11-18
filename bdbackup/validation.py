@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 from bdbackup.config import Config, Job, build_backend
@@ -45,14 +48,77 @@ def _access(path: Path, mode: int) -> bool:
     return os.access(path, mode, effective_ids=True)
 
 
+# Python 3.12 raises PermissionError from Path.exists, is_dir and is_file on EACCES, and 3.14
+# returns False. Every filesystem check below goes through _stat, so 3.12 to 3.14 report
+# alike: ENOENT and ENOTDIR (and ELOOP, as pathlib ignored it) mean missing, EACCES unreachable.
+_MISSING = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """What one stat of a path found: an entry, nothing there, or no way to look."""
+
+    info: os.stat_result | None = None
+    unreachable: bool = False
+
+    @property
+    def exists(self) -> bool:
+        return self.info is not None
+
+    @property
+    def is_dir(self) -> bool:
+        return self.info is not None and stat.S_ISDIR(self.info.st_mode)
+
+    @property
+    def is_file(self) -> bool:
+        return self.info is not None and stat.S_ISREG(self.info.st_mode)
+
+    @property
+    def is_symlink(self) -> bool:
+        return self.info is not None and stat.S_ISLNK(self.info.st_mode)
+
+
+def _stat(path: Path, *, follow: bool = True) -> _Entry:
+    """Stat ``path`` (``lstat`` when ``follow`` is false); any other error is not hidden."""
+    try:
+        return _Entry(os.stat(path) if follow else os.lstat(path))
+    except OSError as exc:
+        if exc.errno in _MISSING:
+            return _Entry()
+        if exc.errno == errno.EACCES:
+            return _Entry(unreachable=True)
+        raise
+
+
+def _unsearchable(path: Path) -> Path:
+    """The first ancestor of ``path``, from the root down, that the OS user cannot search."""
+    for ancestor in reversed(path.parents):
+        if not _access(ancestor, os.X_OK):
+            return ancestor
+    return path.parent
+
+
+def _unreachable(report: Report, path: Path, label: str) -> None:
+    path = path.absolute()
+    report.add(
+        "FAIL",
+        f"{label}: {path} is not reachable by OS user {os_user()}: {_unsearchable(path)} lacks "
+        f"search (x) permission; see namei -l {shlex.quote(str(path))}",
+    )
+
+
 def _directory(report: Report, path: Path, label: str, *, write=False, create=False) -> None:
     path = path.expanduser().absolute()
     required = "read/write/search" if write else "read/search"
-    if not path.exists():
+    found = _stat(path)
+    if found.unreachable:
+        _unreachable(report, path, label)
+        return
+    if not found.exists:
         parent = path.parent
-        while not parent.exists() and parent != parent.parent:
+        while not _stat(parent).exists and parent != parent.parent:
             parent = parent.parent
-        creatable = create and parent.is_dir() and _access(parent, os.W_OK | os.X_OK)
+        creatable = create and _stat(parent).is_dir and _access(parent, os.W_OK | os.X_OK)
         report.add(
             "OK" if creatable else "FAIL",
             f"{label}: {path} does not exist; "
@@ -62,15 +128,19 @@ def _directory(report: Report, path: Path, label: str, *, write=False, create=Fa
         report.lines.append(f"  OS user {os_user()} needs {required} permissions on {path}.")
         return
     mode = os.R_OK | os.X_OK | (os.W_OK if write else 0)
-    if not path.is_dir() or not _access(path, mode):
+    if not found.is_dir or not _access(path, mode):
         report.add("FAIL", f"{label}: OS user {os_user()} needs {required} on directory {path}.")
     else:
         report.add("OK", f"{label}: {path} ({required} as OS user {os_user()}).")
 
 
 def _file(report: Report, path: Path, label: str, *, write=False) -> None:
+    found = _stat(path)
+    if found.unreachable:
+        _unreachable(report, path, label)
+        return
     mode = os.R_OK | (os.W_OK if write else 0)
-    if not path.is_file() or not _access(path, mode):
+    if not found.is_file or not _access(path, mode):
         report.add(
             "FAIL",
             f"{label}: OS user {os_user()} needs "
@@ -289,9 +359,10 @@ def _metrics(report: Report, path: Path) -> None:
     _directory(report, path.parent, "Metrics directory", write=True)
     if not report.lines[first].startswith("[OK]"):
         return
-    if path.is_dir():
+    found = _stat(path)
+    if found.is_dir:
         report.add("FAIL", f"Metrics file: {path} is a directory; the file cannot replace it.")
-    elif path.exists():
+    elif found.exists:
         report.add(
             "OK",
             f"Metrics file: {path} exists; it is replaced whole, so only its directory "
@@ -303,11 +374,14 @@ def _gfs(report: Report, job: Job, config_path: Path, fed: bool) -> None:
     """Check the later stages, and the first one when a pgbackrest job writes into it."""
     for stage in job.params["stage"] if fed else job.params["stage"][1:]:
         for path in stage.paths:
-            if not path.is_dir():
+            found = _stat(path)
+            if found.unreachable:
+                _unreachable(report, path, "Stage path")
+            elif not found.is_dir:
                 report.add("FAIL", f"Stage path {path}: does not exist")
             elif not _access(path, os.W_OK | os.X_OK):
                 report.add("FAIL", f"Stage path {path}: not writable by OS user {os_user()}")
-            elif not (path / MARKER).is_file():
+            elif not _stat(path / MARKER).is_file:
                 report.add("FAIL", f"Stage path {path}: {MARKER} missing; run bdbackup run -c "
                                    f"{config_path} -j {job.name} --initialize-structure")
             elif not _access(path / MARKER, os.W_OK):
@@ -325,7 +399,7 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
     if config.history:
         db = config.history.database
         _directory(report, db.parent, "SQLite history directory", write=True, create=True)
-        if db.exists():
+        if _stat(db).exists:
             _file(report, db, "SQLite history", write=True)
         _directory(report, config.history.restore_root, "Recovery root", write=True, create=True)
     if config.metrics is not None:
@@ -374,19 +448,29 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
                     )
                 if not backend.backup_paths:
                     report.add("FAIL", "File job needs a nonempty template_filename path list.")
+                # The walk stats each root first; one below an unsearchable directory is named
+                # here, and the walk is skipped, as it could only fail there.
+                roots = [backend._resolve_path(raw) for raw in backend.backup_paths]
+                blocked = [
+                    root for root in roots
+                    if _stat(root, follow=backend.follow_symlinks).unreachable
+                ]
+                for root in blocked:
+                    _unreachable(report, root, "Backup source")
                 count = 0
-                for source, _ in backend._walk():
+                walk = [] if blocked else backend._walk()
+                for source, _ in walk:
                     count += 1
-                    if source.is_symlink() and not backend.follow_symlinks:
+                    if _stat(source, follow=False).is_symlink and not backend.follow_symlinks:
                         continue
-                    mode = os.R_OK | (os.X_OK if source.is_dir() else 0)
+                    mode = os.R_OK | (os.X_OK if _stat(source).is_dir else 0)
                     if not _access(source, mode):
                         report.add(
                             "FAIL", f"OS user {os_user()} cannot read/search source {source}."
                         )
                 if count:
                     report.add("OK", f"Checked access to {count} selected source entries.")
-                elif backend.backup_paths:
+                elif backend.backup_paths and not blocked:
                     report.add("FAIL", "No source entries selected after exclusions.")
             elif isinstance(backend, (MySQLBackup, XtraBackup)):
                 if not isinstance(backend.user, str) or not backend.user.strip():
