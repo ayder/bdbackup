@@ -1,9 +1,10 @@
-"""Drift: what the later stage paths hold against what the ledger records (spec 16 section 6.3).
+"""Drift: what the stage paths hold against what the ledger records (spec 16 section 6.3).
 
 A stage path can differ from the ledger without any action looking at it: a unit removed by
 hand, a rename a crash cut short, a share remounted onto the wrong export. Drift counts, per
-stage path, the recorded locations that are not there (``missing``) and the entries that are
-not recorded (``unknown``). It reads the filesystem's metadata only, never a unit's data.
+stage path, the recorded locations that are not there (``missing``) and, for a path that carries
+the destination marker, the entries that are not recorded (``unknown``). It reads the
+filesystem's metadata only, never a unit's data.
 
 Every check that touches a share runs in a child process under one deadline, as the metrics
 probes do: a hung hard mount must not hang the run. The child's source imports nothing from

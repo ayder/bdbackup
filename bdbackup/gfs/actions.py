@@ -1,4 +1,4 @@
-"""GFS filesystem actions: contents check, verified copy and removal (spec 2 §4.3, §4.4).
+"""GFS filesystem actions: contents check, verified copy, rename and removal (spec 2 §4.3, §4.4).
 
 Copies go through a ``Transport`` so that object storage can be added later (spec 2 §5).
 """

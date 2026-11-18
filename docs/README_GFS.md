@@ -446,8 +446,8 @@ checking that no backup of that job is running, mark it failed:
 `bdbackup restore` and `bdbackup history` find a
 backup where GFS put it. `history` shows a copy that was removed or replaced as
 `unavailable`. Before restoring, every backup file used is checked against its
-ledger checksum; with several paths in a stage, the first path that verifies is
-used, and the `Backup:` line names it. An xtrabackup chain is prepared from the
+ledger checksum, whatever the stage's `verify` flag; with several paths in a stage,
+the first path that verifies is used, and the `Backup:` line names it. An xtrabackup chain is prepared from the
 stage directory holding it, which keeps the layout of the first stage.
 
 ## Ledger copies
