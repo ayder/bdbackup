@@ -9,6 +9,10 @@ import venv
 from pathlib import Path
 
 
+def _check_pbm_dry_run(work, cli, run):
+    pass
+
+
 def main(dist: str) -> None:
     project = Path(__file__).resolve().parents[1] / "pyproject.toml"
     expected_version = tomllib.loads(project.read_text())["project"]["version"]
