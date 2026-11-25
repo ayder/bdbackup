@@ -157,9 +157,14 @@ class PBM:
             replicas.append(ReplicaBackup(entry["name"], node))
         return BackupDescription(status, backup_type, tuple(replicas))
 
-    def status(self) -> dict:
-        """Read PBM's status document for validation."""
-        return self._run_json("status")
+    def status(self, *, cluster_only: bool = False) -> dict:
+        """Read PBM's status document."""
+        sections = ("--sections", "cluster") if cluster_only else ()
+        return self._run_json("status", *sections)
+
+    def storage_type(self) -> object:
+        """Read only the storage type, without opening PBM's configured storage."""
+        return self._run_json("config", "storage.type").get("value")
 
     def version(self) -> dict:
         """Read PBM's version document for validation."""

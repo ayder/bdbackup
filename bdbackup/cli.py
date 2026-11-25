@@ -178,6 +178,9 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
         _echo(f"Dry run; would create: {backend.tar_filename}")
     elif isinstance(backend, MySQLBackup):
         _echo(f"Dry run; would dump {backend.selection()} into {backend.out_dir}")
+    elif isinstance(backend, PBM):
+        _echo(f"Dry run; would take a {backend.backup_type} PBM backup and export it into "
+              f"{backend.out_dir}")
     elif isinstance(backend, XtraBackup) and incremental:
         _echo(f"Dry run; would take an incremental of {backend.incremental_parent()} "
                    f"under {backend.backup_root}")

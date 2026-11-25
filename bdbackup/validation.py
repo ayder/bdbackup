@@ -17,6 +17,7 @@ from pathlib import Path
 from bdbackup.config import Config, Job, build_backend
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import MARKER, fed_first_stages
+from bdbackup.mongodb.pbm import PBM, URI_ENV, PBMError
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.mysql.helpers import mysql_cnf_file
 from bdbackup.ssh_copy import CopyCommandError, CopySettings, SSHConnection
@@ -507,6 +508,125 @@ def _gfs(report: Report, job: Job, config_path: Path, fed: bool) -> None:
                     report.add("OK", f"Stage path {path}: writable, marker present and writable")
 
 
+_TESTED_PBM_VERSIONS = ("2.10.0", "2.17.0")
+
+
+def _pbm_version_token(value: object) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9.+_-]+", value):
+        return None
+    return re.sub(r"^v(?=[0-9])", "", value)
+
+
+def _pbm_version(report: Report, backend: PBM) -> str | None:
+    try:
+        version = _pbm_version_token(backend.version().get("Version"))
+        if version is None:
+            raise PBMError("pbm version did not report a version")
+    except PBMError as exc:
+        report.add("FAIL", f"PBM version: {exc}. Install a PBM executable that matches the agents.")
+        return None
+    note = ""
+    if version not in _TESTED_PBM_VERSIONS:
+        note = f" (not a tested version: {', '.join(_TESTED_PBM_VERSIONS)})"
+    report.add("OK", f"PBM {version}{note}")
+    return version
+
+
+def _pbm_agent_checks(report: Report, backend: PBM, version: str | None) -> None:
+    try:
+        # PBM 2.10 can open the storage when the backups section is requested.
+        cluster = backend.status(cluster_only=True).get("cluster")
+        if not isinstance(cluster, list) or any(
+            not isinstance(replica, dict) or not isinstance(replica.get("nodes"), list)
+            for replica in cluster
+        ):
+            raise PBMError("pbm status did not report the replica set nodes")
+        nodes = [node for replica in cluster for node in replica["nodes"]]
+        if any(not isinstance(node, dict) for node in nodes):
+            raise PBMError("pbm status returned invalid agent data")
+    except PBMError as exc:
+        report.add("FAIL", f"PBM status: {exc}. Check that the URI reaches the replica set.")
+        return
+    report.add("OK", "PBM status answered.")
+
+    failed = []
+    versions = set()
+    healthy_without_version = False
+    for node in nodes:
+        agent_version = _pbm_version_token(node.get("agent"))
+        if agent_version is not None:
+            versions.add(agent_version)
+        if node.get("ok") is True:
+            healthy_without_version |= agent_version is None
+        else:
+            host = node.get("host")
+            failed.append(
+                host if isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", host)
+                else "unknown node"
+            )
+    healthy = len(nodes) - len(failed)
+    health = f"{healthy} of {len(nodes)} OK."
+    if failed:
+        health += f" Not OK: {', '.join(failed)}."
+    if healthy:
+        report.add("OK", f"PBM agents: {health}")
+    else:
+        report.add(
+            "FAIL", f"PBM agents: {health} Start or repair a pbm-agent and check its storage.",
+        )
+
+    if version is not None and versions == {version} and not healthy_without_version:
+        report.add("OK", f"PBM command and agents use version {version}.")
+    else:
+        agent_versions = ", ".join(sorted(versions)) or "unavailable"
+        report.add(
+            "FAIL", f"PBM version agreement: CLI {version or 'unavailable'}, agents "
+            f"{agent_versions}. Install matching PBM and agent versions and check agent status.",
+        )
+
+
+def _pbm(report: Report, backend: PBM) -> None:
+    found = shutil.which(backend.binary)
+    if found:
+        report.add("OK", f"Executable: {found}")
+    else:
+        report.add(
+            "FAIL", f"PBM executable {backend.binary!r} is missing or not executable. "
+            "Install Percona Backup for MongoDB and put pbm in PATH or set binary.",
+        )
+    connection = (backend.mongodb_uri or os.environ.get(URI_ENV, "")).strip()
+    if connection:
+        report.add("OK", "PBM connection string is set.")
+    else:
+        report.add("FAIL", f"PBM connection string: set mongodb_uri or {URI_ENV}.")
+
+    if found:
+        version = _pbm_version(report, backend)
+        if connection:
+            _pbm_agent_checks(report, backend, version)
+            try:
+                storage_type = backend.storage_type()
+            except PBMError as exc:
+                report.add("FAIL", f"PBM storage type: {exc}. Check PBM's storage configuration.")
+            else:
+                if storage_type == "filesystem":
+                    report.add("OK", "PBM storage type: filesystem.")
+                else:
+                    report.add("FAIL", "PBM storage type: set PBM storage.type to filesystem.")
+
+    _directory(report, backend.storage_path, "PBM storage")
+    marker = backend.storage_path / ".pbm.init"
+    found_marker = _stat(marker)
+    if not found_marker.exists and not found_marker.unreachable and found_marker.error is None:
+        report.add(
+            "FAIL", f"PBM storage marker: {marker} is missing. "
+            "Point storage_path at PBM's initialized filesystem storage.",
+        )
+    else:
+        _file(report, marker, "PBM storage marker")
+    _directory(report, backend.out_dir, "Backup destination", write=True, create=True)
+
+
 def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
     report = Report()
     report.lines.append(
@@ -540,6 +660,9 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
             if job.type == "pgbackrest":
                 for status, message in build_backend(job).preflight():
                     report.add(status, message)
+                continue
+            if job.type == "pbm":
+                _pbm(report, build_backend(job))
                 continue
             if job.type not in {"file", "xtrabackup", "mysqldump"}:
                 report.add("FAIL", f"Preflight checks are not implemented for engine {job.type!r}.")
