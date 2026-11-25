@@ -193,4 +193,4 @@ here and commits it with the candidate before calling the gate; the gate agent n
 
 | Baseline | Kind | Current value | Runner | Measured at |
 |---|---|---|---|---|
-| Unit test count | inventory | 1302 passed | `.venv/bin/python -m pytest -q -p no:cacheprovider` | `a52e13d` |
+| Unit test count | inventory | 1451 passed | `.venv/bin/python -m pytest -q -p no:cacheprovider` | `eb6a0c6` |
