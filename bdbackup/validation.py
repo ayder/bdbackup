@@ -19,6 +19,7 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import MARKER, fed_first_stages
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.mysql.helpers import mysql_cnf_file
+from bdbackup.ssh_copy import CopyCommandError, CopySettings, SSHConnection
 
 
 def os_user() -> str:
@@ -182,6 +183,89 @@ def _binary(report: Report, name: str) -> None:
         report.add("OK", f"Executable: {found}")
     else:
         report.add("FAIL", f"Required executable {name!r} is missing or not executable in PATH.")
+
+
+def _copy_executable(report: Report, tool: str) -> bool:
+    found = shutil.which(tool)
+    if found:
+        report.add("OK", f"SSH copy local {tool} is available at {found}.")
+        return True
+    package = "rsync" if tool == "rsync" else "OpenSSH"
+    report.add(
+        "FAIL", f"SSH copy local {tool} is missing. Install {package} and put {tool} in PATH.",
+    )
+    return False
+
+
+def _ssh_copy(report: Report, settings: CopySettings) -> None:
+    ssh_available = _copy_executable(report, "ssh")
+    _copy_executable(report, settings.method)
+    config_readable = True
+    if settings.ssh_config is not None:
+        path = settings.ssh_config
+        config_readable = _stat(path).is_file and _access(path, os.R_OK)
+        if config_readable:
+            report.add("OK", f"SSH copy ssh_config {path} is readable.")
+        else:
+            report.add(
+                "FAIL", f"SSH copy ssh_config {path} is unreadable. "
+                f"Give OS user {os_user()} read access.",
+            )
+
+    directory = settings.path
+    probes = [
+        (
+            "destination", f"destination {directory}",
+            f"test -d {directory} && test -w {directory} && test -x {directory}",
+            "is a writable directory.",
+            f"Create the directory {directory} and give the SSH account write and search access.",
+        ),
+        (
+            "sha256sum", "remote sha256sum", "command -v sha256sum >/dev/null", "is available.",
+            "Install GNU coreutils or BusyBox on the SSH server.",
+        ),
+        (
+            "stat", "remote stat -c %a",
+            f"test -d {directory} && stat -c %a -- {directory} >/dev/null",
+            f"can read the mode of {directory}.",
+            "Install GNU coreutils or BusyBox and check access to the directory.",
+        ),
+    ]
+    if settings.method == "rsync":
+        probes.append((
+            "rsync", "remote rsync", "command -v rsync >/dev/null", "is available.",
+            "Install rsync on the SSH server and put it in the account's PATH.",
+        ))
+
+    detected = None
+    if not ssh_available or not config_readable:
+        remedy = (
+            "Install ssh and retry validation." if not ssh_available
+            else "Make the configured SSH file readable and retry validation."
+        )
+        report.add("FAIL", f"SSH copy connection could not be checked. {remedy}")
+    else:
+        command = "; ".join(
+            f"if {check}; then printf '%s\\n' {token}; fi" for token, _, check, _, _ in probes
+        )
+        try:
+            detected = set(SSHConnection(settings).run(command).splitlines())
+        except CopyCommandError as exc:
+            report.add(
+                "FAIL",
+                f"SSH copy connection to {settings.destination} failed ({exc.failure_class}). "
+                "Check network access, the known host key and key-based login for this account.",
+            )
+        else:
+            report.add("OK", f"SSH copy connection to {settings.destination} is non-interactive.")
+
+    for token, label, _, message, remedy in probes:
+        if detected is not None and token in detected:
+            report.add("OK", f"SSH copy {label} {message}")
+        else:
+            if detected is None:
+                remedy = "Restore the SSH connection and retry validation."
+            report.add("FAIL", f"SSH copy {label} could not be confirmed. {remedy}")
 
 
 def _settings(job: Job) -> None:
@@ -447,6 +531,8 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
         try:
             if job.restore_root is not None:
                 _directory(report, job.restore_root, "Recovery root", write=True, create=True)
+            if job.copy is not None:
+                _ssh_copy(report, job.copy)
             if job.type == "gfs":
                 first = job.params["stage"][0].paths[0]
                 _gfs(report, job, config.path, first in fed_first_stages(config.jobs))
