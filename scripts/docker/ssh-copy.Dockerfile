@@ -3,6 +3,8 @@
 ARG UBUNTU=22.04
 FROM ghcr.io/astral-sh/uv:0.9.10 AS uv
 FROM ubuntu:${UBUNTU}
+ARG SOURCE_HASH
+LABEL bdbackup.source="${SOURCE_HASH}"
 COPY --from=uv /uv /usr/local/bin/uv
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
