@@ -317,11 +317,29 @@ def _run_pgbackrest(
             began.append(_now())
             return engine.export(full, verify=verify, progress=outcome.progress)
 
-        result = _tracked_backup(config, job.name, "pgbackrest-full", export, info)
+        result = _tracked_backup(config, job.name, "pgbackrest-full", export, info, copy=job.copy)
     outcome.result = "exported"
     outcome.facts = _export_facts(full, result, outcome.progress, began[0])
     _echo(f"Job {job.name}: {result.path}")
     return EXIT_OK
+
+
+def _run_pgbackrest_job(
+    config: Config, job: Job, *, verify: bool, dry_run: bool, outcome: _Outcome
+) -> int:
+    code = _run_pgbackrest(config, job, verify=verify, dry_run=dry_run, outcome=outcome)
+    if code != EXIT_OK or dry_run or job.copy is None:
+        return code
+
+    # The export lock is released. Keep its facts and report any copy-phase failure.
+    export_result = outcome.result
+    outcome.result = "copy_failed"
+    code = _run_copy(config, job)
+    if code == EXIT_OK:
+        outcome.result = export_result
+    elif code == EXIT_LOCKED:
+        outcome.result = "copy_deferred"
+    return code
 
 
 @main.command(name="run")
@@ -414,7 +432,7 @@ def run(
         outcome = _Outcome()
         with nullcontext() if dry_run else _last_run(config, job, outcome):
             ctx.exit(_handle_errors(
-                _run_pgbackrest, config, job, verify=verify, dry_run=dry_run, outcome=outcome
+                _run_pgbackrest_job, config, job, verify=verify, dry_run=dry_run, outcome=outcome
             ))
     if dry_run:
         return _handle_errors(_dry_run, config, job, incremental)
