@@ -1,11 +1,17 @@
-"""Probe the PBM versions used by the bdbackup integration fixtures.
+"""Probe PBM and test the installed bdbackup wheel with real replica sets.
 
-Build the two images, then run the probes:
+Build both candidate images, then run the probe and integration:
 
     .venv/bin/python scripts/integration_pbm.py --build-probe-images
     .venv/bin/python scripts/integration_pbm.py --probe all
+    .venv/bin/python scripts/integration_pbm.py
 
-Run one fixture or one case:
+Run one integration fixture or one case:
+
+    .venv/bin/python scripts/integration_pbm.py --fixture mongo6-pbm210
+    .venv/bin/python scripts/integration_pbm.py --fixture mongo7-pbm217 --case physical
+
+Select individual probes separately:
 
     .venv/bin/python scripts/integration_pbm.py --probe mongo6-pbm210
     .venv/bin/python scripts/integration_pbm.py --probe mongo7-pbm217 --case restore-physical
@@ -17,6 +23,7 @@ network with no published ports and contains only synthetic data.
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -46,6 +53,11 @@ WORK = Path("/var/tmp/bdbackup-pbm")  # noqa: S108
 CONFIG = str(WORK / "config.yaml")
 URI = "mongodb://localhost:27017/"
 PYTHON = "/opt/bdbackup/bin/python"
+BDBACKUP = "/opt/bdbackup/bin/bdbackup"
+JOB = "mongo"
+JOB_CONFIG = WORK / "job.toml"
+LEDGER = WORK / "history.sqlite3"
+UNITS = WORK / "units"
 DATA = 'db.getSiblingDB("app").items'
 ROWS = [{"_id": index, "value": f"row-{index}"} for index in range(100)]
 
@@ -148,7 +160,8 @@ class ReplicaSet:
             raise RuntimeError(f"fixture cleanup failed ({' '.join(args)}): {detail(result)}")
 
     @contextmanager
-    def started(self, *, umask=None, local_everywhere=False):
+    def started(self, *, umask=None, local_everywhere=False, storage_node=None):
+        writer = storage_node or self.secondary
         with ExitStack() as cleanup:
             cleanup.callback(self.cleanup, "network", "rm", self.network)
             output(
@@ -169,14 +182,14 @@ class ReplicaSet:
                     f"{node}: start isolated container",
                 )
             output(
-                self.exec(self.secondary, "/opt/bdbackup/bin/bdbackup", "--version"),
+                self.exec(self.secondary, BDBACKUP, "--version"),
                 "candidate CLI runs from the installed wheel on the secondary",
             )
             output(
                 self.exec(self.primary, "chown", "1001:0", SHARED, user="0:0"),
                 "shared storage owned by the mongod user",
             )
-            for node in self.nodes if local_everywhere else (self.secondary,):
+            for node in self.nodes if local_everywhere else (writer,):
                 self.local_storage(node)
 
             for node in self.nodes:
@@ -196,7 +209,7 @@ class ReplicaSet:
             for node in self.nodes:
                 self.start_agent(node, umask)
             self.configure(LOCAL)
-            self.wait_agents(self.nodes if local_everywhere else (self.secondary,))
+            self.wait_agents(self.nodes if local_everywhere else (writer,))
             yield self
 
     def exec(self, node, *args, user=None, detach=False, stdin=None, uri=None, timeout=30):
@@ -276,19 +289,24 @@ class ReplicaSet:
     def pbm(self, *args, node=None, uri=URI):
         return self.exec(node or self.secondary, "pbm", *args, uri=uri, timeout=300)
 
-    def configure(self, storage):
+    def cli(self, *args, uri=None):
+        return self.exec(self.secondary, BDBACKUP, *args, uri=uri, timeout=360)
+
+    def configure(self, storage, *, wait=False):
         yaml = f"storage:\n  type: filesystem\n  filesystem:\n    path: {storage}\n"
         for node in self.nodes:
             output(self.exec(node, "sh", "-c", f"cat > {CONFIG}", stdin=yaml),
                    f"{node}: write fixture PBM config")
-        output(self.pbm("config", "--file", CONFIG), f"configure filesystem storage at {storage}")
+        flags = ("--wait",) if wait else ()
+        output(self.pbm("config", "--file", CONFIG, *flags),
+               f"configure filesystem storage at {storage}")
 
     def wait_agents(self, healthy):
         want = {f"{node}:27017" for node in healthy}
         members = {f"{node}:27017" for node in self.nodes}
 
         def check():
-            result = self.pbm("status", "--out", "json")
+            result = self.pbm("status", "--sections", "cluster", "--out", "json")
             if result.returncode:
                 return False
             status = json.loads(result.stdout)
@@ -311,13 +329,18 @@ class ReplicaSet:
                bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", name)))
         if field:
             expect(f"{backup_type}: PBM reports {field}", backup.get(field) == storage)
+        node = self.confirm(name, backup_type, storage, expected_node=expected_node)
+        return name, node
+
+    def confirm(self, name, backup_type, storage=LOCAL, *, expected_node=None):
         desc = json_output(
-            self.pbm("describe-backup", name, "--out", "json"),
+            self.pbm("describe-backup", name, "--out", "json", node=expected_node),
             f"{backup_type}: describe-backup exits 0",
         )
         expect(f"{backup_type}: PBM reports done and the configured type",
-               (desc["status"], desc["type"]) == ("done", backup_type))
-        nodes = [replica["node"] for replica in desc["replsets"]]
+               (desc.get("status"), desc.get("type")) == ("done", backup_type))
+        nodes = [replica.get("node") for replica in desc.get("replsets", ())]
+        expect(f"{backup_type}: PBM reports the backup node", len(nodes) == 1 and bool(nodes[0]))
         if expected_node:
             expect(f"{backup_type}: backup taken on {expected_node}", nodes ==
                    [f"{expected_node}:27017"], str(nodes))
@@ -330,15 +353,20 @@ class ReplicaSet:
             self.exec(node, "test", "-d", f"{storage}/{name}/rs0"),
             f"{backup_type}: replica set directory is present",
         )
-        return name, node
+        return node
 
 
-def single_secondary(cluster, fixture):
-    mongo_version, pbm_version, storage_field = FIXTURES[fixture]
+def check_versions(cluster, fixture):
+    mongo_version, pbm_version, _ = FIXTURES[fixture]
     version = json_output(cluster.pbm("version", "--out", "json"), "pbm version exits 0")
     expect("pinned PBM version", version["Version"] == pbm_version, version["Version"])
     mongo = output(cluster.mongo(cluster.primary, "print(db.version())"), "read server version")
     expect("MongoDB fixture version", mongo.startswith(f"{mongo_version}."), mongo)
+
+
+def single_secondary(cluster, fixture):
+    _, pbm_version, storage_field = FIXTURES[fixture]
+    check_versions(cluster, fixture)
     nodes = cluster.wait_agents((cluster.secondary,))
     for node in nodes:
         if node["host"] != f"{cluster.secondary}:27017":
@@ -409,6 +437,10 @@ def restore(cluster, backup_type, fixture):
                      f"{LOCAL}/{name}.pbm.json", SHARED),
         f"{backup_type}: copy just the two backup entries to shared storage",
     )
+    restore_shared(cluster, backup_type, fixture, name)
+
+
+def restore_shared(cluster, backup_type, fixture, name):
     for node in cluster.nodes:
         output(cluster.exec(node, "test", "-r", f"{SHARED}/{name}.pbm.json"),
                f"{node}: metadata readable at the same shared path")
@@ -419,7 +451,7 @@ def restore(cluster, backup_type, fixture):
            f"{backup_type}: remove fixture data after backup")
     expect("there are no rows before restore",
            cluster.mongo(cluster.primary, f"{DATA}.countDocuments()").stdout.strip() == "0")
-    cluster.configure(SHARED)
+    cluster.configure(SHARED, wait=True)
     cluster.wait_agents(cluster.nodes)
     output(cluster.pbm("config", "--force-resync", "--wait"), "resync the copied storage")
     listing = output(cluster.pbm("list"), "list backups after resync")
@@ -445,7 +477,7 @@ def restore(cluster, backup_type, fixture):
         cluster.wait_members()
         for node in cluster.nodes:
             cluster.start_agent(node)
-        cluster.configure(SHARED)
+        cluster.configure(SHARED, wait=True)
         cluster.wait_agents(cluster.nodes)
         output(cluster.pbm("config", "--force-resync", "--wait"), "resync after physical restart")
     actual = json_output(cluster.mongo(
@@ -538,8 +570,7 @@ def run_case(docker, fixture, case):
                 pitr(cluster)
 
 
-def run_probes(fixture, case):
-    docker = docker_path()
+def checked_fixtures(docker, fixture):
     candidate = source_hash()
     for selected in FIXTURES if fixture == "all" else (fixture,):
         tag = image(selected)
@@ -551,17 +582,198 @@ def run_probes(fixture, case):
                 "Build it with --build-probe-images."
             )
         expect(f"{tag}: installed candidate provenance matches the checkout", True)
+        yield selected
+
+
+def run_probes(fixture, case):
+    docker = docker_path()
+    for selected in checked_fixtures(docker, fixture):
         for selected_case in (case,) if case else CASES:
             run_case(docker, selected, selected_case)
     print("PBM probe passed", flush=True)
 
 
 def archive_facts(path, storage, name):
-    return {}
+    """Compare the candidate's tar to PBM's files, on the node that holds both."""
+    # This function runs under the candidate's Python inside the replica-set container.
+    import hashlib
+    import tarfile
+    from pathlib import Path
+
+    path = Path(path)
+    storage = Path(storage)
+    tree = storage / name
+    source = {
+        file.relative_to(storage).as_posix(): file
+        for file in (storage / f"{name}.pbm.json", tree, *tree.rglob("*"))
+    }
+    types_match = True
+    different_files = []
+    with tarfile.open(path, "r:") as archive:
+        members = archive.getmembers()
+        names = {member.name for member in members}
+        names_match = names == source.keys() and len(names) == len(members)
+        for member in members:
+            file = source.get(member.name)
+            if file is None:
+                continue
+            if file.is_dir() and member.isdir() and not file.is_symlink():
+                continue
+            if not (file.is_file() and member.isfile() and not file.is_symlink()):
+                types_match = False
+                continue
+            with file.open("rb") as stored, archive.extractfile(member) as archived:
+                while chunk := stored.read(1024 * 1024):
+                    if archived.read(len(chunk)) != chunk:
+                        different_files.append(member.name)
+                        break
+                else:
+                    if archived.read(1):
+                        different_files.append(member.name)
+    with path.open("rb") as archive_file:
+        digest = hashlib.file_digest(archive_file, "sha256").hexdigest()
+    return {
+        "names_match": names_match, "types_match": types_match,
+        "different_files": different_files, "size": path.stat().st_size, "sha256": digest,
+    }
+
+
+def configure_job(cluster, backup_type):
+    config = (
+        f'[history]\ndatabase="{LEDGER}"\n'
+        f'[{JOB}]\ntype="pbm"\nbackup_type="{backup_type}"\n'
+        f'storage_path="{LOCAL}"\nout_dir="{UNITS}"\n'
+    )
+    output(
+        cluster.exec(cluster.secondary, "sh", "-c", f"cat > {JOB_CONFIG}", stdin=config),
+        f"{backup_type}: configure the installed bdbackup job on the secondary",
+    )
+
+
+def history_record(cluster):
+    rows = json_output(
+        cluster.exec(
+            cluster.secondary, PYTHON, "-c",
+            "import json, sqlite3, sys; "
+            "db = sqlite3.connect(f'file:{sys.argv[1]}?mode=ro', uri=True); "
+            "db.row_factory = sqlite3.Row; "
+            "print(json.dumps([dict(row) for row in db.execute("
+            "'SELECT * FROM backup_runs ORDER BY id')]))",
+            str(LEDGER),
+        ),
+        "read the installed wheel's persisted history",
+    )
+    expect("one run recorded in history", len(rows) == 1)
+    return rows[0]
+
+
+def backup_and_restore(cluster, backup_type, fixture):
+    result = cluster.cli("run", "-c", str(JOB_CONFIG), "-j", JOB, uri=URI)
+    stdout = output(result, f"{backup_type}: installed wheel backup exits 0")
+    row = history_record(cluster)
+    expect(f"{backup_type}: history records a successful PBM run",
+           (row["status"], row["job_name"], row["backup_type"]) ==
+           ("success", JOB, f"pbm-{backup_type}"))
+    info = json.loads(row["restore_info"])
+    name = info.get("name", "")
+    expect(f"{backup_type}: history records PBM's timestamp",
+           bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", name)))
+    expect(f"{backup_type}: history names the backup type and source secondary",
+           info == {
+               "kind": "pbm", "name": name, "backup_type": backup_type,
+               "replsets": [{"name": "rs0", "node": f"{cluster.secondary}:27017"}],
+           }, str(info))
+    cluster.confirm(name, backup_type, expected_node=cluster.secondary)
+    for node in (cluster.primary, cluster.other):
+        expect(f"{node}: source backup files exist only on the storage secondary",
+               cluster.exec(node, "test", "-e", LOCAL).returncode == 1)
+
+    path = str(UNITS / f"{JOB}-{name.replace(':', '')}.tar")
+    expect(f"{backup_type}: CLI prints the expected archive path", stdout == f"Job {JOB}: {path}")
+    expect(f"{backup_type}: history records that archive as the unit",
+           row["path"] == row["unit"] == path)
+    facts = json_output(
+        cluster.exec(
+            cluster.secondary, PYTHON, "-c",
+            inspect.getsource(archive_facts)
+            + "\nimport json, sys\nprint(json.dumps(archive_facts(*sys.argv[1:])))\n",
+            path, LOCAL, name, timeout=120,
+        ),
+        f"{backup_type}: compare the recorded tar with the source storage",
+    )
+    expect(f"{backup_type}: archive holds exactly PBM's metadata and data tree",
+           facts["names_match"])
+    expect(f"{backup_type}: archive file types match storage", facts["types_match"])
+    expect(f"{backup_type}: all archive files match storage byte for byte",
+           not facts["different_files"], str(facts["different_files"]))
+    expect(f"{backup_type}: history size and SHA-256 match the archive",
+           (row["size_bytes"], row["checksum"]) == (facts["size"], facts["sha256"]))
+
+    extracted = output(
+        cluster.cli("restore", "--archive", path, "--dst", SHARED),
+        f"{backup_type}: installed wheel extracts the exported tar into shared storage",
+    )
+    expect(f"{backup_type}: extracted unit prints the PBM restore steps",
+           f"To restore PBM {backup_type} backup {name}" in extracted
+           and "pbm config --force-resync --wait" in extracted
+           and "pbm list" in extracted and f"pbm restore {name}" in extracted, extracted)
+    restore_shared(cluster, backup_type, fixture, name)
+
+
+def rejected_backup(cluster, case):
+    if case == "backup-failed":
+        output(cluster.exec(cluster.secondary, "chmod", "0555", LOCAL),
+               "make the only backup storage unwritable")
+    result = cluster.cli("run", "-c", str(JOB_CONFIG), "-j", JOB, uri=URI)
+    diagnostic = detail(result)
+    expect(f"{case}: installed wheel exits 1", result.returncode == 1, diagnostic)
+    if case == "backup-failed":
+        expect("failed PBM backup shows its diagnostic",
+               bool(re.search(r"pbm backup failed: .+", diagnostic)), diagnostic)
+    else:
+        report = re.search(r"PBM took backup (\S+) on (\S+), but its files are not in ", diagnostic)
+        expect("missing files diagnostic names the backup and its actual node",
+               report is not None and report[2] == f"{cluster.other}:27017", diagnostic)
+        expect("local PBM storage stays absent on the bdbackup node",
+               cluster.exec(cluster.secondary, "test", "-e", LOCAL).returncode == 1)
+        cluster.confirm(report[1], "logical", expected_node=cluster.other)
+    expect(f"{case}: CLI prints no published path", not result.stdout.strip())
+    row = history_record(cluster)
+    expect(
+        f"{case}: history records failure with no artifact or checksum",
+        (row["status"], row["path"], row["unit"], row["checksum"]) == ("failed", None, None, None),
+    )
+    archives = json_output(
+        cluster.exec(
+            cluster.secondary, PYTHON, "-c",
+            "import json, sys; from pathlib import Path; "
+            "print(json.dumps(sorted(p.name for p in Path(sys.argv[1]).glob('*'))))",
+            str(UNITS),
+        ),
+        f"{case}: inspect the archive output directory",
+    )
+    expect(f"{case}: no archive or temporary file was published", not archives, str(archives))
+
+
+def run_integration_case(docker, fixture, case):
+    print(f"PBM fixture {fixture}, integration case {case}", flush=True)
+    cluster = ReplicaSet(docker, image(fixture))
+    writer = cluster.other if case == "missing-files" else cluster.secondary
+    with cluster.started(storage_node=writer):
+        check_versions(cluster, fixture)
+        configure_job(cluster, "physical" if case == "physical" else "logical")
+        if case in {"logical", "physical"}:
+            backup_and_restore(cluster, case, fixture)
+        else:
+            rejected_backup(cluster, case)
 
 
 def run_integration(fixture, case):
-    pass
+    docker = docker_path()
+    for selected in checked_fixtures(docker, fixture or "all"):
+        for selected_case in (case,) if case else INTEGRATION_CASES:
+            run_integration_case(docker, selected, selected_case)
+    print(SUCCESS, flush=True)
 
 
 def main(argv=None):
@@ -573,7 +785,7 @@ def main(argv=None):
     action.add_argument("--probe", choices=("all", *FIXTURES))
     action.add_argument("--source-hash", action="store_true")
     parser.add_argument("--case", choices=(*CASES, *INTEGRATION_CASES))
-    parser.add_argument("--fixture", choices=FIXTURES, help="build only this fixture image")
+    parser.add_argument("--fixture", choices=FIXTURES, help="build or run only this fixture")
     args = parser.parse_args(argv)
     if args.case and args.case not in (CASES if args.probe else INTEGRATION_CASES):
         parser.error("--case is not available in the selected mode")
