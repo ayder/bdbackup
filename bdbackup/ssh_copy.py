@@ -1,6 +1,9 @@
-"""Settings for copying a published backup to an SSH server."""
+"""SSH copy settings and subprocess commands."""
 
+import os
 import re
+import subprocess
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from ipaddress import IPv6Address
@@ -15,6 +18,14 @@ _AUTHORITY = re.compile(
     r"(?::(?P<port>[0-9]+))?"
 )
 _KEYS = {"destination", "method", "ssh_config", "bwlimit"}
+_SSH_OPTIONS = (
+    "-o", "BatchMode=yes",
+    "-o", "StrictHostKeyChecking=yes",
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=10",
+    "-o", "ServerAliveCountMax=3",
+)
+_SSH_STATUS_HELPER = Path(__file__).with_name("_ssh_status.sh")
 
 
 @dataclass(frozen=True)
@@ -31,6 +42,10 @@ class CopySettings:
 
 def safe_artifact_name(name: object) -> bool:
     return isinstance(name, str) and _SAFE_NAME.fullmatch(name) is not None
+
+
+def _safe_remote_path(path: str) -> bool:
+    return _SAFE_PATH.fullmatch(path) is not None and not {".", ".."}.intersection(path.split("/"))
 
 
 def _parse_authority(authority: str) -> tuple[str | None, str, str | None, int | None]:
@@ -66,7 +81,7 @@ def parse_copy_settings(
         raise ValueError("copy.destination must be an ssh:// URL")
     authority, slash, rest = destination.removeprefix("ssh://").partition("/")
     path = slash + rest
-    if _SAFE_PATH.fullmatch(path) is None or {".", ".."}.intersection(path.split("/")):
+    if not _safe_remote_path(path):
         raise ValueError("copy.destination needs an absolute, shell-safe path without . or ..")
     user, host, written_port, port = _parse_authority(authority)
     method = table.get("method")
@@ -89,18 +104,105 @@ def parse_copy_settings(
 
 
 class CopyCommandError(Exception):
+    """A fixed failure class and a separate operator diagnostic."""
+
     def __init__(self, failure_class: str, diagnostic: str | None):
         super().__init__(failure_class)
         self.failure_class = failure_class
         self.diagnostic = diagnostic
 
 
+def _execute(
+    argv: list[str], *, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(  # noqa: S603
+            argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            errors="replace", check=False, env=env,
+        )
+    except FileNotFoundError:
+        raise CopyCommandError("tool_missing", f"{argv[0]}: executable not found") from None
+    except OSError as exc:
+        raise CopyCommandError("other", f"{argv[0]}: {exc}") from None
+
+
+def _last_diagnostic(result: subprocess.CompletedProcess[str]) -> str | None:
+    lines = (result.stderr or "").strip().splitlines()
+    return lines[-1] if lines else None
+
+
+def _rsync_word(word: str) -> str:
+    # rsync parses -e itself. In its quoting syntax a doubled quote is a literal quote.
+    if any(char in word for char in " '\"\t\r\n"):
+        return "'" + word.replace("'", "''") + "'"
+    return word
+
+
 class SSHConnection:
+    """Use one endpoint and the same SSH options for commands and transfers."""
+
     def __init__(self, settings: CopySettings):
         self.settings = settings
 
+    def _options(self, port_option: str) -> list[str]:
+        options = list(_SSH_OPTIONS)
+        if self.settings.ssh_config is not None:
+            options.extend(("-F", str(self.settings.ssh_config)))
+        if self.settings.port is not None:
+            options.extend((port_option, str(self.settings.port)))
+        return options
+
     def run(self, command: str, *, failures: Mapping[int, str] | None = None) -> str:
-        return ""
+        """Run a fixed remote command. Reserve exit 255 for the SSH client."""
+        argv = ["ssh", *self._options("-p")]
+        if self.settings.user is not None:
+            argv.extend(("-l", self.settings.user))
+        argv.extend(("--", self.settings.host, command))
+        result = _execute(argv)
+        if result.returncode == 0:
+            return result.stdout
+        failure_class = (failures or {}).get(result.returncode, "other")
+        if result.returncode == 255:
+            failure_class = "connect"
+        raise CopyCommandError(failure_class, _last_diagnostic(result))
 
     def transfer(self, source: Path, remote_path: str) -> None:
-        pass
+        if not _safe_remote_path(remote_path):
+            raise ValueError("invalid SSH transfer remote path")
+        host = self.settings.host
+        if ":" in host:
+            host = f"[{host}]"
+        if self.settings.user is not None:
+            host = f"{self.settings.user}@{host}"
+        target = f"{host}:{remote_path}"
+        argv = self._transfer_args()
+        argv.extend(("--", str(source.absolute()), target))
+
+        # Both transfer tools can hide SSH's exit status. Keep it out of the data streams
+        # and separate from diagnostics so a refused key is classed without parsing prose.
+        with tempfile.TemporaryDirectory(prefix="bdbackup-ssh-") as directory:
+            status_path = Path(directory) / "status"
+            result = _execute(argv, env={**os.environ, "BDBACKUP_SSH_STATUS": str(status_path)})
+            if result.returncode == 0:
+                return
+            try:
+                status = status_path.read_text(encoding="ascii").strip()
+            except FileNotFoundError:
+                status = ""
+        failure_class = {"255": "connect", "missing": "tool_missing"}.get(status, "transfer")
+        raise CopyCommandError(failure_class, _last_diagnostic(result))
+
+    def _transfer_args(self) -> list[str]:
+        helper = str(_SSH_STATUS_HELPER)
+        bwlimit = self.settings.bwlimit
+        if self.settings.method == "scp":
+            argv = ["scp", "-S", helper, *self._options("-P")]
+            if bwlimit is not None:
+                argv.extend(("-l", str(bwlimit * 8)))
+            return argv
+        argv = ["rsync", "--timeout=30"]
+        if bwlimit is not None:
+            argv.append(f"--bwlimit={bwlimit}")
+        remote_shell = " ".join(_rsync_word(arg) for arg in (helper, *self._options("-p")))
+        argv.extend(("-e", remote_shell))
+        return argv
