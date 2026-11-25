@@ -163,6 +163,11 @@ def _handle_errors(func, *args, **kwargs) -> int:
     return code if isinstance(code, int) else EXIT_OK
 
 
+def _dry_copy(job: Job) -> None:
+    if job.copy is not None:
+        _echo(f"Dry run; configured copy: {job.copy.destination} ({job.copy.method})")
+
+
 def _dry_run(config: Config, job: Job, incremental: bool) -> None:
     """Report what a run of ``job`` would do; run no tool and write nothing."""
     backend = build_backend(job)
@@ -179,6 +184,7 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
         _echo(f"Dry run; would take a full backup under {backend.backup_root}")
     else:
         raise click.UsageError(f"--dry-run is not supported for job type {job.type!r}")
+    _dry_copy(job)
 
 
 @dataclass
@@ -328,7 +334,10 @@ def _run_pgbackrest_job(
     config: Config, job: Job, *, verify: bool, dry_run: bool, outcome: _Outcome
 ) -> int:
     code = _run_pgbackrest(config, job, verify=verify, dry_run=dry_run, outcome=outcome)
-    if code != EXIT_OK or dry_run or job.copy is None:
+    if dry_run:
+        _dry_copy(job)
+        return code
+    if code != EXIT_OK or job.copy is None:
         return code
 
     # The export lock is released. Keep its facts and report any copy-phase failure.
