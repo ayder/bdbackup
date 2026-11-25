@@ -16,12 +16,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = {"22.04": "legacy SCP", "24.04": "SFTP"}
+CASES = (
+    "rsync", "scp", "existing-name", "publish-race", "checksum", "unreachable",
+    "unknown-host", "refused-key", "session-stop", "session-stall", "killed-transfer",
+)
 COLLISIONS = ("existing file", "existing directory", "dangling symlink", "after precheck")
 # The Ubuntu sshd login sessions can retain these masks.
 UMASKS = (0o022, 0o077)
 SOURCE_MODES = (0o600, 0o640)
 PORT = 22222
 USER = "bdprobe"
+
+
+def source_hash(root=ROOT):
+    return ""
+
+
+def run_integration(case=None, ubuntu=None):
+    pass
 
 
 def expect(check, condition):
