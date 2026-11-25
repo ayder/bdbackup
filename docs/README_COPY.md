@@ -112,11 +112,12 @@ while a copy is in progress.
 
 ### Abandoned deliveries
 
-A run marks a delivery `abandoned (source_unavailable)` if it finds no local
-source with a matching recorded identity. For a GFS-managed backup, that
-includes a temporarily unreachable stage when no other recorded location
-matches. An abandoned delivery contributes exit 1 and is skipped on later
-runs. Recover the artifact for a manual copy or run a new backup.
+A run marks a delivery `abandoned (source_unavailable)` when GFS has deleted
+its unit or when a backup outside GFS is missing or its identity has changed.
+Later runs skip abandoned deliveries. If GFS still lists locations but none
+is readable with the recorded identity, the delivery is
+`failed (source_unavailable)` and a later run retries it. A read error for a
+backup outside GFS is also retryable. Both outcomes make the run exit 1.
 
 A killed run may leave a temporary name on the server. A copy that publishes
 but cannot remove its temporary name stays `copied` and logs a warning with
@@ -141,5 +142,5 @@ available. History stores the failure class.
 | `name_taken` | Investigate the existing final file before moving it aside. Retry once the destination can accept the recorded artifact. |
 | `transfer` | Read the tool diagnostic and check network stability, permissions and free space. Retry the job. |
 | `checksum_mismatch` | Check for a changed source or storage errors on the server. Retry after addressing the cause. |
-| `source_unavailable` | See [Abandoned deliveries](#abandoned-deliveries). |
+| `source_unavailable` | For a failed delivery, restore access to a recorded location and rerun the job. For an abandoned delivery, recover the artifact for a manual copy or run a new backup. See [Abandoned deliveries](#abandoned-deliveries). |
 | `other` | Read the last diagnostic and check server command compatibility, mode changes and hard-link support. |
