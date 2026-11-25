@@ -37,6 +37,8 @@ class ConfigError(Exception):
 # Keys removed in 0.7.0, by the job types that had them (None: every type).
 _REMOVED_KEYS = {"schedule": None, "apply": {"gfs"}, "jobs": {"mysqldump"}}
 _COPY_ENGINES = {"mysqldump": MySQLBackup, "pgbackrest": PgBackRest}
+_PBM_PATHS = ("storage_path", "out_dir")
+_PBM_KEYS = frozenset((*_PBM_PATHS, "backup_type", "binary", "mongodb_uri"))
 
 
 def supported_types() -> set[str]:
@@ -48,8 +50,8 @@ class Config:
     """Load and validate a TOML job configuration file.
 
     With ``lexical`` the paths of the shares (gfs stages, engine outputs, ``repo_path``,
-    ``out_dir`` and the restore roots) are normalised from their text and never resolved, so
-    loading makes no filesystem call on a share that may hang. ``bdbackup metrics`` reads its
+    ``storage_path``, ``out_dir`` and the restore roots) are normalised from their text without
+    filesystem access on a share that may hang. ``bdbackup metrics`` reads its
     configuration so; a path written through a link then stays as written. The configuration
     file itself and ``[history] database`` are local and always resolved.
     """
@@ -137,25 +139,28 @@ class Config:
                     raise ConfigError(f"Job {name!r}: restore_root requires a [history] section")
                 restore_root = self._resolve(self.path.parent / Path(value).expanduser())
             params = {k: v for k, v in section.items() if k not in {"type", "restore_root"}}
-            # Config paths are relative to the config file; file-template entries
-            # and excludes remain relative to the explicitly selected source path.
-            for key in (
-                "template_filename",
-                "backup_dst",
-                "chdir",
-                "out_dir",
-                "backup_root",
-                "encrypt_key_file",
-                "repo_path",
-                "config_file",
-            ):
-                if key in params:
-                    try:
-                        params[key] = self.path.parent / Path(params[key]).expanduser()
-                    except TypeError as exc:
-                        raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
-                    if self._resolve is lexical_path:
-                        params[key] = lexical_path(params[key])
+            if job_type == "pbm":
+                self._check_pbm_settings(name, params)
+            else:
+                # Config paths are relative to the config file; file-template entries
+                # and excludes remain relative to the explicitly selected source path.
+                for key in (
+                    "template_filename",
+                    "backup_dst",
+                    "chdir",
+                    "out_dir",
+                    "backup_root",
+                    "encrypt_key_file",
+                    "repo_path",
+                    "config_file",
+                ):
+                    if key in params:
+                        try:
+                            params[key] = self.path.parent / Path(params[key]).expanduser()
+                        except TypeError as exc:
+                            raise ConfigError(f"Job {name!r}: {key} must be a path string") from exc
+                        if self._resolve is lexical_path:
+                            params[key] = lexical_path(params[key])
             self.jobs[name] = Job(
                 name=name, type=job_type, params=params, restore_root=restore_root,
                 active=active, copy=copy,
@@ -167,6 +172,7 @@ class Config:
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
         self._check_pgbackrest()
+        self._check_pbm_layouts()
 
     def _load_copy(
         self, job_type: str, section: dict[str, Any],
@@ -265,6 +271,50 @@ class Config:
                     )
                 if any(path.is_relative_to(repo) for path in stage.paths):
                     raise ConfigError(f"Job {name!r}: a gfs stage path must be outside repo_path")
+
+    def _check_pbm_settings(self, name: str, params: dict[str, Any]) -> None:
+        if self.history is None:
+            raise ConfigError(f"Job {name!r}: pbm jobs require a [history] section")
+        if not safe_artifact_name(name):
+            raise ConfigError(f"Job {name!r}: pbm job name must be shell-safe")
+        unknown = params.keys() - _PBM_KEYS
+        if unknown:
+            raise ConfigError(f"Job {name!r}: unknown pbm key(s): {', '.join(sorted(unknown))}")
+        for key in _PBM_PATHS:
+            if key not in params:
+                raise ConfigError(f"Job {name!r}: {key} is required for pbm")
+            value = params[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"Job {name!r}: {key} must be a nonempty path string")
+            params[key] = self._resolve(self.path.parent / Path(value).expanduser())
+        if params.get("backup_type", "logical") not in ("logical", "physical"):
+            raise ConfigError(f"Job {name!r}: backup_type must be logical or physical")
+        for key in ("binary", "mongodb_uri"):
+            if key in params and (not isinstance(params[key], str) or not params[key].strip()):
+                raise ConfigError(f"Job {name!r}: {key} must be a nonempty string")
+
+    def _check_pbm_layouts(self) -> None:
+        stage_paths = [
+            ("gfs stage path", path)
+            for job in self.jobs.values() if job.type == "gfs"
+            for stage in job.params["stage"]
+            for path in stage.paths
+        ]
+        for name, job in self.jobs.items():
+            if job.type != "pbm":
+                continue
+            storage = job.params["storage_path"]
+            for key, path in (
+                ("out_dir", job.params["out_dir"]),
+                ("[history] database", self.history.database),
+                ("[history] restore_root", self.history.restore_root),
+                ("restore_root", job.restore_root),
+                *stage_paths,
+            ):
+                if path is not None and (
+                    path.is_relative_to(storage) or storage.is_relative_to(path)
+                ):
+                    raise ConfigError(f"Job {name!r}: {key} and storage_path must not overlap")
 
     def get(self, name: str) -> Job:
         if name not in self.jobs:
