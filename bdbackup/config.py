@@ -12,6 +12,7 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
 from bdbackup.metrics.settings import MetricsSettings, parse_metrics
+from bdbackup.mongodb.pbm import PBM
 from bdbackup.mysql.mysqldump import MySQLBackup
 from bdbackup.postgres.pgbackrest import PgBackRest
 from bdbackup.ssh_copy import CopySettings, parse_copy_settings, safe_artifact_name
@@ -36,7 +37,7 @@ class ConfigError(Exception):
 
 # Keys removed in 0.7.0, by the job types that had them (None: every type).
 _REMOVED_KEYS = {"schedule": None, "apply": {"gfs"}, "jobs": {"mysqldump"}}
-_COPY_ENGINES = {"mysqldump": MySQLBackup, "pgbackrest": PgBackRest}
+_COPY_ENGINES = {"mysqldump": MySQLBackup, "pgbackrest": PgBackRest, "pbm": PBM}
 _PBM_PATHS = ("storage_path", "out_dir")
 _PBM_KEYS = frozenset((*_PBM_PATHS, "backup_type", "binary", "mongodb_uri"))
 
@@ -182,7 +183,7 @@ class Config:
             or get_engine(job_type).backend is not _COPY_ENGINES[job_type]
         ):
             raise ValueError(
-                "copy is supported only by built-in file, mysqldump and pgbackrest jobs"
+                "copy is supported only by built-in file, mysqldump, pgbackrest and pbm jobs"
             )
         if self.history is None:
             raise ValueError("copy requires a [history] section")

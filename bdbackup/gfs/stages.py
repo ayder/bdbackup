@@ -140,6 +140,7 @@ def _engine_output(job: Job, resolve: Callable[[Path], Path] = real_path) -> Pat
         "mysqldump": "out_dir",
         "file": "backup_dst",
         "pgbackrest": "out_dir",
+        "pbm": "out_dir",
     }.get(job.type)
     value = job.params.get(key) if key else None
     return resolve(Path(value)) if value is not None else None
