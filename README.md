@@ -10,8 +10,9 @@ pgBackRest fulls, archives files and directories as tar, tar.gz or tar.zst, and
 rotates the results across storage stages with GFS (grandfather-father-son)
 retention. Every backup is verified before it is
 published and recorded with a SHA-256 checksum in an SQLite backup history, from
-which a guided restore prepares a recovery copy. Jobs live in one TOML file and
-run from cron.
+which a guided restore prepares a recovery copy. File, mysqldump and pgbackrest
+jobs can also send their published archives to an SSH server with rsync or scp.
+Jobs live in one TOML file and run from cron.
 
 ## Features
 
@@ -30,7 +31,8 @@ run from cron.
 - [Backup history and guided restore](#backup-history-and-guided-restore) with
   SHA-256 checksums in SQLite.
 - [Configuration validation](#validate-configuration-and-permissions) of
-  settings, filesystem permissions and MySQL grants, without running a backup.
+  settings, filesystem permissions, MySQL grants and SSH copy readiness,
+  without running a backup.
 - [Prometheus metrics](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md): a read-only
   `bdbackup metrics` writes a textfile for node_exporter and PMM with the last run of each
   pgbackrest and gfs job, the history, the GFS stages, the destinations and the pgBackRest
@@ -46,6 +48,7 @@ run from cron.
 | [MySQL and MariaDB physical backups with Percona XtraBackup and MariaDB Backup](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) | xtrabackup jobs, full and incremental backups, encryption, preparing a recovery copy, engine pruning |
 | [PostgreSQL pgBackRest backups: nightly fulls exported to a GFS stage](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md) | pgbackrest jobs, taking fulls with archive-copy, the first stage, no new full and `max_full_age_hours`, restore and the printed pgBackRest command, the repository host lost, known limits |
 | [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, the `verify` key, preparing stage directories, safety rules and renames, final name exists, drift, run and step logs, ledger copies, known limits |
+| [Copy published backups to an SSH server](https://github.com/ayder/bdbackup/blob/master/docs/README_COPY.md) | per-job configuration, rsync and scp, server setup, verified publication, retries and failure remedies |
 | [Prometheus metrics: `bdbackup metrics`](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md) | the metrics command and `[metrics]`, the textfile for node_exporter and PMM, every metric (coverage and drift of the GFS stages included), alerting, hangs and outages, known limits |
 | [Custom backup engines (plugins)](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md) | the engine registry, writing your own engine and its metrics collector |
 | [Running xtrabackup jobs with systemd timers](https://github.com/ayder/bdbackup/blob/master/docs/README_SYSTEMD.md) | service and timer templates, the mysql account, schedules, CPU, I/O and memory limits |
@@ -122,9 +125,9 @@ The CLI uses these exit codes:
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | Backup/verify failure (including a job whose backend rejects its settings in a real run, except a pgbackrest job: exit 2), or validation checks failed/incomplete; for `metrics`, the file was written with an error series or could not be written |
+| 1 | Backup, verification, or SSH copy failure, or failed or incomplete validation. A backend rejecting its settings in a real run also exits 1, except pgbackrest reports a usage error. For `metrics`, the file was written with an error series or could not be written. |
 | 2 | Usage error, an inactive job, or a configuration error found when the config loads or by `--dry-run` |
-| 3 | Lock held; for GFS, another run of the job is in progress or only deferred work remains; for `metrics`, another metrics run holds its lock |
+| 3 | Lock held, including another run holding the job's SSH copy lock. For GFS, another run is in progress or only deferred work remains. For `metrics`, another metrics run holds its lock. |
 
 ## Config-driven jobs
 

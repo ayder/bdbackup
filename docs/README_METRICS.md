@@ -174,7 +174,7 @@ The result words:
 
 | Job type | `result` |
 |----------|----------|
-| `pgbackrest` | `exported`, `no_new_full`, `full_too_old`, `locked`, `destination_not_ready`, `export_failed`, `verify_failed`, `failed` |
+| `pgbackrest` | `exported`, `no_new_full`, `full_too_old`, `locked`, `destination_not_ready`, `export_failed`, `verify_failed`, `copy_failed` (exit 1 after a successful export phase), `copy_deferred` (exit 3, copy lock busy), `failed` |
 | `gfs` | `completed` (exit 0), `failed` (exit 1: a failure or refusal), `deferred` (exit 3, deferred work only), `locked` (exit 3, another run of the job is in progress), `error` (the run raised) |
 
 ### History units

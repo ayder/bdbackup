@@ -20,7 +20,7 @@
 # lines (see the README, "Scheduling with cron"); xtrabackup jobs can use systemd
 # timers instead (docs/README_SYSTEMD.md). --validate checks settings/access/grants
 # without backups.
-# Other keys (except type, active and restore_root) are passed to the backend
+# Other keys (except type, active, restore_root and the copy table) are passed to the backend
 # constructor (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup /
 # bdbackup.postgres.PgBackRest), so key names use Python-style underscores
 # (e.g. exclude_templates).
@@ -119,6 +119,17 @@ exclude_pattern = ["*.log", "node_modules"]
 #    matters for cron/systemd jobs. Gitignore syntax: trailing "/" matches
 #    directories only, a leading "/" anchors to the chdir root, "!" negates.
 exclude_templates = ["python-dev"]
+
+# Optional SSH copy for this job. Keep [history] and enable timestamp above.
+# [files-daily.copy]
+# Existing dedicated directory on the SSH server, with an absolute path.
+# destination = "ssh://backup@vault.example.com/srv/bdbackup/files-daily"
+# Transfer tool: "rsync" or "scp" (required when using copy).
+# method = "rsync"
+# Optional OpenSSH client configuration passed as -F; relative to this TOML file.
+# ssh_config = "backup-ssh.conf"
+# Optional transfer rate in KiB/s as a positive whole number.
+# bwlimit = 20000
 
 # ---------------------------------------------------------------------------
 # mysqldump: logical dump of one database (`database`), or of all databases

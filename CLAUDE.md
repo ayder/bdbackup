@@ -25,6 +25,7 @@ updates the baselines there before calling it.
 | `docs/README_METRICS.md` | The metrics command, `[metrics]`, the catalogue of metrics, PMM and node_exporter setup, alerting, hangs and outages, and the limits. |
 | `docs/README_ENGINES.md` | The engine registry and custom engine plugins. |
 | `docs/README_GFS.md` | The ledger and GFS rotation, including `--initialize-structure`. |
+| `docs/README_COPY.md` | Per-job SSH copies, configuration, server setup, checksum verification, publication, retry, and failure remedies. |
 | `config.toml.example` | Every config key with a comment. |
 
 Search tool for documentation sweeps: `rg` (ripgrep), over `README.md`, `docs/`,

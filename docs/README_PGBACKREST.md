@@ -54,6 +54,20 @@ pgBackRest itself refuses every command except `restore` as root by default. The
 refuses root too:
 `pgbackrest jobs do not run as root; run as the OS user that owns the repository`.
 
+## Copy the export to an SSH server
+
+Add a `copy` table to send each published tar after its local export.
+For the worked example's `pg-main` job, use:
+
+```toml
+[pg-main.copy]
+destination = "ssh://backup@vault.example.com/srv/bdbackup/pg-main"
+method = "rsync"
+```
+
+The copy phase runs after the export lock is released. For server setup,
+verification and retries, see the [SSH copy guide](README_COPY.md).
+
 ## Take the fulls with archive-copy
 
 The tar restores without the WAL archive only if the full holds the WAL it needs. That is
@@ -226,7 +240,7 @@ pgbackrest binary is not executable: /usr/local/bin/pgbackrest (check its permis
 ## Run outcome and metrics
 
 Every run that is not a dry run records its outcome in the `last_runs` table of the history
-database (schema 6), one row per job, whether or not it wrote a backup record. The row holds
+database, one row per job, whether or not it wrote a backup record. The row holds
 the end of the run, its exit code and one of these results:
 
 | Result | Meaning |
@@ -238,10 +252,13 @@ the end of the run, its exit code and one of these results:
 | `destination_not_ready` | The first stage's marker is missing. |
 | `export_failed` | Writing or publishing the tar failed. |
 | `verify_failed` | The read-back of the tar failed. |
+| `copy_failed` | An SSH copy failed or was abandoned after a successful export phase (exit 1). |
+| `copy_deferred` | Another run holds the SSH copy lock after a successful export phase (exit 3). |
 | `failed` | Anything else: a failed `pgbackrest` command, a refusal (an encrypted repository, no full, a full without archive-copy) or a usage error. |
 
-An `exported` run also keeps the time of the write and of the read-back, the label, the size
-and the age of the full; the other results leave that part as the last export wrote it. A run
+A new export records the time of the write and of the read-back, the label, the size and
+the age of the full, even if its copy fails or is deferred. Runs without a new export keep
+the previous export's facts. A run
 refused for root records nothing, so it never leaves a history database owned by root.
 
 `bdbackup metrics` reads this table and `pgbackrest info` to write the Prometheus metrics of
@@ -251,16 +268,18 @@ every night exits 0, so alert on the age of the last export as well.
 
 ## When there is no new full
 
-If this job already exported the newest full, a run writes no history row and prints the
-label and the age of that full, then exits 0:
+If this job already exported the newest full, the export phase prints the
+label and age of that full and succeeds:
 
 ```
 no new full: newest 20261109-010203F, 2 hours old
 ```
 
 No backup record is written for such a run (its outcome is recorded, see
-[Run outcome and metrics](#run-outcome-and-metrics)). A nightly export that finds no new full
-every night would therefore look healthy, so set `max_full_age_hours`. When the newest full is more
+[Run outcome and metrics](#run-outcome-and-metrics)). If the job has SSH copying
+configured, it then retries pending and failed deliveries. The copy phase can
+change the run's exit code. A nightly export that finds no new full every night
+would otherwise look healthy, so set `max_full_age_hours`. When the newest full is more
 than that many hours old, the same message gets a suffix and the run exits 1 instead:
 
 ```

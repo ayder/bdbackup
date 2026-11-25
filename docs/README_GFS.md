@@ -255,6 +255,11 @@ A [pgbackrest job](README_PGBACKREST.md) deletes and overwrites nothing on its o
 apart from its own temporary files (each tar's name carries its backup label), so it needs
 no such setting.
 
+An eligible job feeding the first stage can also send its published artifact to
+an SSH server. GFS does not wait for the SSH copy. If GFS moved the artifact
+before the copy starts, bdbackup looks for the first recorded location with a
+matching identity. See the [SSH copy guide](README_COPY.md).
+
 ## A first stage fed by a pgbackrest job
 
 A `pgbackrest` job writes its tars into the first stage of a GFS job: its
