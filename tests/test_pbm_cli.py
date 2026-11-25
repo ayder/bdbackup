@@ -335,3 +335,68 @@ def test_pbm_out_dir_in_a_later_gfs_stage_is_a_configuration_error(site):
     assert "Job 'mongo-main' writes into stage path" in result.output
     assert "engines write only into the first stage" in result.output
     assert not site.calls
+
+
+@pytest.mark.parametrize("kind", ["logical", "physical"])
+@pytest.mark.parametrize("mode", ["history", "archive"])
+def test_pbm_restore_extracts_the_unit_and_prints_the_operator_steps(site, kind, mode):
+    site.backup_type = kind
+    site.write()
+    metadata = site.storage / f"{NAME}.pbm.json"
+    metadata.write_text(json.dumps({"name": NAME, "type": kind, "status": "done"}))
+    run = site.run()
+    assert run.exit_code == 0, run.output
+    record, = site.history.records()
+    listing = invoke("history", "-c", site.config, "--job", site.job)
+    assert listing.exit_code == 0, listing.output
+    assert f"{record.id}: {site.job} | pbm-{kind} |" in listing.stdout
+    assert " | success | available | " in listing.stdout
+
+    destination = site.root / "restored"
+    if mode == "history":
+        args = ("-c", site.config, "--backup-id", record.id, "--yes")
+    else:
+        renamed = site.root / "unrelated-filename.tar"
+        site.unit().rename(renamed)
+        args = ("--archive", renamed)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("recovering a PBM archive must not run a command")
+
+    site.monkeypatch.setattr(subprocess, "run", unexpected)
+    result = invoke("restore", *args, "--dst", destination)
+    assert result.exit_code == 0, result.output
+    assert {p.name for p in destination.iterdir()} == {NAME, metadata.name}
+    for file in site.storage.rglob("*"):
+        if file.is_file():
+            assert (destination / file.relative_to(site.storage)).read_bytes() == file.read_bytes()
+    lines = result.stdout.splitlines()
+    assert f"To restore PBM {kind} backup {NAME}, follow these steps." in lines
+    steps = [line for line in lines if line[:3] in {"1. ", "2. ", "3. ", "4. "}]
+    assert [line[:3] for line in steps] == ["1. ", "2. ", "3. ", "4. "]
+    assert f"{NAME}.pbm.json" in steps[0] and f"{NAME}/" in steps[0]
+    assert "same path on every node" in steps[0]
+    assert "configured to use it" in steps[0]
+    assert "The restore fails until every node can read both entries." in result.stdout
+    commands = [line.strip() for line in lines if line.strip().startswith("pbm ")]
+    assert commands == [
+        "pbm config --force-resync --wait", "pbm list", f"pbm restore {NAME}",
+    ]
+    assert NAME in steps[2]
+    if kind == "physical":
+        assert "Restart mongod and the PBM agents on every node" in result.stdout
+    else:
+        assert "Restart mongod" not in result.stdout
+
+
+def test_restore_archive_leaves_a_mismatched_pbm_like_archive_as_plain_tar(site):
+    (site.storage / f"{NAME}.pbm.json").write_text(
+        json.dumps({"name": NEXT, "type": "logical", "status": "done"}),
+    )
+    backup = site.run()
+    assert backup.exit_code == 0, backup.output
+    destination = site.root / "plain"
+    result = invoke("restore", "--archive", site.unit(), "--dst", destination)
+    assert result.exit_code == 0, result.output
+    assert (destination / f"{NAME}.pbm.json").is_file()
+    assert "pbm restore" not in result.stdout
