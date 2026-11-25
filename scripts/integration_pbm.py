@@ -38,6 +38,8 @@ FIXTURES = {
 CASES = (
     "single-secondary", "local-layouts", "restore-logical", "restore-physical", "modes", "pitr",
 )
+INTEGRATION_CASES = ("logical", "physical", "backup-failed", "missing-files")
+SUCCESS = "Real PBM backup export and restore passed"
 LOCAL = "/pbm-local"
 SHARED = "/pbm-shared"
 WORK = Path("/var/tmp/bdbackup-pbm")  # noqa: S108
@@ -554,27 +556,39 @@ def run_probes(fixture, case):
     print("PBM probe passed", flush=True)
 
 
+def archive_facts(path, storage, name):
+    return {}
+
+
+def run_integration(fixture, case):
+    pass
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    action = parser.add_mutually_exclusive_group(required=True)
+    action = parser.add_mutually_exclusive_group()
     action.add_argument("--build-probe-images", action="store_true")
     action.add_argument("--probe", choices=("all", *FIXTURES))
     action.add_argument("--source-hash", action="store_true")
-    parser.add_argument("--case", choices=CASES)
+    parser.add_argument("--case", choices=(*CASES, *INTEGRATION_CASES))
     parser.add_argument("--fixture", choices=FIXTURES, help="build only this fixture image")
     args = parser.parse_args(argv)
-    if args.case and not args.probe:
-        parser.error("--case requires --probe")
-    if args.fixture and not args.build_probe_images:
-        parser.error("--fixture requires --build-probe-images")
+    if args.case and args.case not in (CASES if args.probe else INTEGRATION_CASES):
+        parser.error("--case is not available in the selected mode")
+    if args.case and (args.build_probe_images or args.source_hash):
+        parser.error("--case applies only to a probe or integration run")
+    if args.fixture and (args.probe or args.source_hash):
+        parser.error("--fixture applies only to a build or integration run")
     if args.probe:
         run_probes(args.probe, args.case)
     elif args.build_probe_images:
         build_probe_images((args.fixture,) if args.fixture else FIXTURES)
-    else:
+    elif args.source_hash:
         print(source_hash())
+    else:
+        run_integration(args.fixture, args.case)
 
 
 if __name__ == "__main__":
