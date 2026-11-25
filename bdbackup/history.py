@@ -11,9 +11,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from stat import S_ISREG
+from typing import TYPE_CHECKING
 
 from bdbackup.backends import BackupError, BackupResult
 from bdbackup.ledger import LedgerError, checksum, unit_path
+
+if TYPE_CHECKING:
+    from bdbackup.ssh_copy import CopySettings
 
 
 class HistoryError(BackupError):
@@ -85,6 +89,20 @@ class LastRun:
     exit_code: int
     result: str
     facts: dict | None = None
+
+
+@dataclass(frozen=True)
+class Delivery:
+    record_id: int
+    job_name: str
+    destination: str
+    method: str
+    status: str
+    failure_class: str | None
+    attempt_count: int
+    bytes_sent: int | None
+    started_at: str | None
+    ended_at: str | None
 
 
 class History:
@@ -250,6 +268,7 @@ class History:
         restore_info: dict[str, str] | None = None,
         *,
         encrypted: bool = False,
+        copy: CopySettings | None = None,
     ) -> BackupResult:
         with self._connect(create=True) as db:
             cursor = db.execute(
@@ -284,6 +303,20 @@ class History:
                  json.dumps(restore_info or {}), str(unit), digest, run_id),
             )
         return result
+
+    def deliveries(
+        self, *, job: str | None = None, destination: str | None = None, uncopied: bool = False,
+    ) -> list[Delivery]:
+        return []
+
+    def start_delivery_attempt(self, record_id: int, method: str, started_at: datetime) -> int:
+        return 0
+
+    def finish_delivery_attempt(
+        self, record_id: int, attempt: int, status: str, ended_at: datetime, *,
+        failure_class: str | None = None, bytes_sent: int | None = None,
+    ) -> None:
+        pass
 
     def record_checksums(self, job: str | None = None) -> list[tuple[int, str]]:
         """Record unit and checksum for successful records that have none, oldest first.

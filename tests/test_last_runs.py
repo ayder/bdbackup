@@ -34,6 +34,7 @@ def make_schema_5(history: History, tmp_path) -> None:
     """A database as 0.7.2 leaves it: one record, schema 5 and no ``last_runs`` table."""
     add_record(history, tmp_path)
     with closing(sqlite3.connect(history.settings.database)) as db, db:
+        db.execute("DROP TABLE IF EXISTS deliveries")
         db.execute("DROP TABLE IF EXISTS last_runs")
         db.execute("PRAGMA user_version = 5")
 
@@ -54,18 +55,18 @@ def tables(history: History) -> set[str]:
         return {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def test_a_new_database_is_schema_6_with_the_last_runs_table(tmp_path):
+def test_a_new_database_is_schema_7_with_the_last_runs_table(tmp_path):
     history = make_history(tmp_path)
 
     add_record(history, tmp_path)
 
-    assert user_version(history) == 6
+    assert user_version(history) == 7
     with closing(sqlite3.connect(history.settings.database)) as db:
         assert [r[1] for r in db.execute("PRAGMA table_info(last_runs)")] == COLUMNS
         assert db.execute("SELECT count(*) FROM last_runs").fetchone()[0] == 0
 
 
-def test_a_schema_5_database_migrates_to_6_on_the_first_write(tmp_path):
+def test_a_schema_5_database_migrates_and_gets_last_runs_on_the_first_write(tmp_path):
     history = make_history(tmp_path)
     make_schema_5(history, tmp_path)
     assert user_version(history) == 5
@@ -73,7 +74,7 @@ def test_a_schema_5_database_migrates_to_6_on_the_first_write(tmp_path):
 
     history.record_last_run("pg", "pgbackrest", 0, "exported")
 
-    assert user_version(history) == 6
+    assert user_version(history) == 7
     assert "last_runs" in tables(history)
     assert [r.job_name for r in history.records()] == ["job"]  # what was there is kept
     assert set(history.last_runs()) == {"pg"}
