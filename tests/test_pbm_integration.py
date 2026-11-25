@@ -1,8 +1,10 @@
 """Host-side witnesses for the PBM probe with Docker calls replaced."""
 
 import hashlib
+import json
 import subprocess
 import tarfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -138,3 +140,152 @@ def test_integration_checks_the_exact_archive_members_and_bytes(tmp_path, differ
     assert facts["different_files"] == ([f"{name}/data"] if difference == "bytes" else [])
     assert facts["size"] == archive.stat().st_size
     assert facts["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+RESTORE_NAME = "2026-11-25T12:14:37.708524218Z"
+BACKUP_NAME = "2026-11-25T12:14:06Z"
+
+
+class RestoreFixture:
+    nodes = ("primary", "secondary", "peer")
+    primary = nodes[0]
+
+    def __init__(self):
+        self.calls = []
+        self.elapsed = 0
+        self.restart = False
+        self.listed = 0
+        self.kind = "physical"
+        self.pure_json = False
+
+    def exec(self, *args):
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def mongo(self, node, js):
+        self.calls.append(("mongo", node))
+        data = "0" if "countDocuments" in js else json.dumps(harness.ROWS)
+        return subprocess.CompletedProcess((node, js), 0, data, "")
+
+    def configure(self, storage, *, wait=False):
+        self.calls.append(("configure", storage, wait))
+
+    def wait_agents(self, nodes):
+        assert nodes == self.nodes
+
+    def pbm(self, *args, **kwargs):
+        self.calls.append(args)
+        text = ""
+        stderr = ""
+        status = 0
+        if args[0] == "restore":
+            if self.elapsed < 23 and "--yes" in args and self.kind == "physical":
+                status = 1
+                stderr = "Error: operation staled, last heartbeat: 0\n"
+            elif "--out" in args and args[args.index("--out") + 1] == "json":
+                payload = json.dumps({"name": RESTORE_NAME})
+                text = payload if self.pure_json else f"Started restore.\nWaiting...{payload}\n"
+            else:
+                text = (f"Waiting to finish......Restore finished! Check pbm describe-restore "
+                        f"{RESTORE_NAME}\n")
+        elif args[0] == "describe-restore":
+            assert args[1] == RESTORE_NAME
+            text = '{"status":"done"}'
+        elif args[0] == "status":
+            running = {"type": "resync"} if self.elapsed < 3 else {}
+            text = json.dumps({"running": running, "pitr": {"conf": False, "run": False}})
+        elif args == ("list",):
+            if self.restart:
+                self.listed += 1
+            text = BACKUP_NAME if not self.restart or self.listed > 1 else ""
+        return subprocess.CompletedProcess(args, status, text, stderr)
+
+    def stop_agent(self, node):
+        self.calls.append(("stop-agent", node))
+
+    def start_mongod(self, node):
+        self.restart = True
+        self.calls.append(("start-mongod", node))
+
+    def wait_members(self):
+        self.calls.append(("ready",))
+
+    def start_agent(self, node):
+        self.calls.append(("start-agent", node))
+
+
+@pytest.fixture
+def restore_fixture(monkeypatch):
+    fixture = RestoreFixture()
+
+    def sleep(seconds):
+        fixture.elapsed += seconds
+
+    monkeypatch.setattr(harness, "time", SimpleNamespace(monotonic=lambda: fixture.elapsed,
+                                                        sleep=sleep))
+    return fixture
+
+
+@pytest.mark.parametrize(("fixture", "kind"), [
+    ("mongo6-pbm210", "logical"),
+    ("mongo7-pbm217", "logical"),
+    ("mongo6-pbm210", "physical"),
+    ("mongo7-pbm217", "physical"),
+])
+def test_restore_reads_the_text_completion_and_resyncs_after_physical_restart(
+    restore_fixture, fixture, kind, capsys,
+):
+    cluster = restore_fixture
+    cluster.kind = kind
+    harness.restore_shared(cluster, kind, fixture, BACKUP_NAME)
+    restores = [args for args in cluster.calls if args[0] == "restore"]
+    flags = ("--yes",) if fixture == "mongo7-pbm217" else ()
+    assert restores == [
+        ("restore", BACKUP_NAME, *flags, "--wait", "--out", "text"),
+    ], "restore must use the text completion form"
+    text = capsys.readouterr().out
+    assert f"PASS: {kind}: restored rows match every original row" in text
+    if kind == "physical":
+        assert [args for args in cluster.calls if args[0] == "start-mongod"] == [
+            ("start-mongod", node) for node in cluster.nodes
+        ]
+        assert [args for args in cluster.calls if args[0] == "start-agent"] == [
+            ("start-agent", node) for node in cluster.nodes
+        ]
+        assert [args for args in cluster.calls if args[:2] == ("config", "--force-resync")] == [
+            ("config", "--force-resync", "--wait"), ("config", "--force-resync"),
+        ]
+        assert cluster.listed == 2
+        if fixture == "mongo7-pbm217":
+            assert cluster.elapsed >= 23
+            assert any(args[:3] == ("status", "--sections", "running") for args in cluster.calls)
+    else:
+        assert not cluster.restart
+
+
+def test_physical_restart_requests_resync_without_the_hanging_wait_flag(restore_fixture):
+    cluster = restore_fixture
+    cluster.pure_json = True  # Bypass the old restore-output bug to check the next command.
+    harness.restore_shared(cluster, "physical", "mongo6-pbm210", BACKUP_NAME)
+    resyncs = [args for args in cluster.calls if args[:2] == ("config", "--force-resync")]
+    assert resyncs[-1] == ("config", "--force-resync"), (
+        "PBM 2.10 must resync without --wait after restart"
+    )
+    assert cluster.listed == 2, "wait until PBM lists the backup again"
+
+
+def test_fixture_uses_an_init_process_and_removes_volumes_on_failure(monkeypatch):
+    cluster = harness.ReplicaSet("/fixture/docker", "test")
+    calls = []
+
+    def command(*args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, int(args[0] == "run"), "", "")
+
+    monkeypatch.setattr(cluster, "command", command)
+    with pytest.raises(AssertionError, match="start isolated container failed"), cluster.started():
+        pytest.fail("the simulated container launch should fail")
+    attempt, = (args for args in calls if args[0] == "run")
+    assert "--init" in attempt, "the container init process must reap mongod after restore"
+    assert ("rm", "--force", "--volumes", cluster.primary) in calls
+    assert ("volume", "rm", cluster.volume) in calls
+    assert ("network", "rm", cluster.network) in calls

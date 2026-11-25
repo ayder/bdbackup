@@ -379,9 +379,14 @@ def test_pbm_restore_extracts_the_unit_and_prints_the_operator_steps(site, kind,
     assert "configured to use it" in steps[0]
     assert "The restore fails until every node can read both entries." in result.stdout
     commands = [line.strip() for line in lines if line.strip().startswith("pbm ")]
-    assert commands == [
+    expected_commands = [
         "pbm config --force-resync --wait", "pbm list", f"pbm restore {NAME}",
     ]
+    if kind == "physical":
+        expected_commands.append("pbm config --force-resync")
+    assert commands == expected_commands
+    assert ('If pbm restore answers "operation staled" just after resync, '
+            'wait a few seconds and run it again.') in result.stdout
     assert NAME in steps[2]
     if kind == "physical":
         assert "Restart mongod and the PBM agents on every node" in result.stdout
