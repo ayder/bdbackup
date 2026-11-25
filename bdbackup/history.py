@@ -355,6 +355,12 @@ class History:
             ).fetchall()
         return [Delivery(**dict(row)) for row in rows]
 
+    def next_uncopied(
+        self, job: str, destination: str, attempted: set[int], *,
+        db: sqlite3.Connection | None = None,
+    ) -> int | None:
+        return None
+
     def start_delivery_attempt(self, record_id: int, method: str, started_at: datetime) -> int:
         """Record the method and start time while keeping the delivery eligible for retry."""
         with self._connect(create=True) as db:
