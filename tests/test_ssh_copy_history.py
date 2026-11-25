@@ -1,12 +1,17 @@
 """Schema 7 and SSH delivery recording at the history transaction boundary."""
 
 import sqlite3
+import subprocess
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from bdbackup.backends import BackupError, BackupResult
+from bdbackup.cli import main
+from bdbackup.gfs import store
 from bdbackup.history import Delivery, History, HistoryError, HistorySettings
 from bdbackup.ssh_copy import CopySettings
 
@@ -233,3 +238,107 @@ def test_old_attempt_cannot_overwrite_the_newer_attempt(history, artifact):
 def test_no_database_read_creates_nothing(history):
     assert history.deliveries() == []
     assert not history.settings.database.parent.exists()
+
+
+@pytest.fixture
+def list_history(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text('[history]\ndatabase="state/history.db"\n')
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("history started an external process")
+
+    monkeypatch.setattr(subprocess, "run", unexpected)
+
+    def invoke(*args):
+        result = CliRunner().invoke(main, ["history", "-c", str(config), *args])
+        assert result.exit_code == 0, result.output
+        return {int(line.split(":", 1)[0]): line for line in result.stdout.splitlines()}
+
+    return invoke
+
+
+def display_delivery(history, artifact, status, *, job="file-job"):
+    record = add(history, artifact, job=job)
+    if status == "pending":
+        return record
+    attempt = history.start_delivery_attempt(record, "scp", NOW)
+    failure_class = {"abandoned": "source_unavailable", "failed": "connect"}.get(status)
+    history.finish_delivery_attempt(
+        record, attempt, status, NOW, failure_class=failure_class,
+        bytes_sent=7 if status == "copied" else None,
+    )
+    return record
+
+
+def test_history_shows_exact_copy_suffixes_on_mixed_records(history, artifact, list_history):
+    plain = add(history, artifact, copy=None)
+    before = list_history()[plain]
+    suffixes = {
+        display_delivery(history, artifact, "pending"): " | copy pending",
+        display_delivery(history, artifact, "copied"): " | copy copied",
+        display_delivery(history, artifact, "failed"): " | copy failed (connect)",
+        display_delivery(history, artifact, "abandoned"): " | copy abandoned (source_unavailable)",
+    }
+    snapshot = history.settings.database.read_bytes()
+
+    lines = list_history()
+
+    assert lines[plain] == before
+    assert set(lines) == {plain, *suffixes}
+    for record, suffix in suffixes.items():
+        assert lines[record].endswith(suffix), f"wrong copy suffix for {lines[record]}"
+        assert lines[record].count(" | copy ") == 1
+        assert len(lines[record].split(" | ")) == len(before.split(" | ")) + 1
+        assert DEST not in lines[record]
+    assert history.settings.database.read_bytes() == snapshot
+
+
+def test_history_filters_still_treat_a_failed_copy_as_a_successful_backup(
+    history, artifact, list_history,
+):
+    copied = display_delivery(history, artifact, "failed")
+    other = display_delivery(history, artifact, "pending", job="other-job")
+
+    def fail():
+        raise BackupError("synthetic backup failure")
+
+    with pytest.raises(BackupError):
+        history.run("file-job", "file", fail, copy=SETTINGS)
+    failed = history.records(job="file-job")[0].id
+
+    assert set(list_history("--job", "file-job")) == {copied, failed}
+    assert set(list_history("--successful")) == {copied, other}
+    selected = list_history("--job", "file-job", "--successful")
+    assert list(selected) == [copied]
+    assert " | success | " in selected[copied]
+    assert selected[copied].endswith(" | copy failed (connect)")
+    assert " | copy " not in list_history()[failed]
+
+
+def test_history_copy_suffix_follows_the_existing_gfs_suffix(history, artifact, list_history):
+    record_id = display_delivery(history, artifact, "pending")
+    source = Path(history.get(record_id).path)
+    units, _, seen = store.load(history, source.parent)
+    unit, = units
+    store.record_unit(history, unit)
+    store.record_members(history, seen)
+
+    line = list_history()[record_id]
+
+    assert line.endswith(
+        f" | stage {source.parent} | locations {source} | copy pending"
+    )
+
+
+def test_history_reads_schema_six_without_migrating_or_adding_a_copy_suffix(
+    history, artifact, list_history,
+):
+    schema_six(history, artifact)
+    before = history.settings.database.read_bytes()
+
+    line, = list_history().values()
+
+    assert " | copy " not in line
+    assert " | stage /gfs/first | locations /gfs/first/a.tar" in line
+    assert history.settings.database.read_bytes() == before
