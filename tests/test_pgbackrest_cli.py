@@ -598,6 +598,36 @@ def test_no_new_full_can_enable_copy_on_schema_six_without_attempting_ssh(tmp_pa
     assert site.history.deliveries() == []
 
 
+@pytest.mark.parametrize(
+    "existing,age,code,message",
+    [(False, 2, 0, "would export"), (True, 2, 0, "no new full:"), (True, 30, 1, "older than")],
+    ids=["new-full", "no-new-full", "too-old"],
+)
+def test_pgbackrest_dry_run_appends_copy_and_preserves_its_exit_code(
+    tmp_path, existing, age, code, message,
+):
+    site = make_site(tmp_path, extra="max_full_age_hours = 26\n")
+    database = site.history.settings.database
+    if existing:
+        assert site.run().exit_code == 0
+        before = database.read_bytes()
+    site.config.write_text(site.config.read_text() + COPY)
+    paths = set(tmp_path.rglob("*"))
+    remote = Remote()
+
+    result = site.run("--dry-run", now=STOP + timedelta(hours=age), ssh=remote)
+
+    assert result.exit_code == code, result.output
+    assert message in result.stdout
+    assert result.stdout.splitlines()[-1] == (
+        "Dry run; configured copy: ssh://vault/remote/archive (rsync)"
+    )
+    assert not remote.calls
+    assert set(tmp_path.rglob("*")) == paths
+    if existing:
+        assert database.read_bytes() == before
+
+
 @pytest.mark.parametrize("method,verify", [("rsync", True), ("scp", True), ("scp", False)])
 def test_export_copies_after_releasing_its_backup_lock(tmp_path, method, verify):
     site = make_site(tmp_path, extra=COPY.replace("rsync", method))

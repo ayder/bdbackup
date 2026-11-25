@@ -212,6 +212,32 @@ def test_without_copy_a_backup_starts_no_ssh_and_leaves_an_existing_delivery_pen
     assert (delivery.status, delivery.attempt_count) == ("pending", 0)
 
 
+@pytest.mark.parametrize("job,method", [(FILE, "rsync"), (MYSQL, "scp")], ids=["file", "mysqldump"])
+def test_dry_run_reports_copy_without_starting_ssh_or_creating_history(site, remote, job, method):
+    site.configure(job, COPY.replace("rsync", method))
+
+    result = site.run("--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == f"Dry run; configured copy: {DEST} ({method})"
+    assert not remote.calls
+    assert not site.history.settings.database.parent.exists()
+    assert not (site.path.parent / "source-stage").exists()
+
+
+def test_dry_run_leaves_a_pending_copy_untouched(site, remote):
+    site.seed("older.tar")
+    database = site.history.settings.database
+    before = database.read_bytes()
+
+    result = site.run("--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[-1] == f"Dry run; configured copy: {DEST} (rsync)"
+    assert not remote.calls and not site.copy_lock.exists()
+    assert database.read_bytes() == before
+
+
 def test_newest_first_retries_once_with_current_method_and_leaves_other_destination(site, remote):
     site.configure(copy=COPY.replace("vault", "other"))
     other = site.seed("other.tar")
