@@ -93,6 +93,8 @@ class LastRun:
 
 @dataclass(frozen=True)
 class Delivery:
+    """The delivery queued for a successful backup and its latest attempt."""
+
     record_id: int
     job_name: str
     destination: str
@@ -133,7 +135,7 @@ class History:
                 if create:
                     connection.execute("BEGIN IMMEDIATE")
                 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-                if schema not in (0, 1, 2, 3, 4, 5, 6) or (not create and schema == 0):
+                if schema not in (0, 1, 2, 3, 4, 5, 6, 7) or (not create and schema == 0):
                     raise HistoryError(f"Unsupported history schema version: {schema}")
                 if create and schema == 0:
                     connection.execute(
@@ -253,6 +255,30 @@ class History:
                         )"""
                     )
                     connection.execute("PRAGMA user_version = 6")
+                if create and schema in (0, 1, 2, 3, 4, 5, 6):
+                    connection.execute(
+                        """CREATE TABLE deliveries (
+                            record_id INTEGER PRIMARY KEY REFERENCES backup_runs(id),
+                            job_name TEXT NOT NULL,
+                            destination TEXT NOT NULL,
+                            method TEXT NOT NULL CHECK(method IN ('rsync', 'scp')),
+                            status TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending', 'copied', 'failed', 'abandoned')),
+                            failure_class TEXT CHECK(failure_class IN (
+                                'connect', 'destination_not_ready', 'tool_missing', 'name_taken',
+                                'transfer', 'checksum_mismatch', 'source_unavailable', 'other'
+                            )),
+                            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+                            bytes_sent INTEGER CHECK(bytes_sent >= 0),
+                            started_at TEXT,
+                            ended_at TEXT,
+                            CHECK(
+                                (status IN ('failed', 'abandoned')) = (failure_class IS NOT NULL)
+                            ),
+                            CHECK((status = 'copied') = (bytes_sent IS NOT NULL))
+                        )"""
+                    )
+                    connection.execute("PRAGMA user_version = 7")
                 yield connection
         except (OSError, sqlite3.Error) as exc:
             raise HistoryError(f"Cannot access history database {path}: {exc}") from exc
@@ -302,21 +328,66 @@ class History:
                 (datetime.now(UTC).isoformat(), str(path), result.size_bytes, identity,
                  json.dumps(restore_info or {}), str(unit), digest, run_id),
             )
+            if copy is not None:
+                db.execute(
+                    """INSERT INTO deliveries (record_id, job_name, destination, method)
+                       VALUES (?, ?, ?, ?)""",
+                    (run_id, job_name, copy.destination, copy.method),
+                )
         return result
 
     def deliveries(
         self, *, job: str | None = None, destination: str | None = None, uncopied: bool = False,
     ) -> list[Delivery]:
-        return []
+        """Read deliveries in backup record order, optionally restricted to the retry queue."""
+        if not self.settings.database.exists():
+            return []
+        with self._connect() as db:
+            if db.execute("PRAGMA user_version").fetchone()[0] < 7:
+                return []
+            rows = db.execute(
+                """SELECT * FROM deliveries
+                   WHERE (? IS NULL OR job_name = ?)
+                     AND (? IS NULL OR destination = ?)
+                     AND (? = 0 OR status IN ('pending', 'failed'))
+                   ORDER BY record_id DESC""",
+                (job, job, destination, destination, uncopied),
+            ).fetchall()
+        return [Delivery(**dict(row)) for row in rows]
 
     def start_delivery_attempt(self, record_id: int, method: str, started_at: datetime) -> int:
-        return 0
+        """Record the method and start time while keeping the delivery eligible for retry."""
+        with self._connect(create=True) as db:
+            result = db.execute(
+                """UPDATE deliveries SET method = ?, attempt_count = attempt_count + 1,
+                   started_at = ?, ended_at = NULL
+                   WHERE record_id = ? AND status IN ('pending', 'failed')""",
+                (method, started_at.isoformat(), record_id),
+            )
+            if not result.rowcount:
+                raise HistoryError(f"Backup ID {record_id} has no uncopied delivery")
+            return db.execute(
+                "SELECT attempt_count FROM deliveries WHERE record_id = ?", (record_id,),
+            ).fetchone()[0]
 
     def finish_delivery_attempt(
         self, record_id: int, attempt: int, status: str, ended_at: datetime, *,
         failure_class: str | None = None, bytes_sent: int | None = None,
     ) -> None:
-        pass
+        """Record the outcome only if this is still the current unfinished attempt."""
+        if status not in {"copied", "failed", "abandoned"}:
+            raise HistoryError("Invalid delivery attempt outcome")
+        with self._connect(create=True) as db:
+            result = db.execute(
+                """UPDATE deliveries SET status = ?, failure_class = ?, bytes_sent = ?, ended_at = ?
+                   WHERE record_id = ? AND attempt_count = ? AND started_at IS NOT NULL
+                     AND ended_at IS NULL AND status IN ('pending', 'failed')""",
+                (status, failure_class, bytes_sent, ended_at.isoformat(), record_id, attempt),
+            )
+            if not result.rowcount:
+                raise HistoryError(
+                    f"Delivery attempt {attempt} for backup {record_id} is stale or missing"
+                )
 
     def record_checksums(self, job: str | None = None) -> list[tuple[int, str]]:
         """Record unit and checksum for successful records that have none, oldest first.
