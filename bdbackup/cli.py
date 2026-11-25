@@ -658,16 +658,25 @@ def history_cmd(config_path: Path, job: str | None, successful: bool,
         records = history.records(job=job, successful=successful)
         suffixes = gfs_store.listing_suffixes(history)
         known = gfs_store.places(history)
+        deliveries = {delivery.record_id: delivery for delivery in history.deliveries(job=job)}
         if not records:
             _echo("No backup history found.")
         for record in records:
             available = "available" if gfs_store.available(record, known) else "unavailable"
+            # A backup can finish between the records and deliveries reads.
+            delivery = deliveries.get(record.id) if record.status == "success" else None
+            copy_suffix = ""
+            if delivery is not None:
+                copy_suffix = f" | copy {delivery.status}"
+                if delivery.failure_class is not None:
+                    copy_suffix += f" ({delivery.failure_class})"
             _echo(
                 f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
                 f"{record.status} | {available} | "
                 f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path or '-'}"
                 f" | unit {record.unit or '-'}"
                 f"{suffixes.get(record.unit, '') if record.unit else ''}"
+                f"{copy_suffix}"
             )
 
     _handle_errors(_checksums if create_checksum else _listing)
