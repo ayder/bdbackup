@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -278,6 +278,11 @@ class History:
                             CHECK((status = 'copied') = (bytes_sent IS NOT NULL))
                         )"""
                     )
+                    connection.execute(
+                        """CREATE INDEX deliveries_uncopied
+                           ON deliveries (job_name, destination, record_id DESC)
+                           WHERE status IN ('pending', 'failed')"""
+                    )
                     connection.execute("PRAGMA user_version = 7")
                 yield connection
         except (OSError, sqlite3.Error) as exc:
@@ -359,7 +364,15 @@ class History:
         self, job: str, destination: str, attempted: set[int], *,
         db: sqlite3.Connection | None = None,
     ) -> int | None:
-        return None
+        """Find the newest unattempted delivery, optionally in a caller's transaction."""
+        with self._connect() if db is None else nullcontext(db) as connection:
+            rows = connection.execute(
+                """SELECT record_id FROM deliveries
+                   WHERE job_name = ? AND destination = ? AND status IN ('pending', 'failed')
+                   ORDER BY record_id DESC""",
+                (job, destination),
+            )
+            return next((row[0] for row in rows if row[0] not in attempted), None)
 
     def start_delivery_attempt(self, record_id: int, method: str, started_at: datetime) -> int:
         """Record the method and start time while keeping the delivery eligible for retry."""

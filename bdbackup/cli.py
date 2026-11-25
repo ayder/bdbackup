@@ -14,7 +14,7 @@ from pathlib import Path
 import click
 from click.core import ParameterSource
 
-from bdbackup import __version__
+from bdbackup import __version__, copy_runner
 from bdbackup.backends import BackupError, setup_logging
 from bdbackup.config import Config, ConfigError, Job, build_backend
 from bdbackup.filebackup import FileBackup
@@ -28,6 +28,7 @@ from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.postgres.pgbackrest import ExportProgress
 from bdbackup.postgres.restore import describe_unit, restore_lines
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
+from bdbackup.ssh_copy import CopySettings
 from bdbackup.templates import TemplateError
 from bdbackup.utils import process_lock
 from bdbackup.validation import validate_config
@@ -105,12 +106,21 @@ def _history_config(path: Path | None) -> Config:
     return config
 
 
-def _tracked_backup(config, name, backup_type, action, restore_info=None, *, encrypted=False):
+def _tracked_backup(
+    config, name, backup_type, action, restore_info=None, *,
+    encrypted=False, copy: CopySettings | None = None,
+):
     if config.history:
         return History(config.history).run(
-            name, backup_type, action, restore_info, encrypted=encrypted,
+            name, backup_type, action, restore_info, encrypted=encrypted, copy=copy,
         )
     return action()
+
+
+def _run_copy(config: Config, job: Job) -> int:
+    if job.copy is None:
+        return EXIT_OK
+    return copy_runner.run_job(History(config.history), job.name, job.copy, _echo)
 
 
 def _protect_history(backend, config):
@@ -430,7 +440,7 @@ def run(
     try:
         result = _tracked_backup(
             config, job.name, backup_type, _create, info,
-            encrypted=job.params.get("encrypt") is True,
+            encrypted=job.params.get("encrypt") is True, copy=job.copy,
         )
     except BlockingIOError as exc:
         logger.error("Job %r locked: %s", job.name, exc)
@@ -439,7 +449,7 @@ def run(
         logger.error("Job %r failed: %s", job.name, exc)
         ctx.exit(EXIT_BACKUP_FAILED)
     _echo(f"Job {job.name}: {result.path}")
-    return EXIT_OK
+    ctx.exit(_handle_errors(_run_copy, config, job))
 
 
 def _restore_mode(config_path, backup_id, job, yes, dst, archive, backup, root, binary,
