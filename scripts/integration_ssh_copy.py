@@ -17,7 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = {"22.04": "legacy SCP", "24.04": "SFTP"}
 COLLISIONS = ("existing file", "existing directory", "dangling symlink", "after precheck")
-UMASKS = (0o000, 0o077)
+# The Ubuntu sshd login sessions can retain these masks.
+UMASKS = (0o022, 0o077)
 SOURCE_MODES = (0o600, 0o640)
 PORT = 22222
 USER = "bdprobe"
