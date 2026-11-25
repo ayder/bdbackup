@@ -47,6 +47,10 @@ CASES = (
 )
 INTEGRATION_CASES = ("logical", "physical", "backup-failed", "missing-files")
 SUCCESS = "Real PBM backup export and restore passed"
+RESTORE_FINISHED = re.compile(
+    r"Restore finished! Check pbm describe-restore "
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z)(?=\s|$)"
+)
 LOCAL = "/pbm-local"
 SHARED = "/pbm-shared"
 WORK = Path("/var/tmp/bdbackup-pbm")  # noqa: S108
@@ -174,7 +178,7 @@ class ReplicaSet:
                 cleanup.callback(self.cleanup, "rm", "--force", "--volumes", node)
                 output(
                     self.command(
-                        "run", "--detach", "--name", node, "--hostname", node,
+                        "run", "--init", "--detach", "--name", node, "--hostname", node,
                         "--network", self.network, "--mount",
                         f"type=volume,source={self.volume},target={SHARED}",
                         "--entrypoint", "sleep", self.tag, "infinity",
@@ -286,8 +290,8 @@ class ReplicaSet:
             "write the fixture rows with majority acknowledgement",
         )
 
-    def pbm(self, *args, node=None, uri=URI):
-        return self.exec(node or self.secondary, "pbm", *args, uri=uri, timeout=300)
+    def pbm(self, *args, node=None, uri=URI, timeout=300):
+        return self.exec(node or self.secondary, "pbm", *args, uri=uri, timeout=timeout)
 
     def cli(self, *args, uri=None):
         return self.exec(self.secondary, BDBACKUP, *args, uri=uri, timeout=360)
@@ -440,6 +444,52 @@ def restore(cluster, backup_type, fixture):
     restore_shared(cluster, backup_type, fixture, name)
 
 
+def wait_for_restore_ready(cluster):
+    """Let the agents settle after resync before submitting the physical restore."""
+    idle_since = None
+
+    def ready():
+        nonlocal idle_since
+        response = {}
+        try:
+            result = cluster.pbm(
+                "status", "--sections", "running", "--sections", "pitr", "--out", "json",
+                timeout=10,
+            )
+            if result.returncode == 0:
+                response = json.loads(result.stdout)
+        except (ValueError, subprocess.TimeoutExpired):
+            pass  # Reset the idle interval after a transient or incomplete answer.
+        if isinstance(response, dict):
+            running, pitr = response.get("running"), response.get("pitr")
+            if running == {} and isinstance(pitr, dict) and (
+                pitr.get("conf") is False and pitr.get("run") is False
+            ):
+                now = time.monotonic()
+                if idle_since is None:
+                    idle_since = now
+                return now - idle_since >= 20
+        idle_since = None
+        return False
+
+    wait_for("physical restore: PBM reports no operation or PITR for 20 seconds", ready, seconds=90)
+
+
+def resync_after_restart(cluster, name):
+    # PBM 2.10 may complete the resync without releasing the CLI's --wait.
+    output(cluster.pbm("config", "--force-resync", timeout=30),
+           "request resync after physical restart")
+
+    def listed():
+        try:
+            result = cluster.pbm("list", timeout=10)
+        except subprocess.TimeoutExpired:
+            return False
+        return result.returncode == 0 and name in result.stdout
+
+    wait_for("PBM lists the backup after resync and physical restart", listed, seconds=90)
+
+
 def restore_shared(cluster, backup_type, fixture, name):
     for node in cluster.nodes:
         output(cluster.exec(node, "test", "-r", f"{SHARED}/{name}.pbm.json"),
@@ -456,30 +506,35 @@ def restore_shared(cluster, backup_type, fixture, name):
     output(cluster.pbm("config", "--force-resync", "--wait"), "resync the copied storage")
     listing = output(cluster.pbm("list"), "list backups after resync")
     expect(f"{backup_type}: PBM lists the backup after resync", name in listing)
-    flags = ("--yes",) if FIXTURES[fixture][1] == "2.17.0" else ()
-    reply = json_output(
-        cluster.pbm("restore", name, *flags, "--wait", "--out", "json"),
+    recent = FIXTURES[fixture][1] == "2.17.0"
+    if recent and backup_type == "physical":
+        wait_for_restore_ready(cluster)
+    flags = ("--yes",) if recent else ()
+    reply = output(
+        cluster.pbm("restore", name, *flags, "--wait", "--out", "text"),
         f"{backup_type}: restore finishes",
     )
+    finished = RESTORE_FINISHED.search(reply)
+    expect(f"{backup_type}: restore returns its operation name", finished is not None, reply)
     # Physical restore reports its state through the copied filesystem, while MongoDB is down.
     if backup_type == "physical":
-        restored = reply.get("name", "")
-        expect("physical restore returns its operation name", bool(restored))
         report = json_output(
-            cluster.pbm("describe-restore", restored, "--config", CONFIG, "--out", "json"),
+            cluster.pbm("describe-restore", finished[1], "--config", CONFIG, "--out", "json"),
             "read physical restore status from storage",
         )
         expect("physical restore done on the full replica set", report["status"] == "done",
                str(report.get("status")))
         for node in cluster.nodes:
             cluster.stop_agent(node)
+        for node in cluster.nodes:
+            # A restored mongod has exited, regardless of whether its old PID is still visible.
             cluster.start_mongod(node)
         cluster.wait_members()
         for node in cluster.nodes:
             cluster.start_agent(node)
-        cluster.configure(SHARED, wait=True)
+        cluster.configure(SHARED)
         cluster.wait_agents(cluster.nodes)
-        output(cluster.pbm("config", "--force-resync", "--wait"), "resync after physical restart")
+        resync_after_restart(cluster, name)
     actual = json_output(cluster.mongo(
         cluster.primary, f"print(JSON.stringify({DATA}.find().sort({{_id: 1}}).toArray()))",
     ), f"{backup_type}: query restored rows")

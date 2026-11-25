@@ -60,7 +60,13 @@ def restore_lines(facts: UnitFacts) -> list[str]:
         f"4. Restore the {facts.backup_type} backup and follow Percona's "
         "post-restore instructions.",
         f"   pbm restore {name}",
+        '   If pbm restore answers "operation staled" just after resync, '
+        "wait a few seconds and run it again.",
     ]
     if facts.backup_type == "physical":
-        lines.append("   Restart mongod and the PBM agents on every node after the restore.")
+        lines += [
+            "   Restart mongod and the PBM agents on every node after the restore, then resync.",
+            "   pbm config --force-resync",
+            f"   Wait until pbm list shows {name} again.",
+        ]
     return lines

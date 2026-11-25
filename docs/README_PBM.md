@@ -36,9 +36,13 @@ secondary as well as from the primary.
 
 Set PBM's main storage type to `filesystem`. The directory at `storage_path`
 must contain PBM's `.pbm.init` marker and be visible from the host running
-bdbackup. Run bdbackup as an OS user that can search the directories and
-read the files that PBM writes, such as the user running `mongod` and its PBM
-agent on the storage node. Check permissions under that account.
+bdbackup. PBM's backup files belong to the `mongod` user. With the agents'
+default umask (`0022`), backup files have mode
+`0644` and their directories have mode `0755`. Any OS user that can reach
+the storage directory can read the backup. With umask `077`, the backup
+directories have mode `0700` and belong to the `mongod` user. Run bdbackup as
+that user to read the full backup. Other unprivileged users who can reach
+the storage directory can read only the top-level metadata file.
 
 - **Storage on one node.** For example, mount the filesystem on one secondary
   and run bdbackup there. Agents on nodes without the storage report storage
@@ -173,8 +177,11 @@ bdbackup restore --archive mongo-nightly-2026-11-25T085927Z.tar --dst recovery/f
 2. Run `pbm config --force-resync --wait` to resync the backup list.
 3. Run `pbm list` and confirm that the list contains `<name>`.
 4. Run `pbm restore <name>` with the original PBM name, including the colons.
+   If it answers "operation staled" just after resync, wait a few seconds and run it again.
    Follow Percona's steps for that backup type. After a physical restore,
-   restart `mongod` and the PBM agents on every node. [Logical restore](https://docs.percona.com/percona-backup-mongodb/2.17.0/usage/restore.html) · [Physical restore](https://docs.percona.com/percona-backup-mongodb/2.17.0/usage/restore-physical.html)
+   restart `mongod` and the PBM agents on every node, then run
+   `pbm config --force-resync`. Wait until `pbm list` shows the backup again.
+   [Logical restore](https://docs.percona.com/percona-backup-mongodb/2.17.0/usage/restore.html) · [Physical restore](https://docs.percona.com/percona-backup-mongodb/2.17.0/usage/restore-physical.html)
 
 ## Limits
 
