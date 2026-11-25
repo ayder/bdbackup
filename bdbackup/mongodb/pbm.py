@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,17 +46,21 @@ def _redact(text: str, uri: str | None) -> str:
     return _MONGODB_URI.sub("<redacted>", text)
 
 
+def _is_warning(line: str) -> bool:
+    return line.lower().startswith("warning:")
+
+
 def _last_diagnostic(stdout: str, stderr: str) -> str:
-    errors = [line.strip() for line in stderr.splitlines() if line.strip()]
-    for line in reversed(errors):
-        if not line.lower().startswith("warning:"):
+    for raw in reversed(stderr.splitlines()):
+        line = raw.strip()
+        if line and not _is_warning(line):
             return line
     # In JSON mode PBM can emit errors on stdout. Here the line is a diagnostic,
     # not part of the command's successful JSON response.
     lines = stdout.strip().splitlines()
     if lines:
         return lines[-1].strip()
-    return errors[-1] if errors else ""
+    return ""
 
 
 def _failure_diagnostic(stdout: str, stderr: str, uri: str | None) -> str:
@@ -91,7 +96,10 @@ class PBM:
         self.binary = binary
         self.mongodb_uri = mongodb_uri
 
-    def _run_json(self, command: str, *args: str) -> dict:
+    def _run_json(
+        self, command: str, *args: str, on_warning: Callable[[str], None] | None = None,
+        include_stdout_diagnostics: bool = True,
+    ) -> dict:
         env = os.environ.copy()
         if self.mongodb_uri is not None:
             env[URI_ENV] = self.mongodb_uri
@@ -106,20 +114,27 @@ class PBM:
             raise PBMError(f"pbm {command} failed: {detail}") from None
 
         stderr = _redact(result.stderr, uri)
+        for raw in stderr.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            warning = _is_warning(line)
+            if warning or not result.returncode:
+                logger.warning("pbm %s: %s", command, line)
+            if warning and on_warning is not None:
+                on_warning(line)
+        diagnostic_stdout = result.stdout if include_stdout_diagnostics else ""
         if result.returncode:
-            detail = _failure_diagnostic(result.stdout, stderr, uri)
+            detail = _failure_diagnostic(diagnostic_stdout, stderr, uri)
             detail = detail or f"exit status {result.returncode}"
             raise PBMError(f"pbm {command} failed: {detail}")
 
-        for line in stderr.splitlines():
-            if line.strip():
-                logger.warning("pbm %s: %s", command, line.strip())
         try:
             response = json.loads(result.stdout)
         except ValueError:
             response = None
         if not isinstance(response, dict):
-            detail = _last_diagnostic(_redact(result.stdout, uri), stderr)
+            detail = _last_diagnostic(_redact(diagnostic_stdout, uri), stderr)
             suffix = f" ({detail})" if detail else ""
             raise PBMError(f"pbm {command} failed: stdout is not a JSON object{suffix}")
         return response
@@ -157,18 +172,24 @@ class PBM:
             replicas.append(ReplicaBackup(entry["name"], node))
         return BackupDescription(status, backup_type, tuple(replicas))
 
-    def status(self, *, cluster_only: bool = False) -> dict:
+    def status(
+        self, *, cluster_only: bool = False, on_warning: Callable[[str], None] | None = None,
+    ) -> dict:
         """Read PBM's status document."""
         sections = ("--sections", "cluster") if cluster_only else ()
-        return self._run_json("status", *sections)
+        return self._run_json("status", *sections, on_warning=on_warning)
 
-    def storage_type(self) -> object:
-        """Read only the storage type, without opening PBM's configured storage."""
-        return self._run_json("config", "storage.type").get("value")
+    def storage_type(self, *, on_warning: Callable[[str], None] | None = None) -> object:
+        """Read the configuration without opening storage or exposing its settings."""
+        reply = self._run_json(
+            "config", "--list", on_warning=on_warning, include_stdout_diagnostics=False,
+        )
+        storage = reply.get("storage")
+        return storage.get("type") if isinstance(storage, dict) else None
 
-    def version(self) -> dict:
+    def version(self, *, on_warning: Callable[[str], None] | None = None) -> dict:
         """Read PBM's version document for validation."""
-        return self._run_json("version")
+        return self._run_json("version", on_warning=on_warning)
 
     def export(
         self, job: str, name: str, nodes: tuple[str, ...], *, verify: bool = True,

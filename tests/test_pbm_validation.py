@@ -17,7 +17,6 @@ COMMANDS = {
     ("status", "--sections", "cluster", "--out", "json"): "status",
     ("config", "--list", "--out", "json"): "storage",
 }
-SINGLE_KEY = ("config", "storage.type", "--out", "json")
 WARNING = (
     "WARNING: This PBM works with MongoDB and PSMDB v7.0, v8.0, v8.3 and you are running v6.0. "
     "Please upgrade your MongoDB to a supported version."
@@ -59,7 +58,7 @@ class Site:
         assert argv[0] == "pbm"
         args = tuple(argv[1:])
         self.calls.append((args, kwargs["env"].get(URI_ENV)))
-        command = "storage" if args == SINGLE_KEY else COMMANDS.get(args)
+        command = COMMANDS.get(args)
         assert command is not None, f"validation ran an unapproved command: {args}"
         reply = self.replies[command]
         stderr = self.stderr.get(command, "")
@@ -67,8 +66,6 @@ class Site:
             return subprocess.CompletedProcess(argv, *reply, stderr)
         if isinstance(reply, str):
             return subprocess.CompletedProcess(argv, 1, "", stderr + reply)
-        if args == SINGLE_KEY:
-            reply = {"key": "storage.type", "value": reply["storage"]["type"]}
         return subprocess.CompletedProcess(argv, 0, json.dumps(reply), stderr)
 
     def write(self, extra=""):

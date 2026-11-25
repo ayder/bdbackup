@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -517,9 +518,9 @@ def _pbm_version_token(value: object) -> str | None:
     return re.sub(r"^v(?=[0-9])", "", value)
 
 
-def _pbm_version(report: Report, backend: PBM) -> str | None:
+def _pbm_version(report: Report, backend: PBM, on_warning: Callable[[str], None]) -> str | None:
     try:
-        version = _pbm_version_token(backend.version().get("Version"))
+        version = _pbm_version_token(backend.version(on_warning=on_warning).get("Version"))
         if version is None:
             raise PBMError("pbm version did not report a version")
     except PBMError as exc:
@@ -532,10 +533,12 @@ def _pbm_version(report: Report, backend: PBM) -> str | None:
     return version
 
 
-def _pbm_agent_checks(report: Report, backend: PBM, version: str | None) -> None:
+def _pbm_agent_checks(
+    report: Report, backend: PBM, version: str | None, on_warning: Callable[[str], None],
+) -> None:
     try:
         # PBM 2.10 can open the storage when the backups section is requested.
-        cluster = backend.status(cluster_only=True).get("cluster")
+        cluster = backend.status(cluster_only=True, on_warning=on_warning).get("cluster")
         if not isinstance(cluster, list) or any(
             not isinstance(replica, dict) or not isinstance(replica.get("nodes"), list)
             for replica in cluster
@@ -600,12 +603,13 @@ def _pbm(report: Report, backend: PBM) -> None:
     else:
         report.add("FAIL", f"PBM connection string: set mongodb_uri or {URI_ENV}.")
 
+    warnings: list[str] = []
     if found:
-        version = _pbm_version(report, backend)
+        version = _pbm_version(report, backend, warnings.append)
         if connection:
-            _pbm_agent_checks(report, backend, version)
+            _pbm_agent_checks(report, backend, version, warnings.append)
             try:
-                storage_type = backend.storage_type()
+                storage_type = backend.storage_type(on_warning=warnings.append)
             except PBMError as exc:
                 report.add("FAIL", f"PBM storage type: {exc}. Check PBM's storage configuration.")
             else:
@@ -613,6 +617,8 @@ def _pbm(report: Report, backend: PBM) -> None:
                     report.add("OK", "PBM storage type: filesystem.")
                 else:
                     report.add("FAIL", "PBM storage type: set PBM storage.type to filesystem.")
+    for warning in dict.fromkeys(warnings):
+        report.add("NOTE", warning)
 
     _directory(report, backend.storage_path, "PBM storage")
     marker = backend.storage_path / ".pbm.init"
