@@ -12,6 +12,7 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
 from bdbackup.metrics.settings import MetricsSettings, parse_metrics
+from bdbackup.ssh_copy import CopySettings
 from bdbackup.utils import lexical_path, real_path
 
 
@@ -24,6 +25,7 @@ class Job:
     params: dict[str, Any]
     restore_root: Path | None = None
     active: bool = True
+    copy: CopySettings | None = None
 
 
 class ConfigError(Exception):
