@@ -12,6 +12,8 @@ from pathlib import Path
 
 from bdbackup.backends import BackupError, BackupResult
 from bdbackup.engines import EngineInfo
+from bdbackup.mongodb.export import export_unit
+from bdbackup.ssh_copy import safe_artifact_name
 
 logger = logging.getLogger(__name__)
 URI_ENV = "PBM_MONGODB_URI"
@@ -154,7 +156,12 @@ class PBM:
     def export(
         self, job: str, name: str, nodes: tuple[str, ...], *, verify: bool = True,
     ) -> BackupResult:
-        return BackupResult(self.out_dir / "placeholder.tar")
+        """Verify and publish a tar containing only the requested PBM backup."""
+        if not safe_artifact_name(job):
+            raise BackupError("pbm job name must be shell-safe")
+        if not _BACKUP_NAME.fullmatch(name):
+            raise BackupError("invalid PBM backup name for export")
+        return export_unit(self.storage_path, self.out_dir, job, name, nodes, verify)
 
     def backup(self) -> BackupResult:
         raise BackupError("PBM backup export is not available")
