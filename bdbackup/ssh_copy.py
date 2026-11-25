@@ -1,7 +1,7 @@
 """Settings for copying a published backup to an SSH server."""
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from ipaddress import IPv6Address
 from pathlib import Path
@@ -86,3 +86,21 @@ def parse_copy_settings(
         raise ValueError("copy.bwlimit must be a positive whole number")
     settings = CopySettings(destination, method, host, path, user, port, ssh_config, bwlimit)
     return settings, (host, written_port, path)
+
+
+class CopyCommandError(Exception):
+    def __init__(self, failure_class: str, diagnostic: str | None):
+        super().__init__(failure_class)
+        self.failure_class = failure_class
+        self.diagnostic = diagnostic
+
+
+class SSHConnection:
+    def __init__(self, settings: CopySettings):
+        self.settings = settings
+
+    def run(self, command: str, *, failures: Mapping[int, str] | None = None) -> str:
+        return ""
+
+    def transfer(self, source: Path, remote_path: str) -> None:
+        pass
