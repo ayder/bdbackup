@@ -8,7 +8,9 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import subprocess
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +26,7 @@ from bdbackup.history import History, HistoryError, HistorySettings
 from bdbackup.postgres import PgBackRest, pgbackrest
 from bdbackup.utils import process_lock
 from tests.pgbackrest_fake import fake_pgbackrest, info_json, make_repo
+from tests.ssh_copy_fake import Remote
 
 NEWEST = "20261109-010000F"
 STOP = datetime(2026, 11, 9, 1, 1, tzinfo=UTC)  # the fake stops a backup a minute after its label
@@ -46,6 +49,7 @@ stanza = "main"
 repo_path = "repo"
 out_dir = "STAGE1/pg"
 """
+COPY = '\n[pg.copy]\ndestination="ssh://vault/remote/archive"\nmethod="rsync"\n'
 
 
 @pytest.fixture(autouse=True)
@@ -97,10 +101,16 @@ class Site:
         """The ``last_runs`` row of job ``pg``; ``None`` before a run records one."""
         return self.history.last_runs().get("pg")
 
-    def run(self, *args: str, now: datetime = SOON):
+    def run(self, *args: str, now: datetime = SOON, ssh=None):
         """Invoke ``run -j pg`` with pgBackRest faked and the clock at ``now``."""
         self.fake = fake_pgbackrest(self.repo)
-        with patch(RUN, self.fake), patch("bdbackup.cli._now", return_value=now):
+
+        def execute(argv, **kwargs):
+            if ssh is not None and argv[0] in {"ssh", "scp", "rsync"}:
+                return ssh(argv, **kwargs)
+            return self.fake(argv, **kwargs)
+
+        with patch(RUN, execute), patch("bdbackup.cli._now", return_value=now):
             return CliRunner().invoke(
                 main, ["run", "-c", str(self.config), "-j", "pg", *args]
             )
@@ -564,6 +574,189 @@ def test_last_run_of_no_new_full_keeps_the_last_exports_facts(tmp_path):
     assert (row.result, row.exit_code) == ("no_new_full", 0)
     assert row.facts == exported.facts
     assert row.facts is not None
+
+
+def test_no_new_full_can_enable_copy_on_schema_six_without_attempting_ssh(tmp_path):
+    site = make_site(tmp_path)
+    assert site.run().exit_code == 0
+    backup, = site.rows()
+    facts = last_run(site).facts
+    with closing(sqlite3.connect(site.history.settings.database)) as db, db:
+        db.execute("DROP TABLE deliveries")
+        db.execute("PRAGMA user_version = 6")
+    site.config.write_text(site.config.read_text() + COPY)
+    remote = Remote()
+
+    result = site.run(ssh=remote)
+
+    assert result.exit_code == 0, "a no-new-full run may see a history without a copy queue"
+    assert "no new full:" in result.stdout and "Copy pg:" not in result.stdout
+    assert not remote.calls
+    assert site.rows() == [backup]
+    row = last_run(site)
+    assert (row.result, row.exit_code, row.facts) == ("no_new_full", 0, facts)
+    assert site.history.deliveries() == []
+
+
+@pytest.mark.parametrize(
+    "existing,age,code,message",
+    [(False, 2, 0, "would export"), (True, 2, 0, "no new full:"), (True, 30, 1, "older than")],
+    ids=["new-full", "no-new-full", "too-old"],
+)
+def test_pgbackrest_dry_run_appends_copy_and_preserves_its_exit_code(
+    tmp_path, existing, age, code, message,
+):
+    site = make_site(tmp_path, extra="max_full_age_hours = 26\n")
+    database = site.history.settings.database
+    if existing:
+        assert site.run().exit_code == 0
+        before = database.read_bytes()
+    site.config.write_text(site.config.read_text() + COPY)
+    paths = set(tmp_path.rglob("*"))
+    remote = Remote()
+
+    result = site.run("--dry-run", now=STOP + timedelta(hours=age), ssh=remote)
+
+    assert result.exit_code == code, result.output
+    assert message in result.stdout
+    assert result.stdout.splitlines()[-1] == (
+        "Dry run; configured copy: ssh://vault/remote/archive (rsync)"
+    )
+    assert not remote.calls
+    assert set(tmp_path.rglob("*")) == paths
+    if existing:
+        assert database.read_bytes() == before
+
+
+@pytest.mark.parametrize("method,verify", [("rsync", True), ("scp", True), ("scp", False)])
+def test_export_copies_after_releasing_its_backup_lock(tmp_path, method, verify):
+    site = make_site(tmp_path, extra=COPY.replace("rsync", method))
+    remote = Remote()
+
+    def check_lock(argv):
+        assert not lock_is_held(site.lock_file)
+        assert site.rows()[0].status == "success"
+
+    remote.before = check_lock
+    result = site.run(*([] if verify else ["--no-verify"]), ssh=remote)
+
+    assert result.exit_code == 0, result.output
+    assert f"Copy pg: {site.unit.name} -> ssh://vault/remote/archive ({method}," in result.stdout
+    assert [(tool, path) for tool, path, _ in remote.transfers] == [(method, site.unit)]
+    backup, = site.rows()
+    assert remote.digest(f"/remote/archive/{site.unit.name}") == backup.checksum
+    delivery, = site.history.deliveries()
+    assert (delivery.status, delivery.method) == ("copied", method)
+    row = last_run(site)
+    assert (row.result, row.exit_code) == ("exported", 0)
+    assert ("verify" in row.facts["phases"]) is verify
+    assert row.facts == exported_facts(site, row.facts["phases"])
+
+
+def copy_lock(site):
+    return process_lock(f"{site.history.settings.database}.copy-pg.lock")
+
+
+def disconnected(argv):
+    return subprocess.CompletedProcess(argv, 255, "", "synthetic refused key")
+
+
+@pytest.mark.parametrize("disposition", ["failure", "deferred"])
+def test_export_copy_outcome_keeps_export_facts_and_no_new_full_retries(tmp_path, disposition):
+    site = make_site(tmp_path, extra=COPY)
+    remote = Remote()
+    if disposition == "failure":
+        remote.before = disconnected
+        result = site.run(ssh=remote)
+        expected = ("copy_failed", 1)
+    else:
+        with copy_lock(site):
+            result = site.run(ssh=remote)
+        expected = ("copy_deferred", 3)
+
+    assert result.exit_code == expected[1], "copy failure or deferral must control the run exit"
+    backup, = site.rows()
+    assert backup.status == "success"
+    before, = site.history.deliveries()
+    assert before.status == ("failed" if disposition == "failure" else "pending")
+    row = last_run(site)
+    assert (row.result, row.exit_code) == expected
+    assert row.facts == exported_facts(site, row.facts["phases"])
+    assert "verify" in row.facts["phases"]
+
+    remote.before = None
+    second = site.run(ssh=remote)
+
+    assert second.exit_code == 0, second.output
+    assert "no new full:" in second.stdout
+    assert f"Copy pg: {site.unit.name} ->" in second.stdout
+    assert site.rows() == [backup]
+    after, = site.history.deliveries()
+    assert (after.status, after.attempt_count) == ("copied", before.attempt_count + 1)
+    assert last_run(site).result == "no_new_full"
+    assert last_run(site).facts == row.facts
+
+
+@pytest.mark.parametrize("disposition", ["failure", "deferred"])
+def test_no_new_full_copy_outcome_keeps_previous_export_facts(tmp_path, disposition):
+    site = make_site(tmp_path, extra=COPY)
+    remote = Remote()
+    with copy_lock(site):
+        first = site.run(ssh=remote)
+    assert first.exit_code == 3, "an export must enqueue even when copying is deferred"
+    original = last_run(site)
+    units = site.rows()
+
+    if disposition == "failure":
+        remote.before = disconnected
+        result = site.run(ssh=remote)
+        expected = ("copy_failed", 1)
+    else:
+        with copy_lock(site):
+            result = site.run(ssh=remote)
+        expected = ("copy_deferred", 3)
+
+    assert result.exit_code == expected[1], result.output
+    assert "no new full:" in result.stdout
+    outcome = last_run(site)
+    assert (outcome.result, outcome.exit_code) == expected
+    assert outcome.facts == original.facts
+    assert site.rows() == units
+    assert len(site.history.deliveries()) == 1
+
+
+def test_copy_is_not_started_by_a_dry_run_failed_export_or_busy_export_lock(tmp_path):
+    site = make_site(tmp_path, extra=COPY, marker=False)
+    remote = Remote()
+
+    with process_lock(site.lock_file):
+        busy = site.run(ssh=remote)
+    assert busy.exit_code == 3
+    assert last_run(site).result == "locked"
+    assert site.run(ssh=remote).exit_code == 1
+    assert last_run(site).result == "destination_not_ready"
+
+    (site.root / "STAGE1" / MARKER).touch()
+    dry = site.run("--dry-run", ssh=remote)
+    assert dry.exit_code == 0
+    assert remote.calls == []
+    assert site.history.deliveries() == []
+
+
+def test_too_old_full_leaves_delivery_pending_without_ssh(tmp_path):
+    site = make_site(tmp_path, extra="max_full_age_hours = 26\n" + COPY)
+    remote = Remote()
+    with copy_lock(site):
+        first = site.run(ssh=remote)
+    assert first.exit_code == 3, "the successful export must create a delivery to defer"
+    before = site.history.deliveries()
+
+    late = site.run(now=STOP + timedelta(hours=30), ssh=remote)
+
+    assert late.exit_code == 1
+    assert last_run(site).result == "full_too_old"
+    assert remote.calls == []
+    assert site.history.deliveries() == before
 
 
 def test_last_run_of_a_full_too_old_has_its_result_and_exit_code(tmp_path):

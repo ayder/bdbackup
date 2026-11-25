@@ -40,7 +40,7 @@ def test_schema_3_database_upgrades_to_4(tmp_path):
     new.write_bytes(b"new")
     history.run("job", "file", lambda: BackupResult(new, success=True), {"kind": "file"})
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"gfs_units", "gfs_locations", "gfs_steps"} <= tables
     _, old_row = history.records()
@@ -92,7 +92,7 @@ def test_schema_4_database_upgrades_to_5(tmp_path):
     new.write_bytes(b"new")
     history.run("job", "file", lambda: BackupResult(new, success=True), {"kind": "file"})
     with closing(sqlite3.connect(path)) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
         columns = [r[1] for r in db.execute("PRAGMA table_info(gfs_locations)")]
         assert "identities" in columns
         location = db.execute(

@@ -35,6 +35,18 @@ run stays restorable. With it, each run writes a new archive such as
 `daily-2026-09-29-020000.tar.gz`, and a run that would reuse an existing name
 fails instead. File jobs that GFS rotates set `timestamp = true`.
 
+## Copy the archive to an SSH server
+
+With `[history]` and `timestamp = true`, add a `copy` table to the job.
+
+```toml
+[files-daily.copy]
+destination = "ssh://backup@vault.example.com/srv/bdbackup/files-daily"
+method = "rsync"
+```
+
+For server setup, verification and retries, see the [SSH copy guide](README_COPY.md).
+
 ## Dry run
 
 List what a job would archive without writing it:

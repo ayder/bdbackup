@@ -13,23 +13,22 @@
 #   engines/*.py         user-defined database engines (see docs/README_ENGINES.md)
 #
 # Except for [history] and [metrics], each top-level table is one job; its name is the table
-# name and it must set `type`: file | mysqldump | xtrabackup | pgbackrest | gfs, or any engine
+# name and it must set `type`: file | mysqldump | xtrabackup | pgbackrest | pbm | gfs, or any engine
 # registered by a dropped-in module (e.g. a future xtrabackup80 or mysql-shell).
 # Any job may set active = false to pause it: `run -j` then refuses it (exit 2)
 # and --validate names it as not checked. Schedule jobs with your own crontab
 # lines (see the README, "Scheduling with cron"); xtrabackup jobs can use systemd
 # timers instead (docs/README_SYSTEMD.md). --validate checks settings/access/grants
 # without backups.
-# Other keys (except type, active and restore_root) are passed to the backend
+# Other keys (except type, active, restore_root and the copy table) are passed to the backend
 # constructor (FileBackup / bdbackup.mysql.MySQLBackup / bdbackup.mysql.XtraBackup /
-# bdbackup.postgres.PgBackRest), so key names use Python-style underscores
+# bdbackup.postgres.PgBackRest / bdbackup.mongodb.pbm.PBM), so key names use Python-style underscores
 # (e.g. exclude_templates).
 # Paths expand ~ and resolve relative to this config file; template/exclude
 # entries resolve relative to chdir (or the process working directory).
 # A key the backend does not accept fails the job (exit 1); --validate reports
-# it as FAIL and --dry-run refuses it (exit 2). A pgbackrest job is the
-# exception: a key it does not accept, or an empty stanza, is a usage error,
-# so a real run exits 2 too.
+# it as FAIL and --dry-run refuses it (exit 2). Validation of job settings during config
+# loading can exit 2 for pgbackrest and pbm jobs, including in a real run.
 #
 # Types must match the constructor: strings for paths, integers for ports,
 # booleans for flags, and arrays of strings for the exclusion lists.
@@ -119,6 +118,17 @@ exclude_pattern = ["*.log", "node_modules"]
 #    matters for cron/systemd jobs. Gitignore syntax: trailing "/" matches
 #    directories only, a leading "/" anchors to the chdir root, "!" negates.
 exclude_templates = ["python-dev"]
+
+# Optional SSH copy for this job. Keep [history] and enable timestamp above.
+# [files-daily.copy]
+# Existing dedicated directory on the SSH server, with an absolute path.
+# destination = "ssh://backup@vault.example.com/srv/bdbackup/files-daily"
+# Transfer tool: "rsync" or "scp" (required when using copy).
+# method = "rsync"
+# Optional OpenSSH client configuration passed as -F; relative to this TOML file.
+# ssh_config = "backup-ssh.conf"
+# Optional transfer rate in KiB/s as a positive whole number.
+# bwlimit = 20000
 
 # ---------------------------------------------------------------------------
 # mysqldump: logical dump of one database (`database`), or of all databases
@@ -306,3 +316,41 @@ keep = "7y"
 # paths = ["/mnt/backup/pg"]
 # period = "daily"
 # keep = "14d"
+
+# ---------------------------------------------------------------------------
+# PBM: take a full MongoDB backup and write one tar (docs/README_PBM.md).
+# Uncomment this job to use it. It requires [history] and a job name using
+# ASCII letters, digits or . _ - + = @ , % ~.
+# ---------------------------------------------------------------------------
+# [mongo-nightly]
+# type = "pbm"
+#
+# PBM's initialized filesystem storage as seen by this host (required).
+# Run as an OS user with read/search permissions here. Keep storage_path
+# separate from the output, history database, recovery roots and GFS stages.
+# storage_path = "/var/lib/pbm/backups"
+#
+# Output directory for the tar (required). Its filesystem must support hard
+# links. For rotation, use a directory at or below the first GFS stage.
+# out_dir = "/backup/daily/mongo"
+#
+# Full backup type: "logical" (default) or "physical". Physical backups
+# require Percona Server for MongoDB.
+# backup_type = "logical"
+#
+# Path or name of the PBM executable (defaults to "pbm").
+# binary = "pbm"
+#
+# Optional URI. Use a config at mode 0600 if you set this key. Otherwise set
+# PBM_MONGODB_URI in the run's environment. Leave out directConnection=true.
+# mongodb_uri = "mongodb://pbmuser:REPLACE_ME@mongo.example.com:27017/?replicaSet=rs0"
+#
+# Optional override of [history] restore_root for this job.
+# restore_root = "/restore/mongo"
+#
+# Optional SSH copy of the published tar (docs/README_COPY.md).
+# [mongo-nightly.copy]
+# destination = "ssh://backup@vault.example.com/srv/bdbackup/mongo-nightly"
+# method = "rsync"              # "rsync" or "scp"
+# ssh_config = "backup-ssh.conf"  # optional OpenSSH client configuration
+# bwlimit = 20000               # optional transfer limit in KiB/s

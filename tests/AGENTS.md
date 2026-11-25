@@ -19,7 +19,7 @@ Measured baselines before calling the gate.
 | Layer | What it runs | Environment | Where |
 |---|---|---|---|
 | `unit` | pytest tests of the package and the CLI (`click.testing.CliRunner`). Backup tools and database clients are never executed: physical backups use the `physical_runner` fixture (`tests/conftest.py`) through a patched `subprocess.run`; MySQL clients are patched as in `tests/test_helpers.py`. | `local-python` | `tests/` |
-| `integration` | Real servers and real backup tools in disposable, network-isolated Docker containers with synthetic data; a restore starts a server on the recovered data and checks rows; `bdbackup metrics` runs against a hard NFS mount whose server stops answering, a GFS run renames a unit within that mount (and copies one onto it), and the metrics file shows the share's capacity, ledger snapshot and drift. | `docker` | `scripts/integration_mysql.py`, `scripts/integration_physical.py`, `scripts/integration_pgbackrest.py`, `scripts/integration_nfs_outage.py` |
+| `integration` | Real servers and real backup tools in disposable, network-isolated Docker containers with synthetic data; a restore starts a server on the recovered data and checks rows; `bdbackup metrics` runs against a hard NFS mount whose server stops answering, a GFS run renames a unit within that mount (and copies one onto it), and the metrics file shows the share's capacity, ledger snapshot and drift. SSH copies run the candidate wheel against a loopback sshd and verify publication, permissions, refusal and interrupted-transfer recovery. PBM runs the candidate wheel against a real replica set, checks the archive and restores the rows. | `docker` | `scripts/integration_mysql.py`, `scripts/integration_physical.py`, `scripts/integration_pgbackrest.py`, `scripts/integration_nfs_outage.py`, `scripts/integration_ssh_copy.py`, `scripts/integration_pbm.py` |
 
 - `local-python`: Python 3.12+, editable install `pip install -e '.[dev]'` in `.venv/`. CI runs
   Python 3.12, 3.13 and 3.14.
@@ -40,6 +40,38 @@ Measured baselines before calling the gate.
     Its run is `--privileged --network none`: it needs a Linux kernel with an NFS server and
     iptables (Docker Desktop's VM has both), and serves and mounts NFS over loopback.
 
+  - `bdbackup-ssh-copy:ubuntu-22.04` and `bdbackup-ssh-copy:ubuntu-24.04`, built
+    from the checkout's wheel with `scripts/docker/ssh-copy.Dockerfile`. Build
+    and run these commands in order:
+    ```sh
+    .venv/bin/python scripts/integration_ssh_copy.py --build-probe-images
+    .venv/bin/python scripts/integration_ssh_copy.py
+    ```
+    The first command builds both images in sequence. The second checks each
+    image's source fingerprint, which `--source-hash` prints, and runs the
+    fixtures one at a time with `--network none`. The SSH server listens on
+    loopback and uses keys generated inside the fixture. For one case, run
+    `.venv/bin/python scripts/integration_ssh_copy.py --ubuntu 24.04 --case checksum`.
+    The `--help` output lists every case. The prerequisite probe is
+    `.venv/bin/python scripts/integration_ssh_copy.py --probe all`.
+
+  - `bdbackup-pbm:mongo6-pbm210` (MongoDB 6.0, PBM 2.10.0) and
+    `bdbackup-pbm:mongo7-pbm217` (MongoDB 7.0, PBM 2.17.0) are built from the
+    candidate wheel with `scripts/docker/pbm.Dockerfile`. Build the two images,
+    then run the prerequisite probe and the integration in order.
+    ```sh
+    .venv/bin/python scripts/integration_pbm.py --build-probe-images
+    .venv/bin/python scripts/integration_pbm.py --probe all
+    .venv/bin/python scripts/integration_pbm.py
+    ```
+    The script checks the candidate source fingerprint and runs each replica set
+    on its own internal Docker network without published ports. The integration
+    ends with `Real PBM backup export and restore passed`. To run one fixture, use
+    `.venv/bin/python scripts/integration_pbm.py --fixture mongo6-pbm210`. To run
+    one case, use
+    `.venv/bin/python scripts/integration_pbm.py --fixture mongo7-pbm217 --case physical`.
+    Add `--fixture` to the build command to build one image.
+
   The scripts create and remove only their own containers, volumes and networks.
 
 Code that runs a backup tool, a database client or a restore against a server has an
@@ -53,7 +85,7 @@ Code that runs a backup tool, a database client or a restore against a server ha
 | Lint | `.venv/bin/ruff check bdbackup tests scripts` | `All checks passed!`, exit 0 |
 | Unit, all | `.venv/bin/python -m pytest -q` | last line `N passed in …`, no `failed`/`error`, exit 0 |
 | Unit, named tests with evidence | `.venv/bin/python -m pytest -v <file>::<test>` | one line per test id ending in `PASSED` or `FAILED` |
-| Integration | `.venv/bin/python scripts/integration_mysql.py`; `.venv/bin/python scripts/integration_physical.py percona`, `percona-encrypted`, `mariadb`; `.venv/bin/python scripts/integration_pgbackrest.py pg16-2.58`, `pg18-2.60`; `.venv/bin/python scripts/integration_nfs_outage.py` | each ends with its success line (`Real full and two-incremental database recovery passed` for physical runs, `Real pgBackRest export and restore passed` for pgBackRest runs, `Real NFS outage metrics test passed` for the NFS outage run) and exit 0 |
+| Integration | `.venv/bin/python scripts/integration_mysql.py`; `.venv/bin/python scripts/integration_physical.py percona`, `percona-encrypted`, `mariadb`; `.venv/bin/python scripts/integration_pgbackrest.py pg16-2.58`, `pg18-2.60`; `.venv/bin/python scripts/integration_nfs_outage.py`; `.venv/bin/python scripts/integration_ssh_copy.py`; `.venv/bin/python scripts/integration_pbm.py` | exits 0 and prints the success line specified for that integration in the gate steps below |
 | Package | `.venv/bin/python -m build && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist` | `PASSED` for every artifact from twine; smoke script exit 0 |
 
 Reading pytest evidence: only a test id's own `PASSED` / `FAILED` line in `-v` output counts.
@@ -88,7 +120,7 @@ sh -c '<commands of the step>' > <log> 2>&1; echo "exit=$?" >> <log>
    this step, reported as `expected <baseline>, measured <N>`, even when every test passed.
    You do not judge whether the change in count was intended.
 5. **Docker available.** Run `docker info --format '{{.ServerVersion}}'`.
-   Expected: a version string. Otherwise: report steps 6–12 as NOT RUN and OVERALL RED.
+   Expected: a version string. Otherwise: report steps 6–15 as NOT RUN and OVERALL RED.
 6. **Integration mysqldump.** Run `.venv/bin/python scripts/integration_mysql.py`.
    Expected: exit 0.
 7. **Integration percona.** Run `.venv/bin/python scripts/integration_physical.py percona`.
@@ -103,12 +135,21 @@ sh -c '<commands of the step>' > <log> 2>&1; echo "exit=$?" >> <log>
     Expected: exit 0 and the line `Real NFS outage metrics test passed`. The run also proves a
     rename within one NFS mount (the same inode, a report line ending `, renamed)`) and checks the
     share's capacity, ledger snapshot and drift series.
-13. **Package.** Run `rm -rf dist && .venv/bin/python -m build -q && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist`
+13. **Integration SSH copy.** Run `.venv/bin/python scripts/integration_ssh_copy.py`.
+    Expected: exit 0 and the line `Real SSH backup copies passed`. A single-case
+    run is useful for diagnosis. The gate runs the full matrix.
+14. **Integration PBM mongo6-pbm210.** Run
+    `.venv/bin/python scripts/integration_pbm.py --fixture mongo6-pbm210`.
+    Expected: exit 0 and the line `Real PBM backup export and restore passed`.
+15. **Integration PBM mongo7-pbm217.** Run
+    `.venv/bin/python scripts/integration_pbm.py --fixture mongo7-pbm217`.
+    Expected: exit 0 and the line `Real PBM backup export and restore passed`.
+16. **Package.** Run `rm -rf dist && .venv/bin/python -m build -q && .venv/bin/twine check dist/* && .venv/bin/python scripts/smoke_install.py dist`
     as one `sh -c '…'`, captured as above.
     Expected: the log contains one `Checking dist/… PASSED` line for the wheel and one for the
     sdist, then the smoke line `Installed wheel: … passed`, then `exit=0`. A log without the
     two twine lines is a FAIL of this step, even when it ends in `exit=0`.
-14. **Clean after.** Run `git status --porcelain`.
+17. **Clean after.** Run `git status --porcelain`.
     Expected: prints nothing except `dist/` if it is not ignored (it is ignored today).
 
 ### Report format
@@ -128,8 +169,11 @@ candidate: <sha>
 10 integration pgbackrest pg16-2.58: PASS|FAIL|NOT RUN
 11 integration pgbackrest pg18-2.60: PASS|FAIL|NOT RUN
 12 integration nfs outage: PASS|FAIL|NOT RUN
-13 package:             PASS|FAIL
-14 clean after:         PASS|FAIL
+13 integration ssh copy: PASS|FAIL|NOT RUN
+14 integration pbm mongo6-pbm210: PASS|FAIL|NOT RUN
+15 integration pbm mongo7-pbm217: PASS|FAIL|NOT RUN
+16 package:             PASS|FAIL
+17 clean after:         PASS|FAIL
 logs: <evidence dir>/gate/
 OVERALL: GREEN|RED
 GATE COMPLETE
@@ -149,4 +193,4 @@ here and commits it with the candidate before calling the gate; the gate agent n
 
 | Baseline | Kind | Current value | Runner | Measured at |
 |---|---|---|---|---|
-| Unit test count | inventory | 1103 passed | `.venv/bin/python -m pytest -q` | `fbfd766` |
+| Unit test count | inventory | 1451 passed | `.venv/bin/python -m pytest -q -p no:cacheprovider` | `eb6a0c6` |

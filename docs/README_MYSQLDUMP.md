@@ -27,6 +27,19 @@ applicable defaults. `--all-databases` retains these defaults.
 Single-transaction consistency applies to transactional tables; quiesce writes
 to nontransactional tables and avoid schema changes during a dump.
 
+## Copy the dump to an SSH server
+
+With `[history]` configured, add a `copy` table to your mysqldump job.
+For a job called `mysql-dump`, use:
+
+```toml
+[mysql-dump.copy]
+destination = "ssh://backup@vault.example.com/srv/bdbackup/mysql-dump"
+method = "scp"
+```
+
+For server setup, verification and retries, see the [SSH copy guide](README_COPY.md).
+
 ## Dry run
 
 A dry run of a mysqldump job names the database (or all databases) and the dump

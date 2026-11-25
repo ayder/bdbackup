@@ -58,6 +58,7 @@ logger = logging.getLogger("bdbackup.engines")
 FAMILIES: tuple[str, ...] = (
     "bdbackup.mysql",
     "bdbackup.postgres",
+    "bdbackup.mongodb",
 )
 
 

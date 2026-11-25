@@ -14,7 +14,7 @@ from pathlib import Path
 import click
 from click.core import ParameterSource
 
-from bdbackup import __version__
+from bdbackup import __version__, copy_runner
 from bdbackup.backends import BackupError, setup_logging
 from bdbackup.config import Config, ConfigError, Job, build_backend
 from bdbackup.filebackup import FileBackup
@@ -24,10 +24,14 @@ from bdbackup.gfs import structure as gfs_structure
 from bdbackup.gfs.stages import fed_first_stages
 from bdbackup.history import History, HistoryError
 from bdbackup.metrics_command import run_metrics
+from bdbackup.mongodb.pbm import PBM
+from bdbackup.mongodb.restore import describe_unit as describe_pbm_unit
+from bdbackup.mongodb.restore import restore_lines as pbm_restore_lines
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.postgres.pgbackrest import ExportProgress
 from bdbackup.postgres.restore import describe_unit, restore_lines
 from bdbackup.recovery import backup_restore_info, restore_record, suggested_destination
+from bdbackup.ssh_copy import CopySettings
 from bdbackup.templates import TemplateError
 from bdbackup.utils import process_lock
 from bdbackup.validation import validate_config
@@ -58,7 +62,8 @@ def config_option(**kwargs):
 def main(log_level: str) -> None:
     """Backups by design.
 
-    File and MySQL/MariaDB backups with verification, retention, and guided recovery.
+    File, MySQL, MariaDB, PostgreSQL and MongoDB backups with verification,
+    retention, and guided recovery.
     """
     setup_logging(getattr(logging, log_level.upper(), logging.INFO))
 
@@ -105,12 +110,21 @@ def _history_config(path: Path | None) -> Config:
     return config
 
 
-def _tracked_backup(config, name, backup_type, action, restore_info=None, *, encrypted=False):
+def _tracked_backup(
+    config, name, backup_type, action, restore_info=None, *,
+    encrypted=False, copy: CopySettings | None = None,
+):
     if config.history:
         return History(config.history).run(
-            name, backup_type, action, restore_info, encrypted=encrypted,
+            name, backup_type, action, restore_info, encrypted=encrypted, copy=copy,
         )
     return action()
+
+
+def _run_copy(config: Config, job: Job) -> int:
+    if job.copy is None:
+        return EXIT_OK
+    return copy_runner.run_job(History(config.history), job.name, job.copy, _echo)
 
 
 def _protect_history(backend, config):
@@ -153,6 +167,11 @@ def _handle_errors(func, *args, **kwargs) -> int:
     return code if isinstance(code, int) else EXIT_OK
 
 
+def _dry_copy(job: Job) -> None:
+    if job.copy is not None:
+        _echo(f"Dry run; configured copy: {job.copy.destination} ({job.copy.method})")
+
+
 def _dry_run(config: Config, job: Job, incremental: bool) -> None:
     """Report what a run of ``job`` would do; run no tool and write nothing."""
     backend = build_backend(job)
@@ -162,6 +181,9 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
         _echo(f"Dry run; would create: {backend.tar_filename}")
     elif isinstance(backend, MySQLBackup):
         _echo(f"Dry run; would dump {backend.selection()} into {backend.out_dir}")
+    elif isinstance(backend, PBM):
+        _echo(f"Dry run; would take a {backend.backup_type} PBM backup and export it into "
+              f"{backend.out_dir}")
     elif isinstance(backend, XtraBackup) and incremental:
         _echo(f"Dry run; would take an incremental of {backend.incremental_parent()} "
                    f"under {backend.backup_root}")
@@ -169,6 +191,7 @@ def _dry_run(config: Config, job: Job, incremental: bool) -> None:
         _echo(f"Dry run; would take a full backup under {backend.backup_root}")
     else:
         raise click.UsageError(f"--dry-run is not supported for job type {job.type!r}")
+    _dry_copy(job)
 
 
 @dataclass
@@ -307,11 +330,32 @@ def _run_pgbackrest(
             began.append(_now())
             return engine.export(full, verify=verify, progress=outcome.progress)
 
-        result = _tracked_backup(config, job.name, "pgbackrest-full", export, info)
+        result = _tracked_backup(config, job.name, "pgbackrest-full", export, info, copy=job.copy)
     outcome.result = "exported"
     outcome.facts = _export_facts(full, result, outcome.progress, began[0])
     _echo(f"Job {job.name}: {result.path}")
     return EXIT_OK
+
+
+def _run_pgbackrest_job(
+    config: Config, job: Job, *, verify: bool, dry_run: bool, outcome: _Outcome
+) -> int:
+    code = _run_pgbackrest(config, job, verify=verify, dry_run=dry_run, outcome=outcome)
+    if dry_run:
+        _dry_copy(job)
+        return code
+    if code != EXIT_OK or job.copy is None:
+        return code
+
+    # The export lock is released. Keep its facts and report any copy-phase failure.
+    export_result = outcome.result
+    outcome.result = "copy_failed"
+    code = _run_copy(config, job)
+    if code == EXIT_OK:
+        outcome.result = export_result
+    elif code == EXIT_LOCKED:
+        outcome.result = "copy_deferred"
+    return code
 
 
 @main.command(name="run")
@@ -404,7 +448,7 @@ def run(
         outcome = _Outcome()
         with nullcontext() if dry_run else _last_run(config, job, outcome):
             ctx.exit(_handle_errors(
-                _run_pgbackrest, config, job, verify=verify, dry_run=dry_run, outcome=outcome
+                _run_pgbackrest_job, config, job, verify=verify, dry_run=dry_run, outcome=outcome
             ))
     if dry_run:
         return _handle_errors(_dry_run, config, job, incremental)
@@ -412,6 +456,9 @@ def run(
 
     def _create():
         backend = build_backend(job)
+        if isinstance(backend, PBM):
+            # PBM verifies its temporary tar before publication.
+            return backend.backup(job.name, verify=verify, restore_info=info)
         _protect_history(backend, config)
         info.update(backup_restore_info(backend))
         result = (
@@ -425,13 +472,18 @@ def run(
         return result
 
     backup_type = job.type
+    guard = nullcontext()
     if job.type == "xtrabackup":
         backup_type = "xtrabackup-incremental" if incremental else "xtrabackup-full"
+    elif job.type == "pbm":
+        backup_type = f"pbm-{job.params.get('backup_type', 'logical')}"
+        guard = process_lock(Path(f"{config.history.database}.pbm-{job.name}.lock"))
     try:
-        result = _tracked_backup(
-            config, job.name, backup_type, _create, info,
-            encrypted=job.params.get("encrypt") is True,
-        )
+        with guard:
+            result = _tracked_backup(
+                config, job.name, backup_type, _create, info,
+                encrypted=job.params.get("encrypt") is True, copy=job.copy,
+            )
     except BlockingIOError as exc:
         logger.error("Job %r locked: %s", job.name, exc)
         ctx.exit(EXIT_LOCKED)
@@ -439,7 +491,7 @@ def run(
         logger.error("Job %r failed: %s", job.name, exc)
         ctx.exit(EXIT_BACKUP_FAILED)
     _echo(f"Job {job.name}: {result.path}")
-    return EXIT_OK
+    ctx.exit(_handle_errors(_run_copy, config, job))
 
 
 def _restore_mode(config_path, backup_id, job, yes, dst, archive, backup, root, binary,
@@ -469,10 +521,13 @@ def _restore_mode(config_path, backup_id, job, yes, dst, archive, backup, root, 
 
 
 def _echo_restore_command(directory: Path) -> None:
-    """Print the pgbackrest restore command if ``directory`` holds an extracted pgBackRest unit."""
+    """Print the operator steps for an extracted pgBackRest or PBM unit."""
     facts = describe_unit(directory)
     if facts is not None:
         for line in restore_lines(facts, directory.expanduser().absolute()):
+            _echo(line)
+    elif (pbm_facts := describe_pbm_unit(directory)) is not None:
+        for line in pbm_restore_lines(pbm_facts):
             _echo(line)
 
 
@@ -589,7 +644,7 @@ def restore(
             _echo(f"Prepared recovery directory: {restored}")
         else:
             _echo(f"Restored to: {restored}")
-        if record.backup_type == "pgbackrest-full":
+        if record.backup_type in {"pgbackrest-full", "pbm-logical", "pbm-physical"}:
             _echo_restore_command(restored)
 
     return _handle_errors(_run)
@@ -621,16 +676,25 @@ def history_cmd(config_path: Path, job: str | None, successful: bool,
         records = history.records(job=job, successful=successful)
         suffixes = gfs_store.listing_suffixes(history)
         known = gfs_store.places(history)
+        deliveries = {delivery.record_id: delivery for delivery in history.deliveries(job=job)}
         if not records:
             _echo("No backup history found.")
         for record in records:
             available = "available" if gfs_store.available(record, known) else "unavailable"
+            # A backup can finish between the records and deliveries reads.
+            delivery = deliveries.get(record.id) if record.status == "success" else None
+            copy_suffix = ""
+            if delivery is not None:
+                copy_suffix = f" | copy {delivery.status}"
+                if delivery.failure_class is not None:
+                    copy_suffix += f" ({delivery.failure_class})"
             _echo(
                 f"{record.id}: {record.job_name} | {record.backup_type} | {record.started_at} | "
                 f"{record.status} | {available} | "
                 f"{'encrypted' if record.encrypted else 'unencrypted'} | {record.path or '-'}"
                 f" | unit {record.unit or '-'}"
                 f"{suffixes.get(record.unit, '') if record.unit else ''}"
+                f"{copy_suffix}"
             )
 
     _handle_errors(_checksums if create_checksum else _listing)

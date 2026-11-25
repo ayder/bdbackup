@@ -6,7 +6,6 @@ full to export. Reading the repository is :mod:`bdbackup.postgres.repository`.
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
@@ -20,6 +19,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from bdbackup import tar_export
 from bdbackup.backends import BackupError, BackupResult
 from bdbackup.engines import EngineInfo
 from bdbackup.gfs.stages import MARKER
@@ -39,6 +39,10 @@ from bdbackup.postgres.repository import (
 )
 
 TESTED_VERSIONS = ("2.58.0", "2.60.0")
+
+# Keep the existing export's test hooks bound to the classes used by the shared helpers.
+_HashingWriter = tar_export.HashingWriter
+_HashingReader = tar_export.HashingReader
 
 
 @dataclass(frozen=True)
@@ -427,7 +431,7 @@ class PgBackRest:
                 os.close(fd)
             temp.unlink(missing_ok=True)
             raise
-        _fsync_dir(self.out_dir)
+        tar_export.fsync_dir(self.out_dir)
         progress.step = "done"
         return BackupResult(
             final, size_bytes=writer.size, success=True, checksum=writer.sha256.hexdigest()
@@ -438,21 +442,14 @@ class PgBackRest:
         pattern = re.compile(
             re.escape(f".{self.stanza}-") + LABEL.pattern + r"\.tar\.tmp-[0-9a-f]{32}"
         )
-        with os.scandir(self.out_dir) as scan:
-            stale = [
-                Path(entry.path)
-                for entry in scan
-                if pattern.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
-            ]
-        for path in stale:
-            path.unlink(missing_ok=True)
+        tar_export.remove_stale_temps(self.out_dir, pattern)
 
     def _write_tar(self, writer: _HashingWriter, label: str) -> list[str]:
         """Write the full's directory, then its info file pairs; return the member names."""
         root = self.repo_path.resolve()
         names = []
         # Not a ``with`` block: closing after a failed write would write to the file again.
-        tar = tarfile.open(fileobj=writer, mode="w|", bufsize=_CHUNK)
+        tar = tarfile.open(fileobj=writer, mode="w|", bufsize=tar_export.CHUNK)
         for path in full_entries(root, self.stanza, label):
             arcname = path.relative_to(root).as_posix()
             _add_entry(tar, path, arcname)
@@ -477,33 +474,7 @@ class PgBackRest:
 
     @staticmethod
     def _read_back(path: Path, unit: Path, checksum: str, written: list[str]) -> None:
-        """Read the tar at ``path`` once: walk its members and re-hash every byte.
-
-        ``unit`` is the name the tar is published under; a failure names it, not ``path``.
-        """
-        try:
-            with open(path, "rb") as stream:
-                reader = _HashingReader(stream)
-                names = []
-                with tarfile.open(fileobj=reader, mode="r|", bufsize=_CHUNK) as tar:
-                    for member in tar:
-                        names.append(member.name)
-                        if member.isfile():
-                            with tar.extractfile(member) as data:
-                                while data.read(_CHUNK):
-                                    pass
-                # The zero blocks and padding after the last member are part of the digest.
-                while reader.read(_CHUNK):
-                    pass
-        except (tarfile.TarError, OSError, EOFError) as exc:
-            raise BackupError(f"verification of {unit} failed: {exc}") from exc
-        digest = reader.sha256.hexdigest()
-        if digest != checksum:
-            raise BackupError(
-                f"verification of {unit} failed: checksum {digest} read back, {checksum} written"
-            )
-        if names != written:
-            raise BackupError(f"verification of {unit} failed: members differ from those written")
+        tar_export.read_back(path, unit, checksum, written, opener=open)
 
     def backup(self, name: str | None = None) -> BackupResult:
         """Not used: a pgbackrest job exports through ``bdbackup run`` only."""
@@ -512,9 +483,6 @@ class PgBackRest:
     def prune(self) -> list[Path]:
         """Nothing to prune: the GFS job that owns ``out_dir`` rotates the units."""
         return []
-
-
-_CHUNK = 1024 * 1024  # tar stream buffer: fewer, larger reads and writes over NFS
 
 
 def _usable_dir(path: Path, mode: int) -> bool:
@@ -560,54 +528,6 @@ def _add_entry(tar: tarfile.TarFile, path: Path, arcname: str) -> None:
             source.close()
     if source is not None and _changed(path, before):
         raise BackupError(f"input changed during export: {path}")
-
-
-def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-class _HashingWriter:
-    """A write-only file object over ``fd`` that feeds every byte written to SHA-256."""
-
-    def __init__(self, fd: int):
-        self.fd = fd
-        self.sha256 = hashlib.sha256()
-        self.size = 0
-        self.discarding = False
-
-    def discard(self) -> None:
-        """Drop every later write: the export failed and ``fd`` is about to be closed."""
-        self.discarding = True
-
-    def write(self, data) -> int:
-        if self.discarding:
-            return len(data)
-        view = memoryview(data)
-        while view:
-            count = os.write(self.fd, view)
-            self.sha256.update(view[:count])
-            self.size += count
-            view = view[count:]
-        return len(data)
-
-
-class _HashingReader:
-    """A read-only file object that feeds every byte read to SHA-256."""
-
-    def __init__(self, stream):
-        self.stream = stream
-        self.sha256 = hashlib.sha256()
-        self.size = 0
-
-    def read(self, size: int = -1) -> bytes:
-        data = self.stream.read(size)
-        self.sha256.update(data)
-        self.size += len(data)
-        return data
 
 
 ENGINE = EngineInfo(

@@ -112,7 +112,7 @@ def sql(env, statement, *args):
 
 
 def touch_database(env):
-    """Create the schema-6 history database without a record of any configured job."""
+    """Create a history database without a record of any configured job."""
     env.history.record_last_run("unrelated", "file", 0, "completed")
 
 

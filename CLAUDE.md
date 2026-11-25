@@ -22,9 +22,11 @@ updates the baselines there before calling it.
 | `docs/README_XTRABACKUP.md` | xtrabackup jobs (Percona XtraBackup and MariaDB Backup), `restore --backup`, encryption, engine pruning. |
 | `docs/README_SYSTEMD.md` | Running xtrabackup jobs from systemd units and timers. |
 | `docs/README_PGBACKREST.md` | pgbackrest jobs: exporting a pgBackRest full as one tar into a GFS first stage, `max_full_age_hours`, restore and the printed pgBackRest command. |
+| `docs/README_PBM.md` | pbm jobs: logical and physical MongoDB backups, storage on a secondary or shared across nodes, tar export, GFS and SSH copy, retention and guided restore. |
 | `docs/README_METRICS.md` | The metrics command, `[metrics]`, the catalogue of metrics, PMM and node_exporter setup, alerting, hangs and outages, and the limits. |
 | `docs/README_ENGINES.md` | The engine registry and custom engine plugins. |
 | `docs/README_GFS.md` | The ledger and GFS rotation, including `--initialize-structure`. |
+| `docs/README_COPY.md` | Per-job SSH copies, configuration, server setup, checksum verification, publication, retry, and failure remedies. |
 | `config.toml.example` | Every config key with a comment. |
 
 Search tool for documentation sweeps: `rg` (ripgrep), over `README.md`, `docs/`,

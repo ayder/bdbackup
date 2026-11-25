@@ -11,14 +11,17 @@ import shutil
 import stat
 import subprocess
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from bdbackup.config import Config, Job, build_backend
 from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import MARKER, fed_first_stages
+from bdbackup.mongodb.pbm import PBM, URI_ENV, PBMError
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.mysql.helpers import mysql_cnf_file
+from bdbackup.ssh_copy import CopyCommandError, CopySettings, SSHConnection
 
 
 def os_user() -> str:
@@ -182,6 +185,89 @@ def _binary(report: Report, name: str) -> None:
         report.add("OK", f"Executable: {found}")
     else:
         report.add("FAIL", f"Required executable {name!r} is missing or not executable in PATH.")
+
+
+def _copy_executable(report: Report, tool: str) -> bool:
+    found = shutil.which(tool)
+    if found:
+        report.add("OK", f"SSH copy local {tool} is available at {found}.")
+        return True
+    package = "rsync" if tool == "rsync" else "OpenSSH"
+    report.add(
+        "FAIL", f"SSH copy local {tool} is missing. Install {package} and put {tool} in PATH.",
+    )
+    return False
+
+
+def _ssh_copy(report: Report, settings: CopySettings) -> None:
+    ssh_available = _copy_executable(report, "ssh")
+    _copy_executable(report, settings.method)
+    config_readable = True
+    if settings.ssh_config is not None:
+        path = settings.ssh_config
+        config_readable = _stat(path).is_file and _access(path, os.R_OK)
+        if config_readable:
+            report.add("OK", f"SSH copy ssh_config {path} is readable.")
+        else:
+            report.add(
+                "FAIL", f"SSH copy ssh_config {path} is unreadable. "
+                f"Give OS user {os_user()} read access.",
+            )
+
+    directory = settings.path
+    probes = [
+        (
+            "destination", f"destination {directory}",
+            f"test -d {directory} && test -w {directory} && test -x {directory}",
+            "is a writable directory.",
+            f"Create the directory {directory} and give the SSH account write and search access.",
+        ),
+        (
+            "sha256sum", "remote sha256sum", "command -v sha256sum >/dev/null", "is available.",
+            "Install GNU coreutils or BusyBox on the SSH server.",
+        ),
+        (
+            "stat", "remote stat -c %a",
+            f"test -d {directory} && stat -c %a -- {directory} >/dev/null",
+            f"can read the mode of {directory}.",
+            "Install GNU coreutils or BusyBox and check access to the directory.",
+        ),
+    ]
+    if settings.method == "rsync":
+        probes.append((
+            "rsync", "remote rsync", "command -v rsync >/dev/null", "is available.",
+            "Install rsync on the SSH server and put it in the account's PATH.",
+        ))
+
+    detected = None
+    if not ssh_available or not config_readable:
+        remedy = (
+            "Install ssh and retry validation." if not ssh_available
+            else "Make the configured SSH file readable and retry validation."
+        )
+        report.add("FAIL", f"SSH copy connection could not be checked. {remedy}")
+    else:
+        command = "; ".join(
+            f"if {check}; then printf '%s\\n' {token}; fi" for token, _, check, _, _ in probes
+        )
+        try:
+            detected = set(SSHConnection(settings).run(command).splitlines())
+        except CopyCommandError as exc:
+            report.add(
+                "FAIL",
+                f"SSH copy connection to {settings.destination} failed ({exc.failure_class}). "
+                "Check network access, the known host key and key-based login for this account.",
+            )
+        else:
+            report.add("OK", f"SSH copy connection to {settings.destination} is non-interactive.")
+
+    for token, label, _, message, remedy in probes:
+        if detected is not None and token in detected:
+            report.add("OK", f"SSH copy {label} {message}")
+        else:
+            if detected is None:
+                remedy = "Restore the SSH connection and retry validation."
+            report.add("FAIL", f"SSH copy {label} could not be confirmed. {remedy}")
 
 
 def _settings(job: Job) -> None:
@@ -423,6 +509,130 @@ def _gfs(report: Report, job: Job, config_path: Path, fed: bool) -> None:
                     report.add("OK", f"Stage path {path}: writable, marker present and writable")
 
 
+_TESTED_PBM_VERSIONS = ("2.10.0", "2.17.0")
+
+
+def _pbm_version_token(value: object) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9.+_-]+", value):
+        return None
+    return re.sub(r"^v(?=[0-9])", "", value)
+
+
+def _pbm_version(report: Report, backend: PBM, on_warning: Callable[[str], None]) -> str | None:
+    try:
+        version = _pbm_version_token(backend.version(on_warning=on_warning).get("Version"))
+        if version is None:
+            raise PBMError("pbm version did not report a version")
+    except PBMError as exc:
+        report.add("FAIL", f"PBM version: {exc}. Install a PBM executable that matches the agents.")
+        return None
+    note = ""
+    if version not in _TESTED_PBM_VERSIONS:
+        note = f" (not a tested version: {', '.join(_TESTED_PBM_VERSIONS)})"
+    report.add("OK", f"PBM {version}{note}")
+    return version
+
+
+def _pbm_agent_checks(
+    report: Report, backend: PBM, version: str | None, on_warning: Callable[[str], None],
+) -> None:
+    try:
+        # PBM 2.10 can open the storage when the backups section is requested.
+        cluster = backend.status(cluster_only=True, on_warning=on_warning).get("cluster")
+        if not isinstance(cluster, list) or any(
+            not isinstance(replica, dict) or not isinstance(replica.get("nodes"), list)
+            for replica in cluster
+        ):
+            raise PBMError("pbm status did not report the replica set nodes")
+        nodes = [node for replica in cluster for node in replica["nodes"]]
+        if any(not isinstance(node, dict) for node in nodes):
+            raise PBMError("pbm status returned invalid agent data")
+    except PBMError as exc:
+        report.add("FAIL", f"PBM status: {exc}. Check that the URI reaches the replica set.")
+        return
+    report.add("OK", "PBM status answered.")
+
+    failed = []
+    versions = set()
+    healthy_without_version = False
+    for node in nodes:
+        agent_version = _pbm_version_token(node.get("agent"))
+        if agent_version is not None:
+            versions.add(agent_version)
+        if node.get("ok") is True:
+            healthy_without_version |= agent_version is None
+        else:
+            host = node.get("host")
+            failed.append(
+                host if isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9_.:\[\]-]+", host)
+                else "unknown node"
+            )
+    healthy = len(nodes) - len(failed)
+    health = f"{healthy} of {len(nodes)} OK."
+    if failed:
+        health += f" Not OK: {', '.join(failed)}."
+    if healthy:
+        report.add("OK", f"PBM agents: {health}")
+    else:
+        report.add(
+            "FAIL", f"PBM agents: {health} Start or repair a pbm-agent and check its storage.",
+        )
+
+    if version is not None and versions == {version} and not healthy_without_version:
+        report.add("OK", f"PBM command and agents use version {version}.")
+    else:
+        agent_versions = ", ".join(sorted(versions)) or "unavailable"
+        report.add(
+            "FAIL", f"PBM version agreement: CLI {version or 'unavailable'}, agents "
+            f"{agent_versions}. Install matching PBM and agent versions and check agent status.",
+        )
+
+
+def _pbm(report: Report, backend: PBM) -> None:
+    found = shutil.which(backend.binary)
+    if found:
+        report.add("OK", f"Executable: {found}")
+    else:
+        report.add(
+            "FAIL", f"PBM executable {backend.binary!r} is missing or not executable. "
+            "Install Percona Backup for MongoDB and put pbm in PATH or set binary.",
+        )
+    connection = (backend.mongodb_uri or os.environ.get(URI_ENV, "")).strip()
+    if connection:
+        report.add("OK", "PBM connection string is set.")
+    else:
+        report.add("FAIL", f"PBM connection string: set mongodb_uri or {URI_ENV}.")
+
+    warnings: list[str] = []
+    if found:
+        version = _pbm_version(report, backend, warnings.append)
+        if connection:
+            _pbm_agent_checks(report, backend, version, warnings.append)
+            try:
+                storage_type = backend.storage_type(on_warning=warnings.append)
+            except PBMError as exc:
+                report.add("FAIL", f"PBM storage type: {exc}. Check PBM's storage configuration.")
+            else:
+                if storage_type == "filesystem":
+                    report.add("OK", "PBM storage type: filesystem.")
+                else:
+                    report.add("FAIL", "PBM storage type: set PBM storage.type to filesystem.")
+    for warning in dict.fromkeys(warnings):
+        report.add("NOTE", warning)
+
+    _directory(report, backend.storage_path, "PBM storage")
+    marker = backend.storage_path / ".pbm.init"
+    found_marker = _stat(marker)
+    if not found_marker.exists and not found_marker.unreachable and found_marker.error is None:
+        report.add(
+            "FAIL", f"PBM storage marker: {marker} is missing. "
+            "Point storage_path at PBM's initialized filesystem storage.",
+        )
+    else:
+        _file(report, marker, "PBM storage marker")
+    _directory(report, backend.out_dir, "Backup destination", write=True, create=True)
+
+
 def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
     report = Report()
     report.lines.append(
@@ -447,6 +657,8 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
         try:
             if job.restore_root is not None:
                 _directory(report, job.restore_root, "Recovery root", write=True, create=True)
+            if job.copy is not None:
+                _ssh_copy(report, job.copy)
             if job.type == "gfs":
                 first = job.params["stage"][0].paths[0]
                 _gfs(report, job, config.path, first in fed_first_stages(config.jobs))
@@ -454,6 +666,9 @@ def validate_config(config: Config, jobs: list[Job]) -> tuple[list[str], bool]:
             if job.type == "pgbackrest":
                 for status, message in build_backend(job).preflight():
                     report.add(status, message)
+                continue
+            if job.type == "pbm":
+                _pbm(report, build_backend(job))
                 continue
             if job.type not in {"file", "xtrabackup", "mysqldump"}:
                 report.add("FAIL", f"Preflight checks are not implemented for engine {job.type!r}.")
