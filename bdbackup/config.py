@@ -12,7 +12,9 @@ from bdbackup.filebackup import FileBackup
 from bdbackup.gfs.stages import check_gfs_config, parse_gfs_job, pgbackrest_first_stage
 from bdbackup.history import HistorySettings
 from bdbackup.metrics.settings import MetricsSettings, parse_metrics
-from bdbackup.ssh_copy import CopySettings
+from bdbackup.mysql.mysqldump import MySQLBackup
+from bdbackup.postgres.pgbackrest import PgBackRest
+from bdbackup.ssh_copy import CopySettings, parse_copy_settings, safe_artifact_name
 from bdbackup.utils import lexical_path, real_path
 
 
@@ -34,6 +36,7 @@ class ConfigError(Exception):
 
 # Keys removed in 0.7.0, by the job types that had them (None: every type).
 _REMOVED_KEYS = {"schedule": None, "apply": {"gfs"}, "jobs": {"mysqldump"}}
+_COPY_ENGINES = {"mysqldump": MySQLBackup, "pgbackrest": PgBackRest}
 
 
 def supported_types() -> set[str]:
@@ -91,6 +94,7 @@ class Config:
                 raise ConfigError("[metrics] requires a [history] section")
             self.metrics = settings
 
+        destinations: dict[tuple[str, str | None, str], str] = {}
         for name, section in data.items():
             if not isinstance(section, dict):
                 raise ConfigError(f"Job {name!r} must be a table")
@@ -107,6 +111,16 @@ class Config:
             active = section.pop("active", True)
             if not isinstance(active, bool):
                 raise ConfigError(f"Job {name!r}: active must be true or false")
+            copy = None
+            if "copy" in section:
+                try:
+                    copy, destination = self._load_copy(job_type, section)
+                    if destination in destinations:
+                        other = destinations[destination]
+                        raise ValueError(f"copy.destination is already used by job {other!r}")
+                    destinations[destination] = name
+                except ValueError as exc:
+                    raise ConfigError(f"Job {name!r}: {exc}") from exc
             if job_type == "gfs":
                 try:
                     params = parse_gfs_job(section, self.path.parent, self._resolve)
@@ -144,7 +158,7 @@ class Config:
                         params[key] = lexical_path(params[key])
             self.jobs[name] = Job(
                 name=name, type=job_type, params=params, restore_root=restore_root,
-                active=active,
+                active=active, copy=copy,
             )
 
         if any(job.type == "gfs" for job in self.jobs.values()):
@@ -153,6 +167,29 @@ class Config:
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
         self._check_pgbackrest()
+
+    def _load_copy(
+        self, job_type: str, section: dict[str, Any],
+    ) -> tuple[CopySettings, tuple[str, str | None, str]]:
+        if job_type != "file" and (
+            job_type not in _COPY_ENGINES
+            or get_engine(job_type).backend is not _COPY_ENGINES[job_type]
+        ):
+            raise ValueError(
+                "copy is supported only by built-in file, mysqldump and pgbackrest jobs"
+            )
+        if self.history is None:
+            raise ValueError("copy requires a [history] section")
+        if job_type == "file":
+            if section.get("timestamp") is not True:
+                raise ValueError("copy requires timestamp = true")
+            destination = section.get("backup_dst")
+            if not isinstance(destination, str) or not safe_artifact_name(Path(destination).name):
+                raise ValueError("copy requires a shell-safe backup_dst name")
+        if job_type == "pgbackrest" and not safe_artifact_name(section.get("stanza")):
+            raise ValueError("copy requires a shell-safe stanza name")
+        # Mysqldump percent-encodes the database label before using it in the archive name.
+        return parse_copy_settings(section.pop("copy"), self.path.parent, self._resolve)
 
     def _check_pgbackrest(self) -> None:
         """Rules for pgbackrest jobs; they follow ``check_gfs_config``, which reads the stages."""
