@@ -2,9 +2,12 @@
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import tarfile
+from contextlib import closing
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,9 +17,13 @@ from bdbackup import tar_export
 from bdbackup.backends import BackupError
 from bdbackup.cli import main
 from bdbackup.config import Config
+from bdbackup.gfs import runner, store
+from bdbackup.gfs.stages import MARKER
 from bdbackup.history import History
+from bdbackup.ssh_copy import safe_artifact_name
 from bdbackup.utils import process_lock
 from tests.pbm_fake import NAME, make_storage
+from tests.ssh_copy_fake import Remote
 
 JOB = "mongo-main"
 NEXT = "2026-11-26T13:24:55Z"
@@ -230,3 +237,101 @@ def test_configuration_without_pbm_never_starts_it(site):
     assert site.calls == []
     [record] = site.history.records()
     assert (record.backup_type, record.status) == ("file", "success")
+
+
+GFS = """
+[rotation]
+type = "gfs"
+[[rotation.stage]]
+paths = ["daily"]
+period = "daily"
+keep = "5d"
+[[rotation.stage]]
+paths = ["later"]
+period = "daily"
+keep = "20d"
+"""
+
+
+@pytest.mark.parametrize("method,job", [
+    ("rsync", "Mongo01._-+=@,%~"),
+    ("scp", "-"),
+    ("scp", ".."),
+])
+def test_pbm_copy_publishes_a_safe_unit_and_lists_its_delivery(site, method, job):
+    site.job = job
+    site.write(f'["{job}".copy]\ndestination="ssh://vault/pbm"\nmethod="{method}"\n')
+    peer = Remote()
+
+    def check_published(argv):
+        database = site.history.settings.database
+        with process_lock(Path(f"{database}.pbm-{job}.lock")):
+            [record] = site.history.records()
+            assert record.status == "success"
+
+    peer.before = check_published
+
+    def run(argv, **kwargs):
+        return site.pbm(argv, **kwargs) if argv[0] == "pbm" else peer(argv, **kwargs)
+
+    site.monkeypatch.setattr(subprocess, "run", run)
+    result = site.run("--no-verify")
+    assert result.exit_code == 0, result.output
+    unit = site.unit()
+    assert safe_artifact_name(unit.name) and unit.name not in {".", ".."} and ":" not in unit.name
+    assert f"Copy {job}: {unit.name} -> ssh://vault/pbm ({method}," in result.stdout
+    assert [(tool, path) for tool, path, _ in peer.transfers] == [(method, unit)]
+    assert peer.files == {f"/pbm/{unit.name}": unit.read_bytes()}
+    [delivery] = site.history.deliveries()
+    assert (delivery.method, delivery.status) == (method, "copied")
+    listing = invoke("history", "--config", site.config, "--job", job)
+    assert listing.exit_code == 0 and " | copy copied" in listing.stdout
+
+
+def test_pbm_gfs_rotates_and_expires_the_archive_like_a_file_unit(site):
+    site.out_dir = "daily/mongo"
+    site.write(GFS)
+    init = site.run("--initialize-structure", job="rotation")
+    assert init.exit_code == 0, init.output
+    assert not (site.root / "daily" / MARKER).exists()
+    assert (site.root / "later" / MARKER).is_file()
+
+    first = site.run()
+    assert first.exit_code == 0, first.output
+    older, = site.history.records()
+    old_path = site.unit()
+    original = old_path.read_bytes()
+    site.name = NEXT
+    make_storage(site.storage, NEXT)
+    second = site.run()
+    assert second.exit_code == 0, second.output
+    clock = datetime.now().astimezone()
+    with closing(sqlite3.connect(site.history.settings.database)) as db, db:
+        db.execute("UPDATE backup_runs SET completed_at=? WHERE id=?",
+                   ((clock - timedelta(days=8)).isoformat(), older.id))
+
+    config = Config(site.config)
+    job = config.get("rotation")
+    lines = []
+    assert runner.run_job(config, job, now=clock, out=lines.append) == 0, lines
+    moved = site.root / "later" / "mongo" / old_path.name
+    assert moved.read_bytes() == original and not old_path.exists()
+    assert any(f"move {site.job} mongo/{old_path.name}" in line for line in lines)
+    assert site.unit(NEXT).is_file()
+
+    lines.clear()
+    assert runner.run_job(config, job, now=clock + timedelta(days=31), out=lines.append) == 0, lines
+    assert not moved.exists()
+    assert any(f"delete {site.job} mongo/{old_path.name}" in line for line in lines)
+    assert store.places(site.history)[older.id] == ()
+    assert site.unit(NEXT).is_file()
+
+
+def test_pbm_out_dir_in_a_later_gfs_stage_is_a_configuration_error(site):
+    site.out_dir = "later/mongo"
+    site.write(GFS)
+    result = site.run()
+    assert result.exit_code == 2, result.output
+    assert "Job 'mongo-main' writes into stage path" in result.output
+    assert "engines write only into the first stage" in result.output
+    assert not site.calls
