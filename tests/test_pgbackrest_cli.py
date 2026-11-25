@@ -8,7 +8,9 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import subprocess
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -572,6 +574,28 @@ def test_last_run_of_no_new_full_keeps_the_last_exports_facts(tmp_path):
     assert (row.result, row.exit_code) == ("no_new_full", 0)
     assert row.facts == exported.facts
     assert row.facts is not None
+
+
+def test_no_new_full_can_enable_copy_on_schema_six_without_attempting_ssh(tmp_path):
+    site = make_site(tmp_path)
+    assert site.run().exit_code == 0
+    backup, = site.rows()
+    facts = last_run(site).facts
+    with closing(sqlite3.connect(site.history.settings.database)) as db, db:
+        db.execute("DROP TABLE deliveries")
+        db.execute("PRAGMA user_version = 6")
+    site.config.write_text(site.config.read_text() + COPY)
+    remote = Remote()
+
+    result = site.run(ssh=remote)
+
+    assert result.exit_code == 0, "a no-new-full run may see a history without a copy queue"
+    assert "no new full:" in result.stdout and "Copy pg:" not in result.stdout
+    assert not remote.calls
+    assert site.rows() == [backup]
+    row = last_run(site)
+    assert (row.result, row.exit_code, row.facts) == ("no_new_full", 0, facts)
+    assert site.history.deliveries() == []
 
 
 @pytest.mark.parametrize("method,verify", [("rsync", True), ("scp", True), ("scp", False)])

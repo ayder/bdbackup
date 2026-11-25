@@ -352,6 +352,27 @@ def test_first_identity_valid_gfs_location_is_used_once_without_transfer_fallbac
     assert site.history.deliveries()[-1].failure_class == "transfer"
 
 
+@pytest.mark.parametrize("legacy", [False, True], ids=["missing-history", "schema-six"])
+def test_copy_phase_with_no_delivery_schema_is_a_read_only_noop(site, remote, legacy):
+    database = site.history.settings.database
+    if legacy:
+        site.seed("before-upgrade.tar")
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute("DROP TABLE deliveries")
+            db.execute("PRAGMA user_version = 6")
+        before = database.read_bytes()
+    lines = []
+
+    assert site.drain(lines) == 0, "an unavailable delivery schema is an empty copy queue"
+    assert site.history.next_uncopied(JOB, DEST, set()) is None
+    assert not lines and not remote.calls
+    assert not site.copy_lock.exists()
+    if legacy:
+        assert database.read_bytes() == before
+    else:
+        assert not database.parent.exists()
+
+
 def test_interruption_before_result_leaves_pending_and_the_next_run_retries(site, remote):
     class Interrupted(BaseException):
         pass
