@@ -15,6 +15,7 @@ from bdbackup.engines import (
     list_engines,
     register_engine,
 )
+from bdbackup.mongodb.pbm import PBM
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.postgres import PgBackRest
 
@@ -35,16 +36,18 @@ class FakeBackend:
 
 def test_builtin_engines_registered():
     engines = list_engines()
-    assert set(engines) == {"mysqldump", "xtrabackup", "pgbackrest"}
+    assert set(engines) == {"mysqldump", "xtrabackup", "pgbackrest", "pbm"}
     assert engines["mysqldump"].backend is MySQLBackup
     assert engines["xtrabackup"].backend is XtraBackup
     assert engines["xtrabackup"].family == "mysql"
     assert engines["pgbackrest"].backend is PgBackRest
     assert engines["pgbackrest"].family == "postgres"
+    assert engines["pbm"].backend is PBM
+    assert engines["pbm"].family == "mongodb"
 
 
 def test_supported_types_are_file_gfs_and_engines():
-    assert supported_types() == {"file", "gfs", "mysqldump", "xtrabackup", "pgbackrest"}
+    assert supported_types() == {"file", "gfs", "mysqldump", "xtrabackup", "pgbackrest", "pbm"}
 
 
 def test_unknown_engine_error_lists_available():
