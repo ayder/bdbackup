@@ -151,6 +151,11 @@ class PBM:
         """Read PBM's version document for validation."""
         return self._run_json("version")
 
+    def export(
+        self, job: str, name: str, nodes: tuple[str, ...], *, verify: bool = True,
+    ) -> BackupResult:
+        return BackupResult(self.out_dir / "placeholder.tar")
+
     def backup(self) -> BackupResult:
         raise BackupError("PBM backup export is not available")
 
