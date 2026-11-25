@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from bdbackup.ssh_copy import CopySettings
 
 
+def _has_delivery_schema(db: sqlite3.Connection) -> bool:
+    return db.execute("PRAGMA user_version").fetchone()[0] >= 7
+
+
 class HistoryError(BackupError):
     """History could not be read or written reliably."""
 
@@ -341,6 +345,13 @@ class History:
                 )
         return result
 
+    def has_delivery_schema(self) -> bool:
+        """Check whether the existing database can hold a delivery without migrating it."""
+        if not self.settings.database.exists():
+            return False
+        with self._connect() as db:
+            return _has_delivery_schema(db)
+
     def deliveries(
         self, *, job: str | None = None, destination: str | None = None, uncopied: bool = False,
     ) -> list[Delivery]:
@@ -348,7 +359,7 @@ class History:
         if not self.settings.database.exists():
             return []
         with self._connect() as db:
-            if db.execute("PRAGMA user_version").fetchone()[0] < 7:
+            if not _has_delivery_schema(db):
                 return []
             rows = db.execute(
                 """SELECT * FROM deliveries
@@ -365,7 +376,11 @@ class History:
         db: sqlite3.Connection | None = None,
     ) -> int | None:
         """Find the newest unattempted delivery, optionally in a caller's transaction."""
+        if db is None and not self.settings.database.exists():
+            return None
         with self._connect() if db is None else nullcontext(db) as connection:
+            if not _has_delivery_schema(connection):
+                return None
             rows = connection.execute(
                 """SELECT record_id FROM deliveries
                    WHERE job_name = ? AND destination = ? AND status IN ('pending', 'failed')

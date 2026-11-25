@@ -18,6 +18,9 @@ def run_job(
     history: History, job_name: str, settings: CopySettings, out: Callable[[str], None],
 ) -> int:
     """Return 0 for success, 1 for a failed attempt, or 3 for a busy copy lock."""
+    # A new backup will migrate and enqueue before it tries the flock.
+    if not history.has_delivery_schema():
+        return 0
     attempted: set[int] = set()
     failed = False
     with ExitStack() as lock:
