@@ -1,7 +1,9 @@
 """CLI and runner witnesses for backup records, retries, and queue serialization."""
 
+import errno
 import gzip
 import logging
+import os
 import re
 import sqlite3
 import subprocess
@@ -306,6 +308,107 @@ def record_locations(site, record, *paths, missing_identity=frozenset()):
         for path in paths if path.exists() and path not in missing_identity
     }
     store.record_move(history, unit_id, locations, unit.locations, identities)
+    return unit_id
+
+
+@pytest.mark.parametrize("unavailable", ["unreadable", "missing", "replaced"])
+def test_listed_gfs_location_stays_retryable_until_available(
+    site, remote, monkeypatch, unavailable,
+):
+    source = site.seed("managed.tar")
+    record, = site.history.records()
+    moved = source.parent.parent / "later-stage" / source.name
+    moved.parent.mkdir()
+    moved.write_bytes(source.read_bytes())
+    record_locations(site, record, moved)
+    source.unlink()
+    held = moved.with_suffix(".held")
+
+    with monkeypatch.context() as patch:
+        if unavailable == "unreadable":
+            real_open = os.open
+
+            def open_source(path, *args, **kwargs):
+                if path == moved:
+                    raise PermissionError(errno.EACCES, "synthetic stage is unreadable", path)
+                return real_open(path, *args, **kwargs)
+
+            patch.setattr(os, "open", open_source)
+        else:
+            moved.rename(held)
+            if unavailable == "replaced":
+                moved.write_bytes(b"replacement")
+
+        first = site.run()
+
+    assert first.exit_code == 1, "an unavailable listed source must fail the run"
+    assert "Copy daily: managed.tar failed: source_unavailable" in first.stdout
+    pending = site.history.deliveries()[-1]
+    assert (pending.status, pending.failure_class, pending.attempt_count) == (
+        "failed", "source_unavailable", 1,
+    )
+    assert all(path.name != moved.name for _, path, _ in remote.transfers)
+    if held.exists():
+        held.replace(moved)
+
+    retry = site.run()
+
+    assert retry.exit_code == 0, retry.output
+    assert [path for _, path, _ in remote.transfers if path.name == moved.name] == [moved]
+    copied = site.history.deliveries()[-1]
+    assert (copied.status, copied.failure_class, copied.attempt_count) == ("copied", None, 2)
+
+
+def test_gfs_deleted_unit_is_abandoned_and_not_retried(site, remote):
+    source = site.seed("deleted.tar")
+    record, = site.history.records()
+    moved = source.parent.parent / "later-stage" / source.name
+    moved.parent.mkdir()
+    moved.write_bytes(source.read_bytes())
+    unit_id = record_locations(site, record, moved)
+    store.record_delete(site.history, unit_id)
+
+    first = site.run()
+
+    assert first.exit_code == 1
+    assert "Copy daily: deleted.tar failed: source_unavailable" in first.stdout
+    abandoned = site.history.deliveries()[-1]
+    assert (abandoned.status, abandoned.failure_class, abandoned.attempt_count) == (
+        "abandoned", "source_unavailable", 1,
+    )
+    assert site.run().exit_code == 0
+    assert site.history.deliveries()[-1] == abandoned
+    assert all(path.name != moved.name for _, path, _ in remote.transfers)
+
+
+@pytest.mark.parametrize("operation", ["stat", "open"])
+def test_unmanaged_source_io_error_is_retryable(site, remote, monkeypatch, operation):
+    source = site.seed("unmanaged.tar")
+
+    with monkeypatch.context() as patch:
+        real = getattr(os, operation)
+
+        def failed_lookup(path, *args, **kwargs):
+            if path == source:
+                raise OSError(errno.EIO, "synthetic source I/O error", path)
+            return real(path, *args, **kwargs)
+
+        patch.setattr(os, operation, failed_lookup)
+        first = site.run()
+
+    assert first.exit_code == 1, "a source I/O error must fail the run"
+    assert "Copy daily: unmanaged.tar failed: source_unavailable" in first.stdout
+    failed = site.history.deliveries()[-1]
+    assert (failed.status, failed.failure_class, failed.attempt_count) == (
+        "failed", "source_unavailable", 1,
+    )
+    assert all(path != source for _, path, _ in remote.transfers)
+
+    retry = site.run()
+
+    assert retry.exit_code == 0, retry.output
+    assert site.history.deliveries()[-1].status == "copied"
+    assert [path for _, path, _ in remote.transfers if path == source] == [source]
 
 
 def test_move_during_transfer_retries_from_its_new_gfs_location(site, remote, monkeypatch):
