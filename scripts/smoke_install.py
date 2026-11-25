@@ -10,7 +10,39 @@ from pathlib import Path
 
 
 def _check_pbm_dry_run(work, cli, run):
-    pass
+    (work / "pbm.toml").write_text(
+        '[history]\ndatabase="pbm-state/history.sqlite3"\n'
+        '[mongo]\ntype="pbm"\nbackup_type="physical"\n'
+        'storage_path="pbm-storage"\nout_dir="pbm-units"\n'
+    )
+    tools = work / "no-pbm"
+    tools.mkdir()
+    marker = work / "pbm-invoked"
+    sentinel = tools / "pbm"
+    sentinel.write_text(
+        '#!/bin/sh\nprintf "called\\n" > "$BDBACKUP_SMOKE_PBM_MARKER"\nexit 99\n'
+    )
+    sentinel.chmod(0o755)
+    process_env = {
+        **os.environ,
+        "PATH": str(tools),
+        "BDBACKUP_CONFIG_DIR": str(work / "pbm-config"),
+        "BDBACKUP_SMOKE_PBM_MARKER": str(marker),
+    }
+    process_env.pop("PBM_MONGODB_URI", None)
+    process_env.pop("PYTHONPATH", None)
+    result = run(
+        [str(cli), "run", "-c", "pbm.toml", "-j", "mongo", "--dry-run"],
+        process_env=process_env,
+    )
+    out_dir = work.resolve() / "pbm-units"
+    expected = f"Dry run; would take a physical PBM backup and export it into {out_dir}"
+    if result.stdout.splitlines() != [expected]:
+        raise RuntimeError("Installed wheel PBM dry run did not report the expected backup")
+    if marker.exists() or any(
+        (work / name).exists() for name in ("pbm-state", "pbm-units", "pbm-storage")
+    ):
+        raise RuntimeError("Installed wheel PBM dry run invoked PBM or wrote state")
 
 
 def main(dist: str) -> None:
@@ -114,6 +146,8 @@ def main(dist: str) -> None:
         if any(path.exists() for path in (marker, work / "dry-history", work / "dry-archives")):
             raise RuntimeError("Installed wheel copy dry run invoked an SSH tool or wrote state")
 
+        _check_pbm_dry_run(work, cli, run)
+
         previous = (work / "backup.tar.gz").read_bytes()
         (work / "paths").write_text("missing\n")
         run([str(cli), "run", "-c", "direct.toml", "-j", "direct"], expected=1)
@@ -121,7 +155,7 @@ def main(dist: str) -> None:
             raise RuntimeError("Failed backup replaced the good archive")
     print(
         "Installed wheel: imports, CLI, recovery, history, failed replacement, "
-        "SSH copy dry run and executable SSH helper passed"
+        "SSH copy dry run, executable SSH helper and PBM dry run passed"
     )
 
 
