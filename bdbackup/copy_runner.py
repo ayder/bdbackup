@@ -1,17 +1,23 @@
 """Drain a job's previously recorded SSH deliveries."""
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 
 from bdbackup.gfs import store
-from bdbackup.history import BackupRecord, History, HistoryError
+from bdbackup.history import BackupRecord, History, HistoryError, artifact_identity, stat_identity
 from bdbackup.ssh_copy import CopyCommandError, CopyResult, CopySettings, copy_artifact
 from bdbackup.utils import process_lock
 
 logger = logging.getLogger(__name__)
+
+
+class _AbandonedSource(CopyCommandError):
+    def __init__(self):
+        super().__init__("source_unavailable", None)
 
 
 def run_job(
@@ -50,23 +56,48 @@ def run_job(
     return 1 if failed else 0
 
 
-def _source(history: History, record: BackupRecord) -> Path | None:
-    places = store.places(history)
-    if record.id in places:
-        return next(
-            (place.member for place in places[record.id]
-             if place.identity is not None and store.place_available(place)),
-            None,
-        )
-    return Path(record.path) if record.available else None
+def _readable_source(path: Path, identity: str | None) -> bool:
+    if artifact_identity(path) != identity:
+        return False
+    # Check whether the file can be opened without reading its contents. Nonblocking open
+    # also avoids hanging on a FIFO that replaced the artifact after the stat.
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        return stat_identity(os.fstat(fd)) == identity
+    finally:
+        os.close(fd)
+
+
+def _source(history: History, record: BackupRecord) -> Path:
+    places = store.places(history).get(record.id)
+    if places is not None:
+        if not places:
+            raise _AbandonedSource
+        for place in places:
+            if place.identity is None:
+                continue
+            try:
+                if _readable_source(place.member, place.identity):
+                    return place.member
+            except OSError:
+                continue
+        raise CopyCommandError("source_unavailable", None)
+
+    path = Path(record.path)
+    try:
+        if _readable_source(path, record.identity):
+            return path
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError as exc:
+        raise CopyCommandError("source_unavailable", str(exc)) from None
+    raise _AbandonedSource
 
 
 def _copy_record(
     history: History, record: BackupRecord, settings: CopySettings, name: str,
 ) -> CopyResult:
     source = _source(history, record)
-    if source is None:
-        raise CopyCommandError("source_unavailable", None)
     try:
         return copy_artifact(settings, source, name, record.checksum)
     except CopyCommandError as exc:
@@ -94,7 +125,7 @@ def _attempt(
             failure_class, diagnostic = exc.failure_class, exc.diagnostic
         else:
             failure_class, diagnostic = "other", str(exc)
-        status = "abandoned" if failure_class == "source_unavailable" else "failed"
+        status = "abandoned" if isinstance(exc, _AbandonedSource) else "failed"
         history.finish_delivery_attempt(
             record_id, attempt, status, datetime.now(UTC), failure_class=failure_class,
         )
