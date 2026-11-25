@@ -16,25 +16,11 @@ import pytest
 from bdbackup import tar_export
 from bdbackup.backends import BackupError
 from bdbackup.mongodb.pbm import PBM
+from tests.pbm_fake import NAME, make_storage
 
 JOB = "mongo-main"
-NAME = "2026-11-25T08:59:27Z"
 NODE = "secondary.example:27017"
 FILENAME = f"{JOB}-{NAME.replace(':', '')}.tar"
-
-
-def make_storage(storage, name=NAME, data=b"backup bytes\x00\x01\xff"):
-    files = {
-        f"{name}.pbm.json": b'{"status":"done"}',
-        f"{name}/rs0/data/collection.s2": data,
-        f"{name}/rs0/oplog.s2": b"oplog bytes",
-    }
-    for path, data in files.items():
-        target = storage / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-    (storage / name / "rs0" / "empty").mkdir()
-    return files
 
 
 @pytest.fixture
