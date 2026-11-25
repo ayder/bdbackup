@@ -1,5 +1,6 @@
 """SSH copy settings and subprocess commands."""
 
+import logging
 import os
 import re
 import subprocess
@@ -9,6 +10,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import IPv6Address
 from pathlib import Path
+from stat import S_IMODE, S_ISREG
+from uuid import uuid4
 
 _NAME_CHARS = r"A-Za-z0-9._+=@,%~\-"
 _SAFE_NAME = re.compile(rf"[{_NAME_CHARS}]+")
@@ -27,6 +30,9 @@ _SSH_OPTIONS = (
     "-o", "ServerAliveCountMax=3",
 )
 _SSH_STATUS_HELPER = Path(__file__).with_name("_ssh_status.sh")
+_REMOTE_FAILURES = {20: "destination_not_ready", 21: "tool_missing", 22: "name_taken"}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_MODE = re.compile(r"[0-7]{1,4}")
 
 
 @dataclass(frozen=True)
@@ -124,8 +130,41 @@ class CopyResult:
 def copy_artifact(
     settings: CopySettings, source: Path, artifact_name: str, checksum: str,
 ) -> CopyResult:
-    now = datetime.now(UTC)
-    return CopyResult(0, now, now)
+    """Send one regular file to a fresh temporary name and verify before linking it."""
+    started = datetime.now(UTC)
+    if not safe_artifact_name(artifact_name) or artifact_name in {".", ".."}:
+        raise CopyCommandError("other", "invalid SSH copy artifact name")
+    if not _safe_remote_path(settings.path):
+        raise CopyCommandError("other", "invalid SSH copy destination path")
+    source_info = _source_info(source)
+    directory = settings.path.rstrip("/") or "/"
+    prefix = directory.rstrip("/")
+    final = f"{prefix}/{artifact_name}"
+    connection = SSHConnection(settings)
+    existing = _existing_checksum(connection, directory, final)
+    if existing is not None:
+        if existing != checksum:
+            raise CopyCommandError("name_taken", None)
+        return CopyResult(0, started, datetime.now(UTC), already_there=True)
+
+    temp = f"{prefix}/.bdbackup-tmp-{uuid4().hex}-{artifact_name}"
+    published = False
+    try:
+        connection.transfer(source, temp)
+        mode = _source_mode_after_transfer(source, source_info)
+        _verify_staged(connection, temp, checksum, mode)
+        _publish(connection, temp, final)
+        published = True
+    finally:
+        try:
+            connection.run(f"rm -f -- {temp}")
+        except CopyCommandError as exc:
+            if published:
+                logging.getLogger(__name__).warning(
+                    "Could not remove temporary SSH copy %s: %s",
+                    temp, exc.diagnostic or exc.failure_class,
+                )
+    return CopyResult(source_info.st_size, started, datetime.now(UTC))
 
 
 def _execute(
@@ -220,5 +259,86 @@ class SSHConnection:
         if bwlimit is not None:
             argv.append(f"--bwlimit={bwlimit}")
         remote_shell = " ".join(_rsync_word(arg) for arg in (helper, *self._options("-p")))
-        argv.extend(("-e", remote_shell))
+        argv.extend(("-e", remote_shell, "--inplace"))
         return argv
+
+
+def _source_info(source: Path) -> os.stat_result:
+    try:
+        info = source.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        raise CopyCommandError("source_unavailable", None) from None
+    except OSError as exc:
+        raise CopyCommandError("other", str(exc)) from None
+    if not S_ISREG(info.st_mode):
+        raise CopyCommandError("source_unavailable", None)
+    return info
+
+
+def _source_mode_after_transfer(source: Path, before: os.stat_result) -> int:
+    try:
+        after = source.stat()
+    except OSError as exc:
+        raise CopyCommandError("transfer", str(exc)) from None
+    if (
+        not os.path.samestat(before, after)
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+    ):
+        raise CopyCommandError("transfer", "local artifact changed during SSH transfer")
+    return S_IMODE(before.st_mode) & S_IMODE(after.st_mode)
+
+
+def _existing_checksum(connection: SSHConnection, directory: str, final: str) -> str | None:
+    commands = [
+        f"test -d {directory} && test -w {directory} || exit 20",
+        "command -v sha256sum >/dev/null || exit 21",
+    ]
+    if connection.settings.method == "rsync":
+        commands.append("command -v rsync >/dev/null || exit 21")
+    commands.append(
+        f"if test -e {final} || test -L {final}; then "
+        f"test -f {final} || exit 22; sha256sum -- {final} || exit 23; fi"
+    )
+    output = connection.run("; ".join(commands), failures=_REMOTE_FAILURES)
+    return _read_checksum(output) if output.strip() else None
+
+
+def _read_checksum(output: str) -> str:
+    digest, *_ = output.split(maxsplit=1) or ("",)
+    if _SHA256.fullmatch(digest) is None:
+        raise CopyCommandError("other", "invalid remote SHA-256 output")
+    return digest
+
+
+def _read_mode(output: str) -> int:
+    mode = output.strip()
+    if _MODE.fullmatch(mode) is None:
+        raise CopyCommandError("other", "invalid remote file mode")
+    return int(mode, 8)
+
+
+def _verify_staged(connection: SSHConnection, temp: str, checksum: str, allowed_mode: int) -> None:
+    output = connection.run(
+        f"test -f {temp} && test ! -L {temp} || exit 23; "
+        f"sha256sum -- {temp} || exit 23; stat -c %a -- {temp} || exit 23"
+    )
+    digest, separator, mode = output.partition("\n")
+    if _read_checksum(digest) != checksum:
+        raise CopyCommandError("checksum_mismatch", None)
+    if not separator:
+        raise CopyCommandError("other", "missing remote file mode")
+    remote_mode = _read_mode(mode)
+    if remote_mode & ~allowed_mode:
+        cap = remote_mode & allowed_mode
+        actual = connection.run(f"chmod {cap:04o} {temp} && stat -c %a -- {temp}")
+        if _read_mode(actual) & ~allowed_mode:
+            raise CopyCommandError("other", "remote file mode exceeds local permissions")
+
+
+def _publish(connection: SSHConnection, temp: str, final: str) -> None:
+    connection.run(
+        f"ln -T -- {temp} {final} || {{ "
+        f"if test -e {final} || test -L {final}; then exit 22; fi; exit 23; }}",
+        failures=_REMOTE_FAILURES,
+    )
