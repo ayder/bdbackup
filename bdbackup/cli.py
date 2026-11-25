@@ -25,6 +25,8 @@ from bdbackup.gfs.stages import fed_first_stages
 from bdbackup.history import History, HistoryError
 from bdbackup.metrics_command import run_metrics
 from bdbackup.mongodb.pbm import PBM
+from bdbackup.mongodb.restore import describe_unit as describe_pbm_unit
+from bdbackup.mongodb.restore import restore_lines as pbm_restore_lines
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.postgres.pgbackrest import ExportProgress
 from bdbackup.postgres.restore import describe_unit, restore_lines
@@ -518,10 +520,13 @@ def _restore_mode(config_path, backup_id, job, yes, dst, archive, backup, root, 
 
 
 def _echo_restore_command(directory: Path) -> None:
-    """Print the pgbackrest restore command if ``directory`` holds an extracted pgBackRest unit."""
+    """Print the operator steps for an extracted pgBackRest or PBM unit."""
     facts = describe_unit(directory)
     if facts is not None:
         for line in restore_lines(facts, directory.expanduser().absolute()):
+            _echo(line)
+    elif (pbm_facts := describe_pbm_unit(directory)) is not None:
+        for line in pbm_restore_lines(pbm_facts):
             _echo(line)
 
 
@@ -638,7 +643,7 @@ def restore(
             _echo(f"Prepared recovery directory: {restored}")
         else:
             _echo(f"Restored to: {restored}")
-        if record.backup_type == "pgbackrest-full":
+        if record.backup_type in {"pgbackrest-full", "pbm-logical", "pbm-physical"}:
             _echo_restore_command(restored)
 
     return _handle_errors(_run)

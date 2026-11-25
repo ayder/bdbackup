@@ -17,7 +17,7 @@ from bdbackup.ssh_copy import safe_artifact_name
 
 logger = logging.getLogger(__name__)
 URI_ENV = "PBM_MONGODB_URI"
-_BACKUP_NAME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
+BACKUP_NAME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
 _MONGODB_URI = re.compile(r"""mongodb(?:\+srv)?://[^\s"'<>]+""", re.IGNORECASE)
 
 
@@ -128,13 +128,13 @@ class PBM:
         """Take one backup, waiting until PBM returns its name."""
         response = self._run_json("backup", "--type", self.backup_type, "--wait")
         name = response.get("name")
-        if not isinstance(name, str) or not _BACKUP_NAME.fullmatch(name):
+        if not isinstance(name, str) or not BACKUP_NAME.fullmatch(name):
             raise PBMError("pbm backup failed: JSON did not contain a valid PBM backup name")
         return name
 
     def describe(self, name: str) -> BackupDescription:
         """Read the backup status and type and the node that backed up each replica set."""
-        if not _BACKUP_NAME.fullmatch(name):
+        if not BACKUP_NAME.fullmatch(name):
             raise PBMError("pbm describe-backup failed: invalid PBM backup name")
         response = self._run_json("describe-backup", name)
         status = response.get("status")
@@ -176,7 +176,7 @@ class PBM:
         """Verify and publish a tar containing only the requested PBM backup."""
         if not safe_artifact_name(job):
             raise BackupError("pbm job name must be shell-safe")
-        if not _BACKUP_NAME.fullmatch(name):
+        if not BACKUP_NAME.fullmatch(name):
             raise BackupError("invalid PBM backup name for export")
         return export_unit(self.storage_path, self.out_dir, job, name, nodes, verify)
 
