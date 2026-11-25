@@ -9,7 +9,7 @@ Part of the [bdbackup documentation](../README.md).
 `active` and `restore_root` are job metadata and are not passed to an engine backend.
 
 Database engines are pluggable and live in per-database family packages
-(`bdbackup/mysql/` and `bdbackup/postgres/`). Each engine maps a
+(`bdbackup/mysql/`, `bdbackup/postgres/` and `bdbackup/mongodb/`). Each engine maps a
 config `type` name to a backend class; adding one never requires editing
 existing wiring code:
 
@@ -18,6 +18,7 @@ existing wiring code:
 | `mysqldump` | `mysqldump` | `bdbackup.mysql.MySQLBackup` | Logical, gzip-compressed SQL dumps |
 | `xtrabackup` | `xtrabackup` | `bdbackup.mysql.XtraBackup` | Percona XtraBackup / MariaDB mariabackup |
 | `pgbackrest` | `pgbackrest` | `bdbackup.postgres.PgBackRest` | pgBackRest full backups exported as one tar to a GFS first stage; see [README_PGBACKREST.md](README_PGBACKREST.md) |
+| `pbm` | `pbm` | `bdbackup.mongodb.pbm.PBM` | Full logical and physical MongoDB backups exported as individual tars. See [README_PBM.md](README_PBM.md). |
 
 To add an engine, drop a self-registering module into either
 `bdbackup/mysql/` (shipped with the package) or

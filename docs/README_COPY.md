@@ -1,6 +1,6 @@
 # Copy a published backup to an SSH server
 
-File, mysqldump and pgbackrest jobs can send each published archive to a
+File, mysqldump, pgbackrest and pbm jobs can send each published archive to a
 dedicated directory on an SSH server. The copy starts after bdbackup records
 the successful local backup and its SHA-256 in SQLite.
 
@@ -45,8 +45,9 @@ host, port and path, so an SSH user change alone still shares the directory.
 
 Use ASCII letters, digits and `. _ - + = @ , % ~` in remote paths and
 artifact names. Paths also allow `/`. Use an absolute path with no `.`
-or `..` segment. A file job's `backup_dst` basename and a pgbackrest job's
-`stanza` must follow the same name rules. A percent sign in a path is
+or `..` segment. A file job's `backup_dst` basename, a pgbackrest job's
+`stanza` and a pbm job's name must follow the same rules. PBM archive names
+drop the colons from the backup timestamp. A percent sign in a path is
 literal. Leave passwords, queries and fragments out of destination URLs.
 
 ## Prepare the server and keys

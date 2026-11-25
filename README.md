@@ -3,15 +3,16 @@
 **Backups by design.**
 
 bdbackup is a command-line backup tool and Python library for MySQL, MariaDB,
-PostgreSQL (pgBackRest) and files on Linux and macOS. It takes MySQL and MariaDB
+PostgreSQL, MongoDB and files on Linux and macOS. It takes MySQL and MariaDB
 backups with mysqldump, Percona XtraBackup and MariaDB Backup (full and
 incremental physical backups, compressed and optionally encrypted), exports
-pgBackRest fulls, archives files and directories as tar, tar.gz or tar.zst, and
+pgBackRest fulls, takes and exports full MongoDB backups with Percona Backup for
+MongoDB (PBM), archives files and directories as tar, tar.gz or tar.zst, and
 rotates the results across storage stages with GFS (grandfather-father-son)
 retention. Every backup is verified before it is
 published and recorded with a SHA-256 checksum in an SQLite backup history, from
-which a guided restore prepares a recovery copy. File, mysqldump and pgbackrest
-jobs can also send their published archives to an SSH server with rsync or scp.
+which a guided restore prepares a recovery copy. File, mysqldump, pgbackrest
+and pbm jobs can send their published archives to an SSH server with rsync or scp.
 Jobs live in one TOML file and run from cron.
 
 ## Features
@@ -23,6 +24,8 @@ Jobs live in one TOML file and run from cron.
   gzip-compressed, one database or all.
 - [PostgreSQL pgBackRest backups](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md): the newest
   full of a stanza exported as one tar into a GFS stage, restorable on its own.
+- Take full logical or physical MongoDB backups and export each as one tar.
+  [MongoDB backups with PBM](https://github.com/ayder/bdbackup/blob/master/docs/README_PBM.md)
 - [File and directory backups](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md) as tar archives, with
   gitignore-style exclusion templates.
 - [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md): daily,
@@ -31,7 +34,7 @@ Jobs live in one TOML file and run from cron.
 - [Backup history and guided restore](#backup-history-and-guided-restore) with
   SHA-256 checksums in SQLite.
 - [Configuration validation](#validate-configuration-and-permissions) of
-  settings, filesystem permissions, MySQL grants and SSH copy readiness,
+  settings, filesystem permissions, MySQL grants, PBM and SSH copy readiness,
   without running a backup.
 - [Prometheus metrics](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md): a read-only
   `bdbackup metrics` writes a textfile for node_exporter and PMM with the last run of each
@@ -47,6 +50,7 @@ Jobs live in one TOML file and run from cron.
 | [MySQL and MariaDB logical backups with mysqldump](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md) | mysqldump jobs, credentials, default options |
 | [MySQL and MariaDB physical backups with Percona XtraBackup and MariaDB Backup](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md) | xtrabackup jobs, full and incremental backups, encryption, preparing a recovery copy, engine pruning |
 | [PostgreSQL pgBackRest backups: nightly fulls exported to a GFS stage](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md) | pgbackrest jobs, taking fulls with archive-copy, the first stage, no new full and `max_full_age_hours`, restore and the printed pgBackRest command, the repository host lost, known limits |
+| [MongoDB backups with Percona Backup for MongoDB](https://github.com/ayder/bdbackup/blob/master/docs/README_PBM.md) | pbm jobs, secondary and shared storage, logical and physical backups, GFS and SSH copy, restore and retention |
 | [GFS (grandfather-father-son) backup rotation](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md) | stages, the `verify` key, preparing stage directories, safety rules and renames, final name exists, drift, run and step logs, ledger copies, known limits |
 | [Copy published backups to an SSH server](https://github.com/ayder/bdbackup/blob/master/docs/README_COPY.md) | per-job configuration, rsync and scp, server setup, verified publication, retries and failure remedies |
 | [Prometheus metrics: `bdbackup metrics`](https://github.com/ayder/bdbackup/blob/master/docs/README_METRICS.md) | the metrics command and `[metrics]`, the textfile for node_exporter and PMM, every metric (coverage and drift of the GFS stages included), alerting, hangs and outages, known limits |
@@ -63,7 +67,8 @@ with Zstandard support. Database binaries are separate system dependencies.
 Every built-in backend verifies staging output before publishing it. A missing
 or unreadable file fails the backup and preserves the previous archive. A process
 lock prevents concurrent writers to the same file destination or physical root.
-`--no-verify` skips only the additional verification pass after publication.
+`--no-verify` skips the job's optional verification pass. For pgbackrest and
+pbm jobs this pass reads the temporary tar before publication.
 Verification checks archive readability or physical checkpoints; it does not
 replace testing a restore. File backups are not filesystem snapshots: quiesce
 applications or back up snapshots when files can change during a run.
@@ -191,7 +196,8 @@ the read-only `pgbackrest info`. What each job type reports is described with it
 [file jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md#dry-run),
 [mysqldump jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md#dry-run),
 [xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#dry-run),
-[pgbackrest jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md#dry-run-and-validation) and
+[pgbackrest jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md#dry-run-and-validation),
+[pbm jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PBM.md#run-and-validate) and
 [GFS jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_GFS.md#dry-run).
 
 A dry run exits 1 where the real run would fail before writing anything (an
@@ -400,7 +406,8 @@ What a restore produces depends on the job type; see
 [file jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_FILE.md#history-restore),
 [mysqldump jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_MYSQLDUMP.md#history-restore),
 [xtrabackup jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_XTRABACKUP.md#history-restore),
-[pgbackrest jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md#restore) and
+[pgbackrest jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PGBACKREST.md#restore),
+[pbm jobs](https://github.com/ayder/bdbackup/blob/master/docs/README_PBM.md#restore) and
 [custom engines](https://github.com/ayder/bdbackup/blob/master/docs/README_ENGINES.md#history-restore).
 
 Deleted artifacts remain in history as unavailable. File identity, size, and

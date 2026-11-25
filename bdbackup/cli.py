@@ -62,7 +62,8 @@ def config_option(**kwargs):
 def main(log_level: str) -> None:
     """Backups by design.
 
-    File and MySQL/MariaDB backups with verification, retention, and guided recovery.
+    File, MySQL, MariaDB, PostgreSQL and MongoDB backups with verification,
+    retention, and guided recovery.
     """
     setup_logging(getattr(logging, log_level.upper(), logging.INFO))
 

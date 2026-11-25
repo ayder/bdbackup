@@ -255,6 +255,11 @@ A [pgbackrest job](README_PGBACKREST.md) deletes and overwrites nothing on its o
 apart from its own temporary files (each tar's name carries its backup label), so it needs
 no such setting.
 
+A PBM job can feed the first stage by putting `out_dir` there or in a
+subdirectory. GFS rotates each exported tar as a single unit and applies the
+same first-stage rules as it does for file archives. PBM handles retention of
+the underlying backup in its own filesystem storage. [PBM job guide](README_PBM.md)
+
 An eligible job feeding the first stage can also send its published artifact to
 an SSH server. GFS does not wait for the SSH copy. If GFS moved the artifact
 before the copy starts, bdbackup looks for the first recorded location with a
