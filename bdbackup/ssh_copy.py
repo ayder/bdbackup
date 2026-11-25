@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from ipaddress import IPv6Address
 from pathlib import Path
 
@@ -110,6 +111,21 @@ class CopyCommandError(Exception):
         super().__init__(failure_class)
         self.failure_class = failure_class
         self.diagnostic = diagnostic
+
+
+@dataclass(frozen=True)
+class CopyResult:
+    bytes_sent: int
+    started_at: datetime
+    ended_at: datetime
+    already_there: bool = False
+
+
+def copy_artifact(
+    settings: CopySettings, source: Path, artifact_name: str, checksum: str,
+) -> CopyResult:
+    now = datetime.now(UTC)
+    return CopyResult(0, now, now)
 
 
 def _execute(

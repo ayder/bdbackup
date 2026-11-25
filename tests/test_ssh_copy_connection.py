@@ -91,7 +91,7 @@ def test_rsync_passes_ssh_arguments_as_one_remote_shell_argument(tmp_path, proce
     last = f" {' '.join(SECURE)} -F '{escaped_config}' -p 2222"
     assert argv[4].endswith(last)
     assert Path(shlex.split(argv[4].removesuffix(last))[0]).name == "_ssh_status.sh"
-    assert argv[5:] == ["--", str(source), f"{HOST_SPEC}:{TEMP}"]
+    assert argv[5:] == ["--inplace", "--", str(source), f"{HOST_SPEC}:{TEMP}"]
 
 
 @pytest.mark.parametrize("method", ["scp", "rsync"])
