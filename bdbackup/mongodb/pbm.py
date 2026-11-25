@@ -6,6 +6,10 @@ from bdbackup.backends import BackupError, BackupResult
 from bdbackup.engines import EngineInfo
 
 
+class PBMError(BackupError):
+    """A PBM command or its output failed."""
+
+
 class PBM:
     """Configuration for a PBM backup job."""
 
@@ -22,6 +26,18 @@ class PBM:
         self.backup_type = backup_type
         self.binary = binary
         self.mongodb_uri = mongodb_uri
+
+    def take(self):
+        return ""
+
+    def describe(self, name):
+        return None
+
+    def status(self):
+        return {}
+
+    def version(self):
+        return {}
 
     def backup(self) -> BackupResult:
         raise BackupError("PBM backup export is not available")
