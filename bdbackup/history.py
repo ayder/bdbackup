@@ -300,7 +300,7 @@ class History:
         job_name: str,
         backup_type: str,
         action: Callable[[], BackupResult],
-        restore_info: dict[str, str] | None = None,
+        restore_info: dict | None = None,
         *,
         encrypted: bool = False,
         copy: CopySettings | None = None,

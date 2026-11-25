@@ -24,6 +24,7 @@ from bdbackup.gfs import structure as gfs_structure
 from bdbackup.gfs.stages import fed_first_stages
 from bdbackup.history import History, HistoryError
 from bdbackup.metrics_command import run_metrics
+from bdbackup.mongodb.pbm import PBM
 from bdbackup.mysql import MySQLBackup, XtraBackup
 from bdbackup.postgres.pgbackrest import ExportProgress
 from bdbackup.postgres.restore import describe_unit, restore_lines
@@ -449,6 +450,9 @@ def run(
 
     def _create():
         backend = build_backend(job)
+        if isinstance(backend, PBM):
+            # PBM verifies its temporary tar before publication.
+            return backend.backup(job.name, verify=verify, restore_info=info)
         _protect_history(backend, config)
         info.update(backup_restore_info(backend))
         result = (
@@ -462,13 +466,18 @@ def run(
         return result
 
     backup_type = job.type
+    guard = nullcontext()
     if job.type == "xtrabackup":
         backup_type = "xtrabackup-incremental" if incremental else "xtrabackup-full"
+    elif job.type == "pbm":
+        backup_type = f"pbm-{job.params.get('backup_type', 'logical')}"
+        guard = process_lock(Path(f"{config.history.database}.pbm-{job.name}.lock"))
     try:
-        result = _tracked_backup(
-            config, job.name, backup_type, _create, info,
-            encrypted=job.params.get("encrypt") is True, copy=job.copy,
-        )
+        with guard:
+            result = _tracked_backup(
+                config, job.name, backup_type, _create, info,
+                encrypted=job.params.get("encrypt") is True, copy=job.copy,
+            )
     except BlockingIOError as exc:
         logger.error("Job %r locked: %s", job.name, exc)
         ctx.exit(EXIT_LOCKED)

@@ -58,6 +58,18 @@ def _last_diagnostic(stdout: str, stderr: str) -> str:
     return errors[-1] if errors else ""
 
 
+def _failure_diagnostic(stdout: str, stderr: str, uri: str | None) -> str:
+    try:
+        response = json.loads(stdout)
+    except ValueError:
+        response = None
+    message = response.get("Error") if isinstance(response, dict) else None
+    if isinstance(message, str) and message.strip():
+        # Decode JSON before redacting so escaped query-string characters are covered too.
+        return _redact(message, uri).strip().splitlines()[-1].strip()
+    return _last_diagnostic(_redact(stdout, uri), stderr)
+
+
 def _plain_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip()) and not _MONGODB_URI.search(value)
 
@@ -95,7 +107,7 @@ class PBM:
 
         stderr = _redact(result.stderr, uri)
         if result.returncode:
-            detail = _last_diagnostic(_redact(result.stdout, uri), stderr)
+            detail = _failure_diagnostic(result.stdout, stderr, uri)
             detail = detail or f"exit status {result.returncode}"
             raise PBMError(f"pbm {command} failed: {detail}")
 
@@ -163,8 +175,28 @@ class PBM:
             raise BackupError("invalid PBM backup name for export")
         return export_unit(self.storage_path, self.out_dir, job, name, nodes, verify)
 
-    def backup(self) -> BackupResult:
-        raise BackupError("PBM backup export is not available")
+    def backup(
+        self, job: str, *, verify: bool = True, restore_info: dict | None = None,
+    ) -> BackupResult:
+        """Take one backup and export just that backup after PBM confirms it."""
+        name = self.take()
+        description = self.describe(name)
+        if description.status != "done":
+            raise PBMError(f"PBM backup {name} has status {description.status!r}, expected 'done'")
+        if description.backup_type != self.backup_type:
+            raise PBMError(
+                f"PBM backup {name} has type {description.backup_type!r}, "
+                f"expected {self.backup_type!r}"
+            )
+        nodes = tuple(dict.fromkeys(replica.node for replica in description.replsets))
+        result = self.export(job, name, nodes, verify=verify)
+        if restore_info is not None:
+            restore_info.update(
+                kind="pbm", name=name, backup_type=description.backup_type,
+                replsets=[{"name": replica.name, "node": replica.node}
+                          for replica in description.replsets],
+            )
+        return result
 
 
 ENGINE = EngineInfo(
